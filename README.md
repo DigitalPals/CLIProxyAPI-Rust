@@ -243,9 +243,11 @@ CLIProxyAPI-Rust is a smaller rewrite of [CLIProxyAPI](https://github.com/router
 | Dashboard | Built in | Separate web panel |
 | Codex WebSockets | Yes, native relay | Yes |
 | Claude, Codex, Gemini API keys, OpenAI-compatible | Yes | Yes |
-| Gemini CLI, Antigravity, Vertex, Kimi, xAI, Devin sign-in | No | Yes |
+| Antigravity, Vertex, Kimi, xAI, Meta, Devin sign-in | No | Yes |
 | Image and video endpoints, plugins, Redis | No | Yes |
 | Credential files | Reads and writes CLIProxyAPI's format | — |
+
+Kimi and xAI API keys already work through `openai-compatibility`, since both providers offer OpenAI-compatible APIs. Only their subscription sign-ins are missing.
 
 ## FAQ
 
