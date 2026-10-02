@@ -175,7 +175,7 @@ fn claude(t: &Target, mut body: Value) -> Prepared {
     } else {
         let version = header(t.client_headers, "anthropic-version").unwrap_or_else(|| "2023-06-01".into());
         headers.push(("anthropic-version".into(), version));
-        headers.push(("user-agent".into(), format!("cliproxy/{}", env!("CARGO_PKG_VERSION"))));
+        headers.push(("user-agent".into(), format!("CLIProxyAPI-Rust/{}", env!("CARGO_PKG_VERSION"))));
         if body["output_config"]["effort"].is_string() && !betas.iter().any(|b| b.starts_with("effort-")) {
             betas.push("effort-2025-11-24".into());
         }
@@ -369,7 +369,7 @@ pub fn codex_headers(client: &HeaderMap, token: &str, account_id: Option<&str>, 
             h.push(("chatgpt-account-id".into(), a.into()));
         }
     } else {
-        h.push(("user-agent".into(), format!("cliproxy/{}", env!("CARGO_PKG_VERSION"))));
+        h.push(("user-agent".into(), format!("CLIProxyAPI-Rust/{}", env!("CARGO_PKG_VERSION"))));
     }
     h
 }
@@ -422,7 +422,7 @@ fn gemini(t: &Target, mut body: Value) -> Prepared {
     let headers = vec![
         ("x-goog-api-key".into(), token),
         ("content-type".into(), "application/json".into()),
-        ("user-agent".into(), format!("cliproxy/{}", env!("CARGO_PKG_VERSION"))),
+        ("user-agent".into(), format!("CLIProxyAPI-Rust/{}", env!("CARGO_PKG_VERSION"))),
     ];
     Prepared { url: format!("{base}/v1beta/models/{}:{action}", t.model), headers, body }
 }
@@ -438,7 +438,7 @@ fn compat(t: &Target, mut body: Value) -> Prepared {
     }
     let mut headers = vec![
         ("content-type".into(), "application/json".into()),
-        ("user-agent".into(), format!("cliproxy/{}", env!("CARGO_PKG_VERSION"))),
+        ("user-agent".into(), format!("CLIProxyAPI-Rust/{}", env!("CARGO_PKG_VERSION"))),
     ];
     if !token.is_empty() {
         headers.push(("authorization".into(), format!("Bearer {token}")));

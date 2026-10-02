@@ -125,7 +125,7 @@ impl Tracker {
         self.app.stats.record(&self.log);
         self.app.broadcast("request", &self.log);
         tracing::info!(
-            target: "cliproxy::request",
+            target: "cliproxyapi_rust::request",
             "{} {} → {} [{}] {} {}ms in={} out={}",
             self.log.client, self.log.model, self.log.provider, self.log.account, status,
             self.log.latency_ms, input, output

@@ -121,7 +121,7 @@ async fn callback(State(app): State<Arc<App>>, Query(q): Query<CallbackQuery>) -
     Html(format!(
         r#"<!doctype html><meta charset="utf-8"><meta name="color-scheme" content="dark"><title>{title}</title>
 <body style="margin:0;height:100vh;display:grid;place-items:center;background:#000;color:#f5f5f5;font:15px/1.5 ui-sans-serif,system-ui,-apple-system,sans-serif">
-<div style="text-align:center;max-width:420px;padding:24px"><div style="font-size:13px;letter-spacing:.08em;text-transform:uppercase;color:#737373">cliproxy</div>
+<div style="text-align:center;max-width:420px;padding:24px"><div style="font-size:13px;letter-spacing:.08em;text-transform:uppercase;color:#737373">CLIProxyAPI-Rust</div>
 <h1 style="font-size:22px;font-weight:600;margin:10px 0">{title}</h1><p style="color:#a3a3a3;margin:0">{body}</p></div></body>"#
     ))
 }

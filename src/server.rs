@@ -225,7 +225,7 @@ fn reply(_format: Format, r: Reply, json_array: bool) -> Response {
             h.insert(header::CACHE_CONTROL, HeaderValue::from_static("no-cache"));
             h.insert("x-accel-buffering", HeaderValue::from_static("no"));
             if let Ok(v) = HeaderValue::from_str(&account) {
-                h.insert("x-cliproxy-account", v);
+                h.insert("x-cliproxyapi-rust-account", v);
             }
             resp
         }

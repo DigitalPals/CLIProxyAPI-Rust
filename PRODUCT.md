@@ -8,11 +8,11 @@ web
 
 ## Users
 
-Developers who pay for Claude (Pro/Max), ChatGPT (Plus/Pro) or Gemini and want to use those subscriptions from any tool: Claude Code, Codex, Cursor-style editors, OpenAI/Anthropic SDKs, scripts. They run cliproxy either on their own laptop or on a small VPS shared with a few teammates (confirmed: both matter equally). They glance at the dashboard between terminal sessions to answer three questions: is it running, which accounts are healthy, and where is my traffic going.
+Developers who pay for Claude (Pro/Max), ChatGPT (Plus/Pro) or Gemini and want to use those subscriptions from any tool: Claude Code, Codex, Cursor-style editors, OpenAI/Anthropic SDKs, scripts. They run CLIProxyAPI-Rust either on their own laptop or on a small VPS shared with a few teammates (confirmed: both matter equally). They glance at the dashboard between terminal sessions to answer three questions: is it running, which accounts are healthy, and where is my traffic going.
 
 ## Product Purpose
 
-cliproxy is a single fast Rust binary that exposes OpenAI (Chat Completions + Responses, including websockets), Anthropic Messages and Gemini compatible endpoints, and serves them from a pool of OAuth accounts and API keys with round-robin routing, per-model cooldowns and automatic token refresh. Success: point any client at one base URL and forget about which account or provider answers.
+CLIProxyAPI-Rust is a single fast Rust binary that exposes OpenAI (Chat Completions + Responses, including websockets), Anthropic Messages and Gemini compatible endpoints, and serves them from a pool of OAuth accounts and API keys with round-robin routing, per-model cooldowns and automatic token refresh. Success: point any client at one base URL and forget about which account or provider answers.
 
 ## Positioning
 
@@ -21,7 +21,7 @@ A lean rewrite of CLIProxyAPI (Go): one binary, no runtime, an embedded dashboar
 ## Operating Context
 
 - Clients: Claude Code (`ANTHROPIC_BASE_URL`), Codex (`config.toml` provider, websocket transport), OpenAI SDKs, Gemini clients.
-- Accounts are added with `cliproxy login claude|codex`, from the dashboard, or as API keys in `config.yaml`.
+- Accounts are added with `cliproxyapi-rust login claude|codex`, from the dashboard, or as API keys in `config.yaml`.
 - OAuth redirects go to fixed localhost ports (54545 Claude, 1455 Codex). On a remote server the user pastes the redirect URL back into the dashboard.
 - Config hot-reloads; the dashboard edits the same `config.yaml`.
 
@@ -34,7 +34,7 @@ A lean rewrite of CLIProxyAPI (Go): one binary, no runtime, an embedded dashboar
 
 ## Brand Commitments
 
-- Name: cliproxy (lowercase). Repo mark: rose (#e11d48) rounded square in `assets/icon.svg`.
+- Name: CLIProxyAPI-Rust. The command, crate and file names use `cliproxyapi-rust`. Repo mark: rose (#e11d48) rounded square in `assets/icon.svg`.
 - Brief from the user, binding: "clean black OLED UI, simplistic".
 - Copy in English.
 

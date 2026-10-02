@@ -25,13 +25,13 @@ use crate::state::App;
 
 #[derive(Parser)]
 #[command(
-    name = "cliproxy",
+    name = "cliproxyapi-rust",
     version,
     about = "OpenAI / Claude / Gemini compatible proxy for your Claude Code, Codex and Gemini accounts"
 )]
 struct Cli {
     /// Path to the config file (created with defaults if missing).
-    #[arg(short, long, global = true, env = "CLIPROXY_CONFIG", default_value = "config.yaml")]
+    #[arg(short, long, global = true, env = "CLIPROXYAPI_RUST_CONFIG", default_value = "config.yaml")]
     config: PathBuf,
     #[command(subcommand)]
     cmd: Option<Cmd>,
@@ -55,7 +55,7 @@ async fn main() -> Result<()> {
     let cli = Cli::parse();
     let cfg = Config::load(&cli.config)?;
     let filter = std::env::var("RUST_LOG")
-        .unwrap_or_else(|_| if cfg.debug { "cliproxy=debug".into() } else { "cliproxy=info".into() });
+        .unwrap_or_else(|_| if cfg.debug { "cliproxyapi_rust=debug".into() } else { "cliproxyapi_rust=info".into() });
     tracing_subscriber::fmt().with_env_filter(filter).with_target(false).compact().init();
     std::fs::create_dir_all(cfg.auth_dir()).ok();
 
@@ -87,14 +87,16 @@ async fn serve(app: Arc<App>) -> Result<()> {
         if addr.ip().is_unspecified() { format!("http://127.0.0.1:{}", addr.port()) } else { format!("http://{addr}") };
     let accounts = app.pool.all();
     println!();
-    println!("  \x1b[1mcliproxy\x1b[0m {}", env!("CARGO_PKG_VERSION"));
+    println!("  \x1b[1mCLIProxyAPI-Rust\x1b[0m {}", env!("CARGO_PKG_VERSION"));
     println!("  dashboard  {shown}");
     println!("  openai     {shown}/v1");
     println!("  anthropic  {shown}");
     println!("  gemini     {shown}/v1beta");
     println!("  accounts   {} loaded from {}", accounts.len(), cfg.auth_dir().display());
     if accounts.is_empty() {
-        println!("\n  No accounts yet. Run `cliproxy login claude` / `cliproxy login codex` or open the dashboard.");
+        println!(
+            "\n  No accounts yet. Run `cliproxyapi-rust login claude` / `cliproxyapi-rust login codex` or open the dashboard."
+        );
     }
     println!();
 

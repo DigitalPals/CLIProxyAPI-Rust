@@ -1,6 +1,6 @@
 [package]
-name = "cliproxy"
-version = "0.1.0"
+name = "cliproxyapi-rust"
+version = "0.1.1"
 edition = "2024"
 rust-version = "1.88"
 description = "One fast binary that turns your Claude, ChatGPT (Codex) and Gemini accounts into OpenAI, Anthropic and Gemini compatible APIs."

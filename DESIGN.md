@@ -1,5 +1,5 @@
 ---
-name: cliproxy dashboard
+name: CLIProxyAPI-Rust dashboard
 description: Pure-black OLED operator panel for a local AI API proxy.
 colors:
   bg: "#000000"

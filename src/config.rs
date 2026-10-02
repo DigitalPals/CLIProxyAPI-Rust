@@ -110,7 +110,7 @@ impl Default for Config {
     }
 }
 
-pub const TEMPLATE: &str = r#"# cliproxy configuration. Changes are picked up automatically.
+pub const TEMPLATE: &str = r#"# CLIProxyAPI-Rust configuration. Changes are picked up automatically.
 
 host: "127.0.0.1"          # use 0.0.0.0 to expose on your network (set api-keys first!)
 port: 8317
@@ -129,7 +129,7 @@ codex-websockets: true      # native upstream websocket for Codex websocket clie
 claude-cloak: true          # make non-Claude-Code clients look like Claude Code on OAuth accounts
 debug: false
 
-# API keys (optional). OAuth accounts are added with `cliproxy login` or the dashboard.
+# API keys (optional). OAuth accounts are added with `cliproxyapi-rust login` or the dashboard.
 claude-api-key: []
 #  - api-key: "sk-ant-..."
 #    base-url: "https://api.anthropic.com"   # optional

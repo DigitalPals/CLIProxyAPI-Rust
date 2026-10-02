@@ -280,7 +280,7 @@ input.mono { font-family: var(--mono); font-size: 12.5px; }
   .toolbar input { width: 100%; }
 }
 
-@media (max-width: 520px) {
+@media (max-width: 760px) {
   .brand span { display: none; }
 }
 

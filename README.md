@@ -1,8 +1,8 @@
 <div align="center">
 
-<img src="assets/icon.svg" width="72" height="72" alt="cliproxy logo">
+<img src="assets/icon.svg" width="72" height="72" alt="CLIProxyAPI-Rust logo">
 
-# cliproxy
+# CLIProxyAPI-Rust
 
 **Your Claude, ChatGPT and Gemini subscriptions. One fast API.**
 
@@ -21,15 +21,15 @@ Point Claude Code, Codex, your editor or any SDK at one URL and stop caring whic
 
 <br>
 
-<img src="assets/screenshots/overview.png" alt="cliproxy dashboard: an hour of traffic, account health with a cooldown timer, and copy-paste setup for Claude Code" width="100%">
+<img src="assets/screenshots/overview.png" alt="CLIProxyAPI-Rust dashboard: an hour of traffic, account health with a cooldown timer, and copy-paste setup for Claude Code" width="100%">
 
 <br>
 
-## Why cliproxy
+## Why CLIProxyAPI-Rust
 
 - **One small binary.** About 7 MB with the dashboard inside, around 11 MB of memory in our tests. No Docker, no Node, no runtime to install.
 - **Any model from any tool.** Use GPT inside Claude Code, Claude inside Codex, or Gemini behind the OpenAI SDK. Requests are translated between formats automatically. When the client and the provider already speak the same format, the request passes through untouched.
-- **WebSockets.** Codex WebSocket sessions are relayed to ChatGPT's own WebSocket upstream, so `previous_response_id` works on the server side. Switch to a Claude or Gemini model mid-session and cliproxy carries the conversation over.
+- **WebSockets.** Codex WebSocket sessions are relayed to ChatGPT's own WebSocket upstream, so `previous_response_id` works on the server side. Switch to a Claude or Gemini model mid-session and CLIProxyAPI-Rust carries the conversation over.
 - **Many accounts, no babysitting.** Requests rotate across accounts (round-robin or fill-first). A rate limit cools down only that model on that account, until the reset time the provider reports. Failed requests move to the next account, and OAuth tokens refresh themselves.
 - **A dashboard you'll actually open.** Pure black, live over WebSocket: traffic, account health with countdown timers, sign-in flows, a request log and a config editor.
 - **Drop-in for CLIProxyAPI users.** It reads and writes the same credential files in `~/.cli-proxy-api`, so your existing logins work on first start.
@@ -45,7 +45,7 @@ cargo install --git https://github.com/IuCC123/CLIProxyAPI-Rust
 **2. Start it.**
 
 ```sh
-cliproxy
+cliproxyapi-rust
 ```
 
 The first run writes a commented `config.yaml` in the current directory and serves everything on `http://127.0.0.1:8317`. That address is also the dashboard.
@@ -53,8 +53,8 @@ The first run writes a commented `config.yaml` in the current directory and serv
 **3. Add an account.** Click **Sign in with Claude** or **Sign in with ChatGPT** in the dashboard, or use the terminal:
 
 ```sh
-cliproxy login claude    # Claude Pro / Max
-cliproxy login codex     # ChatGPT Plus / Pro / Team
+cliproxyapi-rust login claude    # Claude Pro / Max
+cliproxyapi-rust login codex     # ChatGPT Plus / Pro / Team
 ```
 
 API keys (Anthropic, OpenAI, Gemini, OpenRouter, Ollama, …) can be added from the dashboard or in `config.yaml`.
@@ -75,13 +75,13 @@ Want GPT in Claude Code? `export ANTHROPIC_MODEL=gpt-6-astra`.
 
 ```toml
 model = "gpt-6-astra"
-model_provider = "cliproxy"
+model_provider = "cliproxyapi-rust"
 
-[model_providers.cliproxy]
-name = "cliproxy"
+[model_providers.cliproxyapi-rust]
+name = "CLIProxyAPI-Rust"
 base_url = "http://127.0.0.1:8317/v1"
 wire_api = "responses"
-env_key = "CLIPROXY_API_KEY"   # only needed if you set api-keys
+env_key = "CLIPROXYAPI_RUST_KEY"   # only needed if you set api-keys
 ```
 
 **OpenAI SDK**, or any tool with a custom OpenAI base URL
@@ -200,20 +200,20 @@ openai-compatibility:
 Set `host: "0.0.0.0"`, an `api-keys` entry for your clients, and a `management-key` for the dashboard. Then keep it running, for example with systemd:
 
 ```ini
-# /etc/systemd/system/cliproxy.service
+# /etc/systemd/system/cliproxyapi-rust.service
 [Unit]
-Description=cliproxy
+Description=CLIProxyAPI-Rust
 After=network-online.target
 
 [Service]
-ExecStart=/usr/local/bin/cliproxy --config /etc/cliproxy/config.yaml
+ExecStart=/usr/local/bin/cliproxyapi-rust --config /etc/cliproxyapi-rust/config.yaml
 Restart=always
 
 [Install]
 WantedBy=multi-user.target
 ```
 
-To sign in accounts on a server, open the dashboard, click **Sign in**, approve in your browser, then paste the `localhost` URL the browser lands on (it won't load, which is expected). `cliproxy login claude` on the server works the same way.
+To sign in accounts on a server, open the dashboard, click **Sign in**, approve in your browser, then paste the `localhost` URL the browser lands on (it won't load, which is expected). `cliproxyapi-rust login claude` on the server works the same way.
 
 ## How it works
 
@@ -235,9 +235,9 @@ Each wire format (`src/formats/{chat,responses,claude,gemini}.rs`) knows how to 
 
 ## Compared with CLIProxyAPI
 
-cliproxy is a smaller rewrite of [CLIProxyAPI](https://github.com/router-for-me/CLIProxyAPI), not a port.
+CLIProxyAPI-Rust is a smaller rewrite of [CLIProxyAPI](https://github.com/router-for-me/CLIProxyAPI), not a port.
 
-| | cliproxy | CLIProxyAPI |
+| | CLIProxyAPI-Rust | CLIProxyAPI |
 | --- | --- | --- |
 | Language | Rust, one binary | Go |
 | Dashboard | Built in | Separate web panel |
@@ -249,15 +249,15 @@ cliproxy is a smaller rewrite of [CLIProxyAPI](https://github.com/router-for-me/
 
 ## FAQ
 
-**Is this allowed?** cliproxy is not affiliated with Anthropic, OpenAI or Google. Using subscription accounts through third-party tools may be against a provider's terms, and providers can rate-limit or suspend accounts. You are responsible for how you use it.
+**Is this allowed?** CLIProxyAPI-Rust is not affiliated with Anthropic, OpenAI or Google. Using subscription accounts through third-party tools may be against a provider's terms, and providers can rate-limit or suspend accounts. You are responsible for how you use it.
 
 **Where are my credentials stored?** In `auth-dir` (`~/.cli-proxy-api` by default), one JSON file per account, written with `0600` permissions. Nothing leaves your machine except requests to the providers you use.
 
 **Does it phone home?** No. There is no telemetry and the dashboard loads no external assets.
 
-**Claude sign-in fails or gets blocked.** Some Anthropic endpoints sit behind bot protection that CLIProxyAPI works around with a browser TLS fingerprint. cliproxy uses standard rustls. If token exchange fails for you, please open an issue with the error from the dashboard.
+**Claude sign-in fails or gets blocked.** Some Anthropic endpoints sit behind bot protection that CLIProxyAPI works around with a browser TLS fingerprint. CLIProxyAPI-Rust uses standard rustls. If token exchange fails for you, please open an issue with the error from the dashboard.
 
-**Are usage stats saved?** They're kept in memory and reset when cliproxy restarts.
+**Are usage stats saved?** They're kept in memory and reset when CLIProxyAPI-Rust restarts.
 
 ## Development
 

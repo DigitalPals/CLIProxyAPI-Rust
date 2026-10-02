@@ -6,7 +6,7 @@ const $ = (sel, el = document) => el.querySelector(sel);
 const view = $('#view');
 
 const S = {
-  key: localStorage.getItem('cliproxy.key') || '',
+  key: localStorage.getItem('cliproxyapi-rust.key') || '',
   locked: null, // null | 'key' | 'remote'
   route: 'overview',
   overview: null,
@@ -19,7 +19,7 @@ const S = {
   panel: null, // 'claude' | 'codex' | 'key'
   login: null, // { state, provider, url, callback, status, message }
   keyProvider: 'claude',
-  snippet: localStorage.getItem('cliproxy.snippet') || 'claude',
+  snippet: localStorage.getItem('cliproxyapi-rust.snippet') || 'claude',
   confirm: null,
   config: { text: null, saved: null, path: '', msg: null, busy: false },
 };
@@ -322,7 +322,7 @@ function ovAccountsHTML() {
   if (!list.length) {
     return `${head}<div class="empty list">
       <h3>No accounts connected</h3>
-      <p>Sign in with a subscription or add an API key. From a terminal you can also run <code>cliproxy login claude</code>.</p>
+      <p>Sign in with a subscription or add an API key. From a terminal you can also run <code>cliproxyapi-rust login claude</code>.</p>
       <div class="actions">
         <button class="btn" data-act="start-login" data-provider="claude"><span class="pdot" style="background:var(--claude)"></span>Sign in with Claude</button>
         <button class="btn" data-act="start-login" data-provider="codex"><span class="pdot" style="background:var(--codex)"></span>Sign in with ChatGPT</button>
@@ -343,7 +343,7 @@ function ovAccountsHTML() {
 function snippet(kind) {
   const origin = location.origin;
   const key = S.overview.client_keys[0];
-  const token = key || 'cliproxy';
+  const token = key || 'cliproxyapi-rust';
   const pick = (prefix, fallback) => (S.models.find((m) => m.id.startsWith(prefix)) || {}).id || fallback;
   const any = (S.models[0] || {}).id || 'claude-sonnet-5-5';
   const k = (s) => `<span class="k">${esc(s)}</span>`;
@@ -351,15 +351,15 @@ function snippet(kind) {
   switch (kind) {
     case 'codex':
       return {
-        text: `# ~/.codex/config.toml\nmodel = "${pick('gpt-', 'gpt-6-astra')}"\nmodel_provider = "cliproxy"\n\n[model_providers.cliproxy]\nname = "cliproxy"\nbase_url = "${origin}/v1"\nwire_api = "responses"${key ? '\nenv_key = "CLIPROXY_API_KEY"' : ''}`,
-        html: `${k('# ~/.codex/config.toml')}\nmodel = ${v(`"${pick('gpt-', 'gpt-6-astra')}"`)}\nmodel_provider = ${v('"cliproxy"')}\n\n[model_providers.cliproxy]\nname = ${v('"cliproxy"')}\nbase_url = ${v(`"${origin}/v1"`)}\nwire_api = ${v('"responses"')}${key ? `\nenv_key = ${v('"CLIPROXY_API_KEY"')}` : ''}`,
-        note: `${key ? 'Then export CLIPROXY_API_KEY with your key. ' : ''}Both HTTP and websocket transports work, and any model your accounts serve can be used.`,
+        text: `# ~/.codex/config.toml\nmodel = "${pick('gpt-', 'gpt-6-astra')}"\nmodel_provider = "cliproxyapi-rust"\n\n[model_providers.cliproxyapi-rust]\nname = "CLIProxyAPI-Rust"\nbase_url = "${origin}/v1"\nwire_api = "responses"${key ? '\nenv_key = "CLIPROXYAPI_RUST_KEY"' : ''}`,
+        html: `${k('# ~/.codex/config.toml')}\nmodel = ${v(`"${pick('gpt-', 'gpt-6-astra')}"`)}\nmodel_provider = ${v('"cliproxyapi-rust"')}\n\n[model_providers.cliproxyapi-rust]\nname = ${v('"CLIProxyAPI-Rust"')}\nbase_url = ${v(`"${origin}/v1"`)}\nwire_api = ${v('"responses"')}${key ? `\nenv_key = ${v('"CLIPROXYAPI_RUST_KEY"')}` : ''}`,
+        note: `${key ? 'Then export CLIPROXYAPI_RUST_KEY with your key. ' : ''}Both HTTP and websocket transports work, and any model your accounts serve can be used.`,
       };
     case 'sdk':
       return {
         text: `from openai import OpenAI\n\nclient = OpenAI(base_url="${origin}/v1", api_key="${token}")\nreply = client.chat.completions.create(\n    model="${any}",\n    messages=[{"role": "user", "content": "Hello"}],\n)`,
         html: `from openai import OpenAI\n\nclient = OpenAI(base_url=${v(`"${origin}/v1"`)}, api_key=${v(`"${token}"`)})\nreply = client.chat.completions.create(\n    model=${v(`"${any}"`)},\n    messages=[{"role": "user", "content": "Hello"}],\n)`,
-        note: 'Any model works with any client format; cliproxy translates between OpenAI, Anthropic and Gemini.',
+        note: 'Any model works with any client format; CLIProxyAPI-Rust translates between OpenAI, Anthropic and Gemini.',
       };
     case 'curl':
       return {
@@ -529,7 +529,7 @@ function accountListHTML() {
   const list = S.accounts || [];
   if (!list.length) {
     return `<div class="empty" style="border-top:1px solid var(--line)"><h3>No accounts yet</h3>
-      <p>Sign in with Claude or ChatGPT above, add an API key, or run <code>cliproxy login claude</code> on the server. Existing CLIProxyAPI credentials in the auth directory are picked up automatically.</p></div>`;
+      <p>Sign in with Claude or ChatGPT above, add an API key, or run <code>cliproxyapi-rust login claude</code> on the server. Existing CLIProxyAPI credentials in the auth directory are picked up automatically.</p></div>`;
   }
   const head = `<div class="row" style="min-height:36px;color:var(--fg-3);font-size:12px;font-weight:500"><span>Account</span><span>Status</span><span class="hide-md">Usage</span><span class="hide-md">Last used</span><span></span></div>`;
   const rows = list.map((a) => {
@@ -657,7 +657,7 @@ async function saveConfig() {
   try {
     const r = await api('/config', { method: 'PUT', body: JSON.stringify({ text: c.text }) });
     c.saved = c.text;
-    c.msg = { kind: 'ok', text: r.restart_required ? 'Saved. Restart cliproxy to apply the new host or port.' : 'Saved and applied.' };
+    c.msg = { kind: 'ok', text: r.restart_required ? 'Saved. Restart CLIProxyAPI-Rust to apply the new host or port.' : 'Saved and applied.' };
     refreshAccounts();
   } catch (e) {
     c.msg = { kind: 'err', text: e.message };
@@ -817,7 +817,7 @@ document.addEventListener('click', (e) => {
     case 'copy': return copy(el);
     case 'snippet':
       S.snippet = id;
-      localStorage.setItem('cliproxy.snippet', id);
+      localStorage.setItem('cliproxyapi-rust.snippet', id);
       return patch('connect', connectHTML);
     case 'start-login':
       if (S.panel === el.dataset.provider && S.login && S.login.status === 'pending') return;
@@ -869,7 +869,7 @@ document.addEventListener('submit', async (e) => {
     S.key = form.elements.key.value.trim();
     try {
       await api('/overview');
-      localStorage.setItem('cliproxy.key', S.key);
+      localStorage.setItem('cliproxyapi-rust.key', S.key);
       S.locked = null;
       await boot();
     } catch {
@@ -922,7 +922,7 @@ async function boot() {
     await loadAll();
   } catch (e) {
     if (!(e instanceof ApiError && (e.status === 401 || e.status === 403))) {
-      view.innerHTML = `<div class="lock"><h1>Can't reach cliproxy</h1><p>${esc(e.message)}. Check that the server is running, then reload.</p></div>`;
+      view.innerHTML = `<div class="lock"><h1>Can't reach CLIProxyAPI-Rust</h1><p>${esc(e.message)}. Check that the server is running, then reload.</p></div>`;
     }
     return;
   }
