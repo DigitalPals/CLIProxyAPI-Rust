@@ -20,6 +20,7 @@ const S = {
   login: null, // { state, provider, url, callback, status, message }
   keyProvider: 'claude',
   snippet: localStorage.getItem('cliproxyapi-rust.snippet') || 'claude',
+  setup: localStorage.getItem('cliproxyapi-rust.setup'), // 'open' | 'closed' | null (auto)
   confirm: null,
   config: { text: null, saved: null, path: '', msg: null, busy: false },
 };
@@ -55,6 +56,7 @@ const ICON = {
   check: '<svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.7" aria-hidden="true"><path d="m3.5 8.5 3 3 6-7" stroke-linecap="round" stroke-linejoin="round"/></svg>',
   refresh: '<svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" aria-hidden="true"><path d="M13.5 8a5.5 5.5 0 1 1-1.6-3.9" stroke-linecap="round"/><path d="M13.5 2.5v3h-3" stroke-linecap="round" stroke-linejoin="round"/></svg>',
   trash: '<svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" aria-hidden="true"><path d="M2.5 4.5h11M6.5 4.5v-2h3v2M4 4.5l.7 9h6.6l.7-9" stroke-linecap="round" stroke-linejoin="round"/></svg>',
+  chevron: '<svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.6" aria-hidden="true"><path d="m4 6 4 4 4-4" stroke-linecap="round" stroke-linejoin="round"/></svg>',
   external: '<svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" aria-hidden="true"><path d="M9.5 2.5h4v4M13.5 2.5 7 9M11.5 9.5v3a1 1 0 0 1-1 1h-7a1 1 0 0 1-1-1v-7a1 1 0 0 1 1-1h3" stroke-linecap="round" stroke-linejoin="round"/></svg>',
 };
 
@@ -140,7 +142,7 @@ function refreshAccounts() {
       patch('ov-accounts', ovAccountsHTML);
       patch('acct-list', accountListHTML);
       patch('acct-head', accountHeadHTML);
-      patch('connect', connectHTML);
+      patch('endpoint', endpointHTML);
     } catch {}
   }, 250);
 }
@@ -260,6 +262,7 @@ function skeletonHTML() {
 
 function overviewHTML() {
   return `
+    <section class="endpoint" id="endpoint" aria-label="Connect a client">${endpointHTML()}</section>
     <section class="section">
       <div class="traffic-head">
         <div class="section-head" style="margin:0"><h2>Traffic</h2><span class="meta">since start</span></div>
@@ -268,10 +271,7 @@ function overviewHTML() {
       <div class="bars" id="bars">${barsHTML()}</div>
       <div class="axis"><span>60 min ago</span><span>now</span></div>
     </section>
-    <div class="section split">
-      <section id="ov-accounts">${ovAccountsHTML()}</section>
-      <section id="connect" class="connect">${connectHTML()}</section>
-    </div>
+    <section class="section" id="ov-accounts">${ovAccountsHTML()}</section>
     <section class="section">
       <div class="section-head"><h2>Latest requests</h2><a class="link" href="#/requests">All requests</a></div>
       <div id="recent">${recentHTML()}</div>
@@ -357,9 +357,39 @@ function statusHTML(a, withScope = true) {
   return `<span class="status ${st.cls}"><span class="dot"></span><span>${st.html}</span></span>`;
 }
 
+// The tightest live usage window of a kind: short (5-hour) or long (weekly).
+function windowOf(a, short) {
+  const now = Date.now();
+  return ((a.quota && a.quota.windows) || [])
+    .filter((w) => !w.model && (!w.resets_at || Date.parse(w.resets_at) > now))
+    .filter((w) => /^\d+h$/.test(w.name) === short)
+    .sort((x, y) => y.used - x.used)[0];
+}
+
+const hasLimits = (a) => !!(windowOf(a, true) || windowOf(a, false));
+
+function meterHTML(w, label) {
+  if (!w) return `<span class="meter none"><span class="m-lab">${label}</span><span aria-label="${label}: not reported">–</span></span>`;
+  const p = Math.round(w.used);
+  const cls = p >= 95 ? 'err' : p >= 75 ? 'warn' : '';
+  const reset = w.resets_at
+    ? `<span class="reset">${p >= 100 ? 'Used up, resets in' : 'Resets in'} <span data-until="${esc(w.resets_at)}">${until(w.resets_at)}</span></span>`
+    : '';
+  return `<div class="meter ${cls}">
+    <div class="m-top"><span class="m-lab">${label}</span><span class="track" role="meter" aria-label="${label} used" aria-valuemin="0" aria-valuemax="100" aria-valuenow="${p}"><i style="width:${Math.min(100, p)}%"></i></span><span class="pct">${p}%</span></div>${reset}
+  </div>`;
+}
+
+const ROUTING = {
+  'least-used': 'Requests go to the account with the most quota left',
+  'round-robin': 'Requests take turns across accounts',
+  'fill-first': 'Requests use the first available account',
+};
+
 function ovAccountsHTML() {
   const list = S.accounts || [];
-  const head = `<div class="section-head"><h2>Accounts</h2><a class="link" href="#/accounts">Manage</a></div>`;
+  const routing = ROUTING[S.overview.routing] || '';
+  const head = `<div class="section-head"><div class="head-l"><h2>Accounts</h2>${list.length ? `<span class="meta hide-sm">${routing}</span>` : ''}</div><a class="link" href="#/accounts">Manage</a></div>`;
   if (!list.length) {
     return `${head}<div class="empty list">
       <h3>No accounts connected</h3>
@@ -371,15 +401,31 @@ function ovAccountsHTML() {
         <button class="btn" data-act="open-panel" data-panel="key">Add API key</button>
       </div></div>`;
   }
-  const shown = list.slice(0, 7);
-  const rows = shown.map((a) => `
-    <div class="row acct-row">
-      <div class="acct-name"><span class="dot ${esc(a.provider)}"></span><span class="who"><span class="label">${esc(a.label)}</span><span class="sub">${esc(acctSub(a))}</span></span></div>
-      <span class="status-line">${Object.keys(a.cooldowns || {}).length ? '' : `<span class="hide-sm">${limitsHTML(a, 1)}</span>`}${statusHTML(a)}</span>
-      <span class="num hide-sm"><b>${fmt(a.counters.requests)}</b> req</span>
-    </div>`).join('');
+  // Subscriptions that report their limits lead; the rest follow in pool order.
+  const sorted = [...list.filter(hasLimits), ...list.filter((a) => !hasLimits(a))];
+  const shown = sorted.slice(0, 10);
+  const limits = list.some(hasLimits);
+  const name = (a) => `<div class="acct-name"><span class="dot ${esc(a.provider)}"></span><span class="who"><span class="label">${esc(a.label)}</span><span class="sub">${esc(acctSub(a))}</span></span></div>`;
+  const req = (a) => `<span class="num"><b>${fmt(a.counters.requests)}</b> req</span>`;
   const more = list.length > shown.length ? `<p class="note"><a class="link" href="#/accounts">${list.length - shown.length} more</a></p>` : '';
-  return `${head}<div class="list">${rows}</div>${more}`;
+  if (!limits) {
+    const rows = shown.map((a) => `<div class="row acct-row">${name(a)}${statusHTML(a, false)}<span class="hide-sm">${req(a)}</span></div>`).join('');
+    return `${head}<div class="list">${rows}</div>${more}`;
+  }
+  const rows = shown.map((a) => {
+    const lim = hasLimits(a);
+    return `<div class="row lim-row">
+      ${name(a)}
+      <div class="lim-5h">${lim ? meterHTML(windowOf(a, true), '5h') : ''}</div>
+      <div class="lim-wk">${lim ? meterHTML(windowOf(a, false), 'Week') : ''}</div>
+      <div class="lim-status">${statusHTML(a, false)}</div>
+      <div class="lim-req hide-md">${req(a)}</div>
+    </div>`;
+  }).join('');
+  return `${head}<div class="lim-table">
+    <div class="row lim-row lim-head" aria-hidden="true"><span>Account</span><span>5-hour limit</span><span>Weekly limit</span><span>Status</span><span class="hide-md r">Requests</span></div>
+    ${rows}
+  </div>${more}`;
 }
 
 function snippet(kind) {
@@ -418,21 +464,31 @@ function snippet(kind) {
   }
 }
 
-function connectHTML() {
+function setupOpen() {
+  if (S.setup) return S.setup === 'open';
+  // Until the first request arrives, show how to connect.
+  return !S.overview.totals.requests;
+}
+
+function endpointHTML() {
   const o = S.overview;
   const key = o.client_keys[0];
+  const open = setupOpen();
+  const copyBtn = (text, label) => `<button class="btn ghost small" data-act="copy" data-text="${esc(text)}" aria-label="${label}" title="${label}">${ICON.copy}</button>`;
+  return `<div class="ep-row">
+      <div class="ep-item"><span class="ep-label">Endpoint</span><span class="ep-val mono" title="${esc(location.origin)}">${esc(location.origin)}</span>${copyBtn(location.origin, 'Copy endpoint')}</div>
+      <div class="ep-item">${key
+        ? `<span class="ep-label">Key</span><span class="ep-val mono">${esc(key)}</span>${copyBtn(key, 'Copy API key')}`
+        : `<span class="ep-label">Key</span><span class="ep-val">None required</span>`}</div>
+      <div class="ep-item hide-sm"><span class="ep-label">Models</span><span class="ep-val">${o.models}</span></div>
+      <button class="btn ghost small ep-toggle" data-act="toggle-setup" aria-expanded="${open}" aria-controls="ep-setup">Set up a client${ICON.chevron}</button>
+    </div>${open ? `<div class="ep-setup" id="ep-setup">${setupHTML()}</div>` : ''}`;
+}
+
+function setupHTML() {
   const tabs = [['claude', 'Claude Code'], ['codex', 'Codex'], ['sdk', 'OpenAI SDK'], ['curl', 'curl']];
   const sn = snippet(S.snippet);
-  return `
-    <div class="section-head"><h2>Connect</h2><span class="meta">${o.models} models</span></div>
-    <dl>
-      <dt>Base URL</dt><dd class="mono" title="${esc(location.origin)}">${esc(location.origin)}</dd>
-      <dd><button class="btn ghost small" data-act="copy" data-text="${esc(location.origin)}" aria-label="Copy base URL">${ICON.copy}</button></dd>
-      <dt>API key</dt>${key
-        ? `<dd class="mono">${esc(key)}</dd><dd><button class="btn ghost small" data-act="copy" data-text="${esc(key)}" aria-label="Copy API key">${ICON.copy}</button></dd>`
-        : `<dd>Not required <span class="dim">· set api-keys to require one</span></dd><dd></dd>`}
-    </dl>
-    <div class="snip-head">
+  return `<div class="snip-head">
       <div class="seg" role="group" aria-label="Client">${tabs.map(([id, label]) => `<button data-act="snippet" data-id="${id}" aria-pressed="${S.snippet === id}">${label}</button>`).join('')}</div>
       <button class="btn ghost small" data-act="copy" data-text="${esc(sn.text)}" aria-label="Copy snippet">${ICON.copy}<span>Copy</span></button>
     </div>
@@ -474,7 +530,7 @@ function requestRowHTML(r, lit = false, full = true) {
 function recentHTML(lit = false) {
   const rows = S.requests.slice(0, 8);
   if (!rows.length) {
-    return `<div class="empty"><h3>No requests yet</h3><p>Point a client at the base URL above and requests will show up here as they happen.</p></div>`;
+    return `<div class="empty"><h3>No requests yet</h3><p>Point a client at the endpoint above and requests will show up here as they happen.</p></div>`;
   }
   return `<div class="table-wrap"><table>
     <thead><tr><th>Time</th><th>Route</th><th>Model</th><th class="hide-sm">Account</th><th>Status</th><th class="r">Latency</th><th class="r">In</th><th class="r">Out</th></tr></thead>
@@ -942,7 +998,12 @@ document.addEventListener('click', (e) => {
     case 'snippet':
       S.snippet = id;
       localStorage.setItem('cliproxyapi-rust.snippet', id);
-      return patch('connect', connectHTML);
+      return patch('endpoint', endpointHTML);
+    case 'toggle-setup':
+      S.setup = setupOpen() ? 'closed' : 'open';
+      localStorage.setItem('cliproxyapi-rust.setup', S.setup);
+      patch('endpoint', endpointHTML);
+      return $('[data-act="toggle-setup"]')?.focus();
     case 'start-login':
       if (S.panel === el.dataset.provider && S.login && S.login.status === 'pending') return;
       return startLogin(el.dataset.provider);

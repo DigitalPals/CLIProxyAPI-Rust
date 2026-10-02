@@ -9,6 +9,7 @@ colors:
   line-strong: "#2a2a2a"
   line-hover: "#3a3a3f"
   bar-idle: "#3f3f46"
+  meter-track: "#232327"
   switch-on: "#e4e4e7"
   lit: "#ffffff"
   fg: "#f4f4f5"
@@ -69,6 +70,7 @@ typography:
 rounded:
   hair: "1.5px"
   bar: "2px"
+  meter: "3px"
   xs: "4px"
   tag: "5px"
   sm: "6px"
@@ -125,7 +127,7 @@ Mode: Operate. Familiar controls, dense tables, tabular numbers, system fonts.
 - State: `ok` ready/success, `warn` cooling down, `err` failures. Used for dots and short status words, never for large fills.
 - `brand` rose is the mark only. It is not a text color (4.47:1 on black).
 - Provider dots: Claude clay, Codex light gray, Gemini blue, OpenAI-compatible violet.
-- Supporting neutrals: `line-hover` for hovered control borders, `bar-idle` for traffic bars and disabled dots, `switch-on` for an enabled switch track, and `lit` (#fff) only for the instant a new row lights up and for the hovered primary button.
+- Supporting neutrals: `line-hover` for hovered control borders, `meter-track` for the empty part of usage meters, `bar-idle` for traffic bars and disabled dots, `switch-on` for an enabled switch track, and `lit` (#fff) only for the instant a new row lights up and for the hovered primary button.
 
 ## Typography
 
@@ -133,7 +135,9 @@ One system sans family for all UI; monospace only for real code and data (endpoi
 
 ## Layout
 
-Single column, max width 1180px, 32px side padding (16px on mobile). Sticky 56px top bar with tabs. More space above a section title (32–40px) than below it (12px). Overview splits into a 3:2 two-column grid above 900px.
+Single column, max width 1180px, 32px side padding (16px on mobile). Sticky 56px top bar with tabs. More space above a section title (32–40px) than below it (12px).
+
+Overview, top to bottom: a one-line endpoint strip (endpoint, key, model count, and a "Set up a client" disclosure that expands the client snippets; open until the first request, then remembered), traffic, accounts at full width, latest requests. The accounts table gives subscription limits their own columns (5-hour, weekly) so several subscriptions compare at a glance; accounts that report limits come first. On phones each row stacks: name and status, then the two meters side by side with inline labels.
 
 ## Elevation & Depth
 
@@ -148,6 +152,7 @@ Flat. Depth comes only from `raise` surfaces and 1px `line` hairlines. No shadow
 - Buttons: outline (line-strong border) by default; one white-filled primary per view at most; ghost buttons for row actions.
 - Tables: 12px fg-3 headers, 40px rows, 1px line separators, row hover `#070707`.
 - Status: dot + word ("Ready", "Cooling 4:12", "Disabled", "Error").
+- Usage meters: 6px track (`meter-track`, 3px radius) with the used share in `fg-2`, `warn` from 75% and `err` from 95%; the percentage in `fg` with tabular numbers to the right, and "Resets in 2h 14m" in `fg-3` underneath. Meters for one window share a column.
 - Live rows: a new request row lights up at full white and settles to its resting luminance over 1.8s (the one authored motion; disabled for reduced motion).
 
 ## Do's and Don'ts

@@ -387,6 +387,7 @@ async fn overview(State(app): State<Arc<App>>) -> Json<Value> {
         "uptime_secs": (chrono::Utc::now() - app.started).num_seconds(),
         "base_url": format!("http://{host}:{}", cfg.port),
         "client_keys": cfg.api_keys,
+        "routing": cfg.routing,
         "management_key": !cfg.management_key.is_empty(),
         "totals": *app.stats.totals.lock(),
         "active": app.stats.active.load(Ordering::Relaxed),

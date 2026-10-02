@@ -22,7 +22,7 @@ Point Claude Code, Codex, your editor or any SDK at one URL and stop caring whic
 
 <br>
 
-<img src="assets/screenshots/overview.png" alt="CLIProxyAPI-Rust dashboard: an hour of traffic, account health with a cooldown timer, and copy-paste setup for Claude Code" width="100%">
+<img src="assets/screenshots/overview.png" alt="CLIProxyAPI-Rust dashboard: the endpoint, an hour of traffic, and every subscription's 5-hour and weekly limits side by side" width="100%">
 
 <br>
 
@@ -34,7 +34,7 @@ Point Claude Code, Codex, your editor or any SDK at one URL and stop caring whic
 - **Images and video too.** `/v1/images/generations` and `/v1/images/edits` work with ChatGPT accounts, OpenAI and xAI keys, Vertex Imagen and Gemini image models. xAI video generation is behind `/v1/videos`.
 - **WebSockets.** Codex WebSocket sessions are relayed to ChatGPT's own WebSocket upstream, so `previous_response_id` works on the server side. Switch to a Claude or Gemini model mid-session and CLIProxyAPI-Rust carries the conversation over.
 - **Many accounts, no babysitting.** Each request goes to the account with the most quota left, using the 5-hour and weekly usage Claude and ChatGPT report. An account whose limit is used up sits out until it resets, a rate limit cools down only that model on that account, failed requests move to the next account, and OAuth tokens refresh themselves.
-- **A dashboard you'll actually open.** Pure black, live over WebSocket: traffic, account health with countdown timers, sign-in flows, a request log and a config editor.
+- **A dashboard you'll actually open.** Pure black, live over WebSocket: every subscription's 5-hour and weekly limits side by side, traffic, cooldown timers, sign-in flows, a request log and a config editor.
 - **Drop-in for CLIProxyAPI users.** Same credential files, same `config.yaml` (both of its layouts), same Docker paths and flags. Swap the image and keep everything else.
 
 ## Quick start
