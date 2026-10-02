@@ -1,0 +1,38 @@
+<!doctype html>
+<!--
+THESIS: An always-on operator panel: the screen is off except for what you need lit — the endpoint, account health, and live traffic. Refuses the KPI-card grid.
+OWN-WORLD: Pure #000, luminance ramp (f4f4f5 / a1a1aa / 7c7c85) for hierarchy, 1px #1a1a1a hairlines, color only for state dots and provider dots, system sans + mono for data.
+STORY: Glance: is it running, are my accounts healthy, where is traffic going. Act: connect a client, sign in an account, fix a cooling account.
+FIRST VIEWPORT: Top bar with tabs and live status; a full-width hour of traffic with inline totals; accounts list (left) beside the connect panel (right); latest requests below.
+FORM: Brief-pinned ("clean black OLED UI, simplistic"); no seed roll.
+-->
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="dark">
+  <meta name="theme-color" content="#000000">
+  <title>cliproxy</title>
+  <link rel="icon" href="/ui/icon.svg" type="image/svg+xml">
+  <link rel="stylesheet" href="/ui/style.css">
+</head>
+<body>
+  <header class="bar">
+    <div class="bar-inner">
+      <a class="brand" href="#/overview" aria-label="cliproxy overview">
+        <svg class="mark" viewBox="0 0 20 20" aria-hidden="true"><rect width="20" height="20" rx="5" fill="#e11d48"/><path d="M6 10h8M11 6.5 14.5 10 11 13.5" stroke="#fff" stroke-width="1.8" fill="none" stroke-linecap="round" stroke-linejoin="round"/></svg>
+        <span>cliproxy</span>
+      </a>
+      <nav class="tabs" aria-label="Sections">
+        <a href="#/overview" data-tab="overview">Overview</a>
+        <a href="#/accounts" data-tab="accounts">Accounts</a>
+        <a href="#/requests" data-tab="requests">Requests</a>
+        <a href="#/config" data-tab="config">Config</a>
+      </nav>
+      <div class="bar-status" id="live-status" aria-live="polite"></div>
+    </div>
+  </header>
+  <main id="view" class="view" tabindex="-1"></main>
+  <script src="/ui/app.js"></script>
+</body>
+</html>
