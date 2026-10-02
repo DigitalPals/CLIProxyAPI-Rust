@@ -404,12 +404,17 @@ fn json_array_body(mut frames: FrameStream) -> Body {
 // ------------------------------------------------------------------------- ui
 
 const INDEX: &str = include_str!("../ui/index.html");
+const LOGOS: &str = include_str!("../ui/logos.svg");
 const APP_JS: &str = include_str!("../ui/app.js");
 const STYLE: &str = include_str!("../ui/style.css");
 const ICON: &str = include_str!("../ui/icon.svg");
 
+// The logo sprite is inlined so its gradients resolve from every <use>.
+static PAGE: std::sync::LazyLock<String> = std::sync::LazyLock::new(|| INDEX.replace("<!-- logos -->", LOGOS));
+
 async fn ui_index() -> Response {
-    ([(header::CONTENT_TYPE, "text/html; charset=utf-8"), (header::CACHE_CONTROL, "no-cache")], INDEX).into_response()
+    ([(header::CONTENT_TYPE, "text/html; charset=utf-8"), (header::CACHE_CONTROL, "no-cache")], PAGE.as_str())
+        .into_response()
 }
 
 async fn ui_asset(Path(file): Path<String>) -> Response {

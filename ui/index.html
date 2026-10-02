@@ -1,9 +1,9 @@
 <!doctype html>
 <!--
 THESIS: An always-on operator panel: the screen is off except for what you need lit — the endpoint, account health, and live traffic. Refuses the KPI-card grid.
-OWN-WORLD: Pure #000, luminance ramp (f4f4f5 / a1a1aa / 7c7c85) for hierarchy, 1px #1a1a1a hairlines, color only for state dots and provider dots, system sans + mono for data.
+OWN-WORLD: Pure #000, luminance ramp (f4f4f5 / a1a1aa / 7c7c85) for hierarchy, 1px #1a1a1a hairlines, color only for state dots and the real provider logos, system sans + mono for data.
 STORY: Glance: is it running, are my accounts healthy, where is traffic going. Act: connect a client, sign in an account, fix a cooling account.
-FIRST VIEWPORT: Top bar with tabs and live status; a full-width hour of traffic with inline totals; accounts list (left) beside the connect panel (right); latest requests below.
+FIRST VIEWPORT: Top bar with tabs, privacy toggle and live status; a one-line endpoint strip; a full-width hour of traffic with inline totals; accounts with their 5-hour and weekly limits; latest requests below.
 FORM: Brief-pinned ("clean black OLED UI, simplistic"); no seed roll.
 -->
 <html lang="en">
@@ -17,6 +17,7 @@ FORM: Brief-pinned ("clean black OLED UI, simplistic"); no seed roll.
   <link rel="stylesheet" href="/ui/style.css">
 </head>
 <body>
+  <!-- logos -->
   <header class="bar">
     <div class="bar-inner">
       <a class="brand" href="#/overview" aria-label="CLIProxyAPI Rust overview">
@@ -29,7 +30,10 @@ FORM: Brief-pinned ("clean black OLED UI, simplistic"); no seed roll.
         <a href="#/requests" data-tab="requests">Requests</a>
         <a href="#/config" data-tab="config">Config</a>
       </nav>
-      <div class="bar-status" id="live-status" aria-live="polite"></div>
+      <div class="bar-end">
+        <button class="btn ghost small icon-btn" id="privacy" type="button" data-act="privacy"></button>
+        <div class="bar-status" id="live-status" aria-live="polite"></div>
+      </div>
     </div>
   </header>
   <main id="view" class="view" tabindex="-1"></main>

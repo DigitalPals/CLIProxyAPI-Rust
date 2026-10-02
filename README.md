@@ -232,6 +232,8 @@ Everything is served from the binary at `/`, with no external requests.
 </tr>
 </table>
 
+Sharing a screenshot or your screen? The eye button in the top bar hides every email and API key on the page, and copy buttons still copy the real values.
+
 <sub>Screenshots use sample data.</sub>
 
 ## Configuration
@@ -364,6 +366,8 @@ The dashboard lives in `ui/` and is embedded with `include_str!`, so rebuild aft
 ## License
 
 [Unlicense](LICENSE): public domain. Copy it, change it, sell it, ship it, no attribution required.
+
+The provider logos in `ui/logos.svg` come from [LobeHub Icons](https://github.com/lobehub/lobe-icons) (MIT, notice included in the file) and are trademarks of their owners.
 
 <br>
 

@@ -21,8 +21,9 @@ const S = {
   keyProvider: 'claude',
   snippet: localStorage.getItem('cliproxyapi-rust.snippet') || 'claude',
   setup: localStorage.getItem('cliproxyapi-rust.setup'), // 'open' | 'closed' | null (auto)
+  private: localStorage.getItem('cliproxyapi-rust.private') === '1', // hide emails and keys
   confirm: null,
-  config: { text: null, saved: null, path: '', msg: null, busy: false },
+  config: { text: null, saved: null, path: '', msg: null, busy: false, reveal: false },
 };
 
 const PROVIDER = {
@@ -51,18 +52,53 @@ const LOGIN = {
 };
 const CLIENT = { openai: 'OpenAI', responses: 'Responses', claude: 'Anthropic', gemini: 'Gemini' };
 
+// Real provider logos live in the inline sprite (ui/logos.svg). OpenAI-compatible
+// groups get their vendor's logo when the name gives it away.
+const LOGOS = new Set(['claude', 'codex', 'gemini', 'vertex', 'antigravity', 'xai', 'kimi', 'meta', 'devin']);
+const COMPAT_LOGOS = [
+  ['openrouter', 'openrouter'], ['ollama', 'ollama'], ['lmstudio', 'lmstudio'], ['deepseek', 'deepseek'], ['groq', 'groq'],
+  ['mistral', 'mistral'], ['qwen', 'qwen'], ['dashscope', 'qwen'], ['moonshot', 'kimi'], ['kimi', 'kimi'], ['grok', 'xai'],
+  ['xai', 'xai'], ['gemini', 'gemini'], ['anthropic', 'claude'], ['claude', 'claude'], ['openai', 'codex'],
+];
+
+function logo(provider, group, kind) {
+  let id = LOGOS.has(provider) ? provider : 'compat';
+  if (provider === 'xai' && kind === 'api-key') id = 'xai-api'; // xAI console keys; Grok is the subscription
+  if (provider === 'openai-compat' || provider === 'compat') {
+    const g = String(group || '').toLowerCase().replace(/[^a-z]/g, '');
+    id = (COMPAT_LOGOS.find(([k]) => g.includes(k)) || [, 'compat'])[1];
+  }
+  return `<svg class="logo logo-${id}" aria-hidden="true" focusable="false"><use href="#logo-${id}"/></svg>`;
+}
+
 const ICON = {
   copy: '<svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" aria-hidden="true"><rect x="5.5" y="5.5" width="8" height="8" rx="1.5"/><path d="M10.5 5.5V3.5A1 1 0 0 0 9.5 2.5h-6a1 1 0 0 0-1 1v6a1 1 0 0 0 1 1h2"/></svg>',
   check: '<svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.7" aria-hidden="true"><path d="m3.5 8.5 3 3 6-7" stroke-linecap="round" stroke-linejoin="round"/></svg>',
   refresh: '<svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" aria-hidden="true"><path d="M13.5 8a5.5 5.5 0 1 1-1.6-3.9" stroke-linecap="round"/><path d="M13.5 2.5v3h-3" stroke-linecap="round" stroke-linejoin="round"/></svg>',
   trash: '<svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" aria-hidden="true"><path d="M2.5 4.5h11M6.5 4.5v-2h3v2M4 4.5l.7 9h6.6l.7-9" stroke-linecap="round" stroke-linejoin="round"/></svg>',
   chevron: '<svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.6" aria-hidden="true"><path d="m4 6 4 4 4-4" stroke-linecap="round" stroke-linejoin="round"/></svg>',
+  eye: '<svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" aria-hidden="true"><path d="M1.5 8S3.9 3.5 8 3.5 14.5 8 14.5 8 12.1 12.5 8 12.5 1.5 8 1.5 8Z" stroke-linejoin="round"/><circle cx="8" cy="8" r="2"/></svg>',
+  eyeOff: '<svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" aria-hidden="true"><path d="M6.4 3.7A6 6 0 0 1 8 3.5c4.1 0 6.5 4.5 6.5 4.5a11.5 11.5 0 0 1-1.6 2.2M10.3 12a5.7 5.7 0 0 1-2.3.5C3.9 12.5 1.5 8 1.5 8a11.6 11.6 0 0 1 2.6-3.1M6.6 6.6a2 2 0 0 0 2.8 2.8M2.5 2.5l11 11" stroke-linecap="round" stroke-linejoin="round"/></svg>',
   external: '<svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" aria-hidden="true"><path d="M9.5 2.5h4v4M13.5 2.5 7 9M11.5 9.5v3a1 1 0 0 1-1 1h-7a1 1 0 0 1-1-1v-7a1 1 0 0 1 1-1h3" stroke-linecap="round" stroke-linejoin="round"/></svg>',
 };
 
 // ---------------------------------------------------------------- helpers
 
 const esc = (v) => String(v ?? '').replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' })[c]);
+
+// Privacy: with the toggle on, emails and the visible ends of API keys are
+// replaced before anything reaches the page. Copy buttons still copy the real value.
+const EMAIL = /[^\s@<>()"',;:]+@[^\s@<>()"',;:]+\.[a-z]{2,}/gi;
+const KEY_ENDS = /\S*…\S*/g;
+const HIDDEN = '••••••••';
+const hideEmails = (text) => (S.private ? String(text ?? '').replace(EMAIL, '••••••@••••••') : text);
+// An account label: an email, a masked key ("sk-ant…f3e2") or a group and key.
+const who = (text) => (S.private ? String(hideEmails(text) ?? '').replace(KEY_ENDS, '••••…••••') : text);
+const secret = (key) => (S.private ? HIDDEN : key);
+// Signed-in accounts without an email (a Devin username, a file name) are hidden whole.
+const acctLabel = (a) => (S.private && a.kind !== 'api-key' && !a.label.includes('@') ? HIDDEN : who(a.label));
+// Home directories name the person: /Users/maya/... reads ~/...
+const home = (path) => (S.private ? String(path ?? '').replace(/^(\/Users|\/home)\/[^/]+/, '~').replace(/^[A-Za-z]:\\Users\\[^\\]+/, '~') : path);
 
 function fmt(n) {
   n = Number(n) || 0;
@@ -240,7 +276,18 @@ function renderStatus() {
   el.innerHTML = `<span class="dot" style="background:${dot}" title="${text}"></span><span class="live-word">${text}</span>${up ? `<span class="uptime dim">· up <span data-uptime>${up}</span></span>` : ''}`;
 }
 
+function renderPrivacy() {
+  const btn = $('#privacy');
+  if (!btn) return;
+  const label = S.private ? 'Show emails and keys' : 'Hide emails and keys';
+  btn.innerHTML = S.private ? ICON.eyeOff : ICON.eye;
+  btn.setAttribute('aria-pressed', String(S.private));
+  btn.setAttribute('aria-label', label);
+  btn.title = label;
+}
+
 function render() {
+  renderPrivacy();
   for (const a of document.querySelectorAll('.tabs a')) {
     if (a.dataset.tab === S.route && !S.locked) a.setAttribute('aria-current', 'page');
     else a.removeAttribute('aria-current');
@@ -395,8 +442,8 @@ function ovAccountsHTML() {
       <h3>No accounts connected</h3>
       <p>Sign in with a subscription or add an API key. From a terminal you can also run <code>cliproxyapi-rust login claude</code>.</p>
       <div class="actions">
-        <button class="btn" data-act="start-login" data-provider="claude"><span class="pdot" style="background:var(--claude)"></span>Sign in with Claude</button>
-        <button class="btn" data-act="start-login" data-provider="codex"><span class="pdot" style="background:var(--codex)"></span>Sign in with ChatGPT</button>
+        <button class="btn" data-act="start-login" data-provider="claude">${logo('claude')}Sign in with Claude</button>
+        <button class="btn" data-act="start-login" data-provider="codex">${logo('codex')}Sign in with ChatGPT</button>
         <button class="btn" data-act="open-panel" data-panel="connect">Other accounts</button>
         <button class="btn" data-act="open-panel" data-panel="key">Add API key</button>
       </div></div>`;
@@ -405,7 +452,7 @@ function ovAccountsHTML() {
   const sorted = [...list.filter(hasLimits), ...list.filter((a) => !hasLimits(a))];
   const shown = sorted.slice(0, 10);
   const limits = list.some(hasLimits);
-  const name = (a) => `<div class="acct-name"><span class="dot ${esc(a.provider)}"></span><span class="who"><span class="label">${esc(a.label)}</span><span class="sub">${esc(acctSub(a))}</span></span></div>`;
+  const name = (a) => `<div class="acct-name">${logo(a.provider, a.group, a.kind)}<span class="who"><span class="label">${esc(acctLabel(a))}</span><span class="sub">${esc(acctSub(a))}</span></span></div>`;
   const req = (a) => `<span class="num"><b>${fmt(a.counters.requests)}</b> req</span>`;
   const more = list.length > shown.length ? `<p class="note"><a class="link" href="#/accounts">${list.length - shown.length} more</a></p>` : '';
   if (!limits) {
@@ -432,6 +479,7 @@ function snippet(kind) {
   const origin = location.origin;
   const key = S.overview.client_keys[0];
   const token = key || 'cliproxyapi-rust';
+  const shown = key ? secret(key) : token; // what the page shows; copy gets the real token
   const pick = (prefix, fallback) => (S.models.find((m) => m.id.startsWith(prefix)) || {}).id || fallback;
   const any = (S.models[0] || {}).id || 'claude-sonnet-5-5';
   const k = (s) => `<span class="k">${esc(s)}</span>`;
@@ -446,19 +494,19 @@ function snippet(kind) {
     case 'sdk':
       return {
         text: `from openai import OpenAI\n\nclient = OpenAI(base_url="${origin}/v1", api_key="${token}")\nreply = client.chat.completions.create(\n    model="${any}",\n    messages=[{"role": "user", "content": "Hello"}],\n)`,
-        html: `from openai import OpenAI\n\nclient = OpenAI(base_url=${v(`"${origin}/v1"`)}, api_key=${v(`"${token}"`)})\nreply = client.chat.completions.create(\n    model=${v(`"${any}"`)},\n    messages=[{"role": "user", "content": "Hello"}],\n)`,
+        html: `from openai import OpenAI\n\nclient = OpenAI(base_url=${v(`"${origin}/v1"`)}, api_key=${v(`"${shown}"`)})\nreply = client.chat.completions.create(\n    model=${v(`"${any}"`)},\n    messages=[{"role": "user", "content": "Hello"}],\n)`,
         note: 'Any model works with any client format; CLIProxyAPI-Rust translates between OpenAI, Anthropic and Gemini.',
       };
     case 'curl':
       return {
         text: `curl ${origin}/v1/chat/completions \\\n  -H "Authorization: Bearer ${token}" \\\n  -H "Content-Type: application/json" \\\n  -d '{"model": "${any}", "messages": [{"role": "user", "content": "Hello"}]}'`,
-        html: `curl ${v(`${origin}/v1/chat/completions`)} \\\n  -H ${v(`"Authorization: Bearer ${token}"`)} \\\n  -H "Content-Type: application/json" \\\n  -d '{"model": ${v(`"${any}"`)}, "messages": [{"role": "user", "content": "Hello"}]}'`,
+        html: `curl ${v(`${origin}/v1/chat/completions`)} \\\n  -H ${v(`"Authorization: Bearer ${shown}"`)} \\\n  -H "Content-Type: application/json" \\\n  -d '{"model": ${v(`"${any}"`)}, "messages": [{"role": "user", "content": "Hello"}]}'`,
         note: 'Also available: /v1/messages, /v1/responses (HTTP and websocket) and /v1beta/models.',
       };
     default:
       return {
         text: `export ANTHROPIC_BASE_URL=${origin}\nexport ANTHROPIC_AUTH_TOKEN=${token}\nclaude`,
-        html: `export ANTHROPIC_BASE_URL=${v(origin)}\nexport ANTHROPIC_AUTH_TOKEN=${v(token)}\nclaude`,
+        html: `export ANTHROPIC_BASE_URL=${v(origin)}\nexport ANTHROPIC_AUTH_TOKEN=${v(shown)}\nclaude`,
         note: 'Claude Code requests pass through untouched. Set ANTHROPIC_MODEL to use a GPT or Gemini model instead.',
       };
   }
@@ -478,7 +526,7 @@ function endpointHTML() {
   return `<div class="ep-row">
       <div class="ep-item"><span class="ep-label">Endpoint</span><span class="ep-val mono" title="${esc(location.origin)}">${esc(location.origin)}</span>${copyBtn(location.origin, 'Copy endpoint')}</div>
       <div class="ep-item">${key
-        ? `<span class="ep-label">Key</span><span class="ep-val mono">${esc(key)}</span>${copyBtn(key, 'Copy API key')}`
+        ? `<span class="ep-label">Key</span><span class="ep-val mono">${esc(secret(key))}</span>${copyBtn(key, 'Copy API key')}`
         : `<span class="ep-label">Key</span><span class="ep-val">None required</span>`}</div>
       <div class="ep-item hide-sm"><span class="ep-label">Models</span><span class="ep-val">${o.models}</span></div>
       <button class="btn ghost small ep-toggle" data-act="toggle-setup" aria-expanded="${open}" aria-controls="ep-setup">Set up a client${ICON.chevron}</button>
@@ -496,11 +544,14 @@ function setupHTML() {
     <p class="note">${esc(sn.note)}</p>`;
 }
 
+const accountOf = (r) => (S.accounts || []).find((a) => a.provider === r.provider && a.label === r.account);
+
 function routeHTML(r, tags = false) {
-  const provider = PROVIDER[r.provider] || (r.provider ? r.provider : '—');
+  const acct = accountOf(r);
+  const provider = acct && acct.group ? acct.group : PROVIDER[r.provider] || (r.provider ? r.provider : '—');
   const kind = { ws: 'ws', images: 'image', video: 'video' }[r.transport];
   const extra = tags ? [kind, r.attempts > 1 ? `${r.attempts} tries` : null].filter(Boolean) : [];
-  return `<span class="route"><span>${esc(CLIENT[r.client] || r.client)}</span><span class="arrow">→</span><span class="dot ${esc(r.provider)}"></span><span>${esc(provider)}</span>${extra.map((t) => `<span class="tag">${t}</span>`).join('')}</span>`;
+  return `<span class="route"><span>${esc(CLIENT[r.client] || r.client)}</span><span class="arrow">→</span>${r.provider ? logo(r.provider, acct ? acct.group : r.account, acct && acct.kind) : ''}<span>${esc(provider)}</span>${extra.map((t) => `<span class="tag">${t}</span>`).join('')}</span>`;
 }
 
 function codeClass(s) {
@@ -512,12 +563,13 @@ function codeClass(s) {
 
 function requestRowHTML(r, lit = false, full = true) {
   const status = r.status === 499 ? 'closed' : r.status;
-  const err = r.error && r.status >= 400 && r.status !== 499 ? `<span class="errline" title="${esc(r.error)}">${esc(r.error)}</span>` : '';
+  const error = hideEmails(r.error);
+  const err = r.error && r.status >= 400 && r.status !== 499 ? `<span class="errline" title="${esc(error)}">${esc(error)}</span>` : '';
   return `<tr class="${lit ? 'lit' : ''}">
     <td class="mono" title="${esc(r.ts)}">${clock(r.ts)}</td>
     <td>${routeHTML(r, full)}</td>
     <td><span class="model mono">${esc(r.model)}</span>${err}</td>
-    <td class="hide-sm">${esc(r.account || '—')}</td>
+    <td class="hide-sm">${esc((accountOf(r) ? acctLabel(accountOf(r)) : who(r.account)) || '—')}</td>
     <td class="mono ${codeClass(r.status)}">${status}</td>
     ${full ? `<td class="r mono hide-sm">${ms(r.ttft_ms)}</td>` : ''}
     <td class="r mono">${ms(r.latency_ms)}</td>
@@ -550,7 +602,7 @@ function accountHeadHTML() {
   const n = (S.accounts || []).length;
   const connecting = S.panel === 'connect' || !!LOGIN[S.panel] || S.panel === 'vertex';
   return `<div class="page-head">
-    <div><h1>Accounts</h1><p>${n ? `${n} connected · stored in <span class="mono">${esc(S.overview.auth_dir)}</span> and config.yaml` : 'Nothing connected yet'}</p></div>
+    <div><h1>Accounts</h1><p>${n ? `${n} connected · stored in <span class="mono">${esc(home(S.overview.auth_dir))}</span> and config.yaml` : 'Nothing connected yet'}</p></div>
     <div class="actions">
       <button class="btn" data-act="open-panel" data-panel="connect" aria-expanded="${connecting}">Connect account</button>
       <button class="btn" data-act="open-panel" data-panel="key" aria-expanded="${S.panel === 'key'}">Add API key</button>
@@ -572,7 +624,7 @@ function connectPanelHTML() {
     <p>Sign in with a subscription. Credentials are stored in the auth directory on this machine.</p>
     <div class="choices">${SIGNIN.map(([id, name, sub]) => `
       <button class="choice" data-act="start-login" data-provider="${id}">
-        <span class="dot ${id}"></span><span class="who"><span class="label">${name}</span><span class="sub">${sub}</span></span>
+        ${logo(id)}<span class="who"><span class="label">${name}</span><span class="sub">${sub}</span></span>
       </button>`).join('')}
     </div>
     <div class="actions" style="margin-top:16px"><button class="btn ghost" data-act="close-panel">Cancel</button></div>
@@ -581,8 +633,8 @@ function connectPanelHTML() {
 
 function loginStatus(L, port) {
   if (!L || L.status === 'starting') return `<span class="wait"><span class="pulse"></span>Opening the sign-in page…</span>`;
-  if (L.status === 'done') return `<span class="ok">Connected ${esc(L.message || '')}</span>`;
-  if (L.status === 'error') return `<span class="err">${esc(L.message || 'Sign-in failed')}</span>`;
+  if (L.status === 'done') return `<span class="ok">Connected ${esc(who(L.message) || '')}</span>`;
+  if (L.status === 'error') return `<span class="err">${esc(hideEmails(L.message) || 'Sign-in failed')}</span>`;
   if (L.kind === 'device') return `<span class="wait"><span class="pulse"></span>Waiting for you to approve…</span>`;
   if (L.callback) return `<span class="wait"><span class="pulse"></span>Waiting for you to approve in the browser…</span>`;
   return `<span class="warn">This server can't receive the redirect${port ? ` (port ${port} is busy)` : ''}. Paste the URL below.</span>`;
@@ -590,7 +642,7 @@ function loginStatus(L, port) {
 
 function doneHTML(name, L) {
   return `<div class="panel" role="region" aria-label="Sign in with ${name}">
-    <h3>Signed in</h3><p>${esc(L.message || '')} is ready to serve requests.</p>
+    <h3>Signed in</h3><p>${esc(who(L.message) || '')} is ready to serve requests.</p>
     <div class="actions"><button class="btn" data-act="close-panel">Done</button></div></div>`;
 }
 
@@ -664,7 +716,7 @@ function keyPanelHTML() {
   return `<form class="panel" data-form="key" aria-label="Add an API key">
     <h3>Add an API key</h3>
     <p>Keys are saved to <span class="mono">config.yaml</span> and used alongside your signed-in accounts.</p>
-    <div class="seg" role="group" aria-label="Provider">${opts.map(([id, label]) => `<button type="button" data-act="key-provider" data-id="${id}" aria-pressed="${p === id}">${label}</button>`).join('')}</div>
+    <div class="seg" role="group" aria-label="Provider">${opts.map(([id, label]) => `<button type="button" data-act="key-provider" data-id="${id}" aria-pressed="${p === id}">${logo(id, null, 'api-key')}${label}</button>`).join('')}</div>
     <div class="grid">
       <label class="field wide"><span>API key${compat ? ' (optional for local servers)' : ''}</span><input class="mono" type="password" name="api_key" autocomplete="off" spellcheck="false" ${compat ? '' : 'required'}></label>
       <label class="field ${compat ? '' : 'wide'}"><span>Base URL${compat ? '' : ' (optional)'}</span><input class="mono" type="url" name="base_url" placeholder="${esc(base)}" ${compat ? 'required' : ''}></label>
@@ -687,18 +739,18 @@ function accountListHTML() {
     const confirming = S.confirm === a.id;
     const cooling = Object.keys(a.cooldowns || {}).length > 0;
     const actions = confirming
-      ? `<button class="btn small danger" data-act="delete" data-id="${esc(a.id)}" aria-label="Confirm removing ${esc(a.label)}">Remove</button><button class="btn ghost small" data-act="cancel-delete">Keep</button>`
-      : `${a.kind === 'oauth' ? `<button class="btn ghost small" data-act="refresh" data-id="${esc(a.id)}" aria-label="Refresh token for ${esc(a.label)}" title="Refresh token">${ICON.refresh}</button>` : ''}
-         <button class="switch" role="switch" aria-checked="${!a.disabled}" aria-label="${a.disabled ? 'Enable' : 'Disable'} ${esc(a.label)}" title="${a.disabled ? 'Disabled' : 'Enabled'}" data-act="toggle" data-id="${esc(a.id)}"></button>
-         <button class="btn ghost small" data-act="confirm-delete" data-id="${esc(a.id)}" aria-label="Remove ${esc(a.label)}" title="Remove">${ICON.trash}</button>`;
+      ? `<button class="btn small danger" data-act="delete" data-id="${esc(a.id)}" aria-label="Confirm removing ${esc(acctLabel(a))}">Remove</button><button class="btn ghost small" data-act="cancel-delete">Keep</button>`
+      : `${a.kind === 'oauth' ? `<button class="btn ghost small" data-act="refresh" data-id="${esc(a.id)}" aria-label="Refresh token for ${esc(acctLabel(a))}" title="Refresh token">${ICON.refresh}</button>` : ''}
+         <button class="switch" role="switch" aria-checked="${!a.disabled}" aria-label="${a.disabled ? 'Enable' : 'Disable'} ${esc(acctLabel(a))}" title="${a.disabled ? 'Disabled' : 'Enabled'}" data-act="toggle" data-id="${esc(a.id)}"></button>
+         <button class="btn ghost small" data-act="confirm-delete" data-id="${esc(a.id)}" aria-label="Remove ${esc(acctLabel(a))}" title="Remove">${ICON.trash}</button>`;
     const c = a.counters;
     return `<div class="row">
-      <div class="acct-name"><span class="dot ${esc(a.provider)}"></span><span class="who"><span class="label">${esc(a.label)}</span><span class="sub">${esc(acctSub(a))}</span></span></div>
+      <div class="acct-name">${logo(a.provider, a.group, a.kind)}<span class="who"><span class="label">${esc(acctLabel(a))}</span><span class="sub">${esc(acctSub(a))}</span></span></div>
       <div class="stack">${statusHTML(a, false)}${cooling ? `<span class="sub">${esc(acctStatus(a).scope)} · <button class="linkbtn" data-act="reset" data-id="${esc(a.id)}" title="Make this account available again now">Clear</button></span>` : limitsHTML(a) ? `<span class="sub">${limitsHTML(a)}</span>` : ''}</div>
       <div class="stack hide-md"><span class="main"><b>${fmt(c.requests)}</b> ${c.requests === 1 ? 'request' : 'requests'}</span><span class="sub">${fmt(c.input_tokens)} in · ${fmt(c.output_tokens)} out${c.failures ? ` · <span class="err">${fmt(c.failures)} failed</span>` : ''}</span></div>
       <span class="num hide-md" style="text-align:left" data-ago="${esc(a.last_used || '')}">${ago(a.last_used)}</span>
       <div class="row-actions">${actions}</div>
-      ${a.last_error ? `<div class="acct-err">${esc(a.last_error)}</div>` : ''}
+      ${a.last_error ? `<div class="acct-err">${esc(hideEmails(a.last_error))}</div>` : ''}
     </div>`;
   }).join('');
   return `<div class="acct-table list">${head}${rows}</div>`;
@@ -755,8 +807,15 @@ function configHTML() {
     return skeletonHTML();
   }
   const dirty = c.text !== c.saved;
+  if (S.private && !c.reveal) {
+    return `
+    <div class="page-head"><div><h1>Configuration</h1><p class="mono">${esc(home(c.path))}</p></div></div>
+    <div class="empty" style="border-top:1px solid var(--line)"><h3>Hidden while emails and keys are hidden</h3>
+      <p>config.yaml holds your API keys in plain text.</p>
+      <button class="btn" data-act="reveal-config">${ICON.eye}Show config</button></div>`;
+  }
   return `
-    <div class="page-head"><div><h1>Configuration</h1><p class="mono">${esc(c.path)}</p></div></div>
+    <div class="page-head"><div><h1>Configuration</h1><p class="mono">${esc(home(c.path))}</p></div></div>
     <label class="sr-only" for="cfg">config.yaml</label>
     <textarea id="cfg" class="editor" spellcheck="false" autocapitalize="off" autocomplete="off">${esc(c.text)}</textarea>
     <div class="editor-foot">
@@ -995,6 +1054,18 @@ document.addEventListener('click', (e) => {
   const { act, id } = el.dataset;
   switch (act) {
     case 'copy': return copy(el);
+    case 'privacy': {
+      S.private = !S.private;
+      localStorage.setItem('cliproxyapi-rust.private', S.private ? '1' : '0');
+      const paste = $('#paste-url')?.value;
+      render();
+      if (paste && $('#paste-url')) $('#paste-url').value = paste;
+      return $('#privacy')?.focus();
+    }
+    case 'reveal-config':
+      S.config.reveal = true;
+      render();
+      return $('#cfg')?.focus();
     case 'snippet':
       S.snippet = id;
       localStorage.setItem('cliproxyapi-rust.snippet', id);
@@ -1070,7 +1141,7 @@ document.addEventListener('submit', async (e) => {
 function onRoute() {
   const r = (location.hash.replace(/^#\/?/, '') || 'overview').split('/')[0];
   S.route = ['overview', 'accounts', 'requests', 'config'].includes(r) ? r : 'overview';
-  if (S.route !== 'config') S.config.msg = null;
+  if (S.route !== 'config') Object.assign(S.config, { msg: null, reveal: false });
   render();
   if (S.route === 'accounts' && S.panel === 'key') $('#acct-panel input')?.focus();
   view.focus({ preventScroll: true });

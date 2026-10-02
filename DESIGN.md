@@ -19,16 +19,6 @@ colors:
   warn: "#fbbf24"
   err: "#fb7185"
   brand: "#e11d48"
-  provider-claude: "#e8956b"
-  provider-codex: "#d4d4d8"
-  provider-gemini: "#7aa2f7"
-  provider-compat: "#a78bfa"
-  provider-vertex: "#4cc9b0"
-  provider-antigravity: "#f472b6"
-  provider-kimi: "#67d2f0"
-  provider-xai: "#ffffff"
-  provider-meta: "#5b8def"
-  provider-devin: "#b6e35a"
 typography:
   body:
     fontFamily: "ui-sans-serif, -apple-system, BlinkMacSystemFont, Segoe UI, system-ui, sans-serif"
@@ -116,7 +106,7 @@ components:
 
 ## Overview
 
-An operator panel that behaves like an always-on display: the screen is black, and only information is lit. Luminance, not color, carries hierarchy (fg → fg-2 → fg-3). Color is reserved for state (ok / warn / err) and for identifying providers with a small dot. Nothing glows. There are no cards: sections are separated by space and single hairlines.
+An operator panel that behaves like an always-on display: the screen is black, and only information is lit. Luminance, not color, carries hierarchy (fg → fg-2 → fg-3). Color is reserved for state (ok / warn / err) and for the providers' own logos. Nothing glows. There are no cards: sections are separated by space and single hairlines.
 
 Mode: Operate. Familiar controls, dense tables, tabular numbers, system fonts.
 
@@ -126,7 +116,7 @@ Mode: Operate. Familiar controls, dense tables, tabular numbers, system fonts.
 - Text ramp: `fg` for primary values and titles, `fg-2` for body and secondary values, `fg-3` (5.1:1) for labels and metadata. Never go dimmer than `fg-3` for text.
 - State: `ok` ready/success, `warn` cooling down, `err` failures. Used for dots and short status words, never for large fills.
 - `brand` rose is the mark only. It is not a text color (4.47:1 on black).
-- Provider dots: Claude clay, Codex light gray, Gemini blue, OpenAI-compatible violet.
+- Providers are identified by their real logos, in their own colors. One-color marks (OpenAI, Grok, xAI, OpenRouter, Ollama, LM Studio, Groq) take `fg`; the generic OpenAI-compatible mark takes `fg-3`.
 - Supporting neutrals: `line-hover` for hovered control borders, `meter-track` for the empty part of usage meters, `bar-idle` for traffic bars and disabled dots, `switch-on` for an enabled switch track, and `lit` (#fff) only for the instant a new row lights up and for the hovered primary button.
 
 ## Typography
@@ -135,7 +125,7 @@ One system sans family for all UI; monospace only for real code and data (endpoi
 
 ## Layout
 
-Single column, max width 1180px, 32px side padding (16px on mobile). Sticky 56px top bar with tabs. More space above a section title (32–40px) than below it (12px).
+Single column, max width 1180px, 32px side padding (16px on mobile). Sticky 56px top bar with tabs, the privacy toggle and live status (the brand mark gives way to the tabs under 480px). More space above a section title (32–40px) than below it (12px).
 
 Overview, top to bottom: a one-line endpoint strip (endpoint, key, model count, and a "Set up a client" disclosure that expands the client snippets; open until the first request, then remembered), traffic, accounts at full width, latest requests. The accounts table gives subscription limits their own columns (5-hour, weekly) so several subscriptions compare at a glance; accounts that report limits come first. On phones each row stacks: name and status, then the two meters side by side with inline labels.
 
@@ -152,6 +142,8 @@ Flat. Depth comes only from `raise` surfaces and 1px `line` hairlines. No shadow
 - Buttons: outline (line-strong border) by default; one white-filled primary per view at most; ghost buttons for row actions.
 - Tables: 12px fg-3 headers, 40px rows, 1px line separators, row hover `#070707`.
 - Status: dot + word ("Ready", "Cooling 4:12", "Disabled", "Error").
+- Provider logos: an inline SVG sprite (`ui/logos.svg`, from LobeHub Icons, MIT) used through `<use>`; 18px beside account names, 14px in routes, buttons and the segmented control, 20px in the sign-in picker. OpenAI-compatible groups get their vendor's logo when the group name gives it away (OpenRouter, Ollama, LM Studio, DeepSeek, Groq, Mistral, Qwen, Kimi), otherwise the generic mark. xAI API keys show the xAI mark; Grok sign-ins show Grok.
+- Privacy toggle: a 30px ghost icon button (eye / eye-off) left of the live status, pressed state on `#18181b`, remembered per browser. When on, emails read `••••••@••••••`, key ends `••••…••••`, the client key `••••••••`, sign-ins without an email are hidden whole, home folders read `~`, and the config editor waits behind "Show config". Copy buttons still copy the real value.
 - Usage meters: 6px track (`meter-track`, 3px radius) with the used share in `fg-2`, `warn` from 75% and `err` from 95%; the percentage in `fg` with tabular numbers to the right, and "Resets in 2h 14m" in `fg-3` underneath. Meters for one window share a column.
 - Live rows: a new request row lights up at full white and settles to its resting luminance over 1.8s (the one authored motion; disabled for reduced motion).
 
