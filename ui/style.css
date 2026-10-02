@@ -147,7 +147,7 @@ a { color: inherit; text-decoration: none; }
 .table-wrap { overflow-x: auto; border-top: 1px solid var(--line); }
 table { width: 100%; border-collapse: collapse; }
 th { position: sticky; top: 0; background: var(--bg); text-align: left; color: var(--fg-3); font-size: 12px; font-weight: 500; padding: 10px 12px; border-bottom: 1px solid var(--line); white-space: nowrap; }
-td { padding: 10px 12px; border-bottom: 1px solid var(--line); white-space: nowrap; color: var(--fg-2); font-size: 13px; vertical-align: top; }
+td { padding: 10px 12px; border-bottom: 1px solid var(--line); white-space: nowrap; color: var(--fg-2); font-size: 13px; vertical-align: baseline; }
 th:first-child, td:first-child { padding-left: 4px; }
 th.r, td.r { text-align: right; }
 tbody tr { transition: background .15s; }
