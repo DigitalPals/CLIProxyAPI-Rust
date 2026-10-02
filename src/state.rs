@@ -95,10 +95,27 @@ impl Http {
 
     /// Client for the given proxy (falls back to the configured default).
     pub fn client(&self, proxy: Option<&str>) -> reqwest::Client {
+        self.build(proxy, None)
+    }
+
+    /// Antigravity accounts each get their own HTTP/1.1 pool, as the IDE does;
+    /// Google's backend treats shared HTTP/2 connections less kindly.
+    pub fn for_account(&self, acct: &crate::accounts::Account) -> reqwest::Client {
+        match acct.provider {
+            crate::accounts::Provider::Antigravity => self.build(acct.proxy_url.as_deref(), Some(&acct.id)),
+            _ => self.build(acct.proxy_url.as_deref(), None),
+        }
+    }
+
+    fn build(&self, proxy: Option<&str>, h1_pool: Option<&str>) -> reqwest::Client {
         let proxy =
             proxy.filter(|p| !p.is_empty()).map(String::from).unwrap_or_else(|| self.default_proxy.lock().clone());
+        let key = match h1_pool {
+            Some(id) => format!("{proxy}\0h1:{id}"),
+            None => proxy.clone(),
+        };
         let mut clients = self.clients.lock();
-        if let Some(c) = clients.get(&proxy) {
+        if let Some(c) = clients.get(&key) {
             return c.clone();
         }
         let mut b = reqwest::Client::builder()
@@ -115,8 +132,11 @@ impl Http {
                 Err(e) => tracing::error!("invalid proxy-url {proxy}: {e}"),
             }
         }
+        if h1_pool.is_some() {
+            b = b.http1_only().pool_idle_timeout(Duration::from_secs(200));
+        }
         let c = b.build().expect("http client");
-        clients.insert(proxy, c.clone());
+        clients.insert(key, c.clone());
         c
     }
 }

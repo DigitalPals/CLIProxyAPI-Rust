@@ -495,7 +495,7 @@ fn antigravity(t: &Target, body: Value) -> Prepared {
             ("user-agent".into(), crate::antigravity::user_agent()),
             ("accept".into(), if t.stream { "text/event-stream" } else { "application/json" }.into()),
         ],
-        body: crate::antigravity::envelope(body, t.model, project.as_deref()),
+        body: crate::antigravity::envelope(body, &crate::antigravity::current_id(t.model), project.as_deref()),
         raw: None,
     }
 }

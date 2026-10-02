@@ -195,6 +195,38 @@ fn reset_after(headers: &reqwest::header::HeaderMap, body: &str) -> Option<chron
     None
 }
 
+/// A failure worth retrying on the same account, and how long to wait first:
+/// capacity errors (Google's "No capacity available") and rate limits that
+/// reset within seconds. Real quota exhaustion is not one of them.
+fn soft_failure(
+    provider: Provider,
+    status: u16,
+    headers: &reqwest::header::HeaderMap,
+    body: &str,
+) -> Option<std::time::Duration> {
+    let short = |until: chrono::DateTime<Utc>| {
+        let secs = (until - Utc::now()).num_milliseconds().max(0) as u64;
+        (secs <= 10_000).then(|| std::time::Duration::from_millis(secs))
+    };
+    match status {
+        500 | 502 | 503 | 504 | 529 => Some(std::time::Duration::ZERO),
+        429 => {
+            if body.contains("QUOTA_EXHAUSTED") {
+                return None;
+            }
+            match reset_after(headers, body) {
+                Some(until) => short(until),
+                // Google answers bursts with a bare RESOURCE_EXHAUSTED while quota is left.
+                None if matches!(provider, Provider::Antigravity | Provider::Gemini | Provider::Vertex) => {
+                    Some(std::time::Duration::ZERO)
+                }
+                None => None,
+            }
+        }
+        _ => None,
+    }
+}
+
 /// Responses backends that understand freeform `custom` tools.
 fn native_custom_tools(p: Provider) -> bool {
     matches!(p, Provider::Codex | Provider::Compat)
@@ -310,6 +342,8 @@ pub async fn execute(app: Arc<App>, call: Call) -> Reply {
     let mut refreshed: Vec<String> = Vec::new();
     let mut last_error: Option<(u16, Value)> = None;
     let mut retry_same: Option<String> = None;
+    // Same-account retries for blips (capacity errors, soft rate limits).
+    let mut soft_tries: HashMap<String, u32> = HashMap::new();
     let attempts = cfg.request_retry.max(1) as usize;
 
     while tried.len() < attempts {
@@ -413,7 +447,7 @@ pub async fn execute(app: Arc<App>, call: Call) -> Reply {
             tracing::debug!(url = %prepared.url, body = %prepared.body, "upstream request");
         }
 
-        let client = app.http.client(acct.proxy_url.as_deref());
+        let client = app.http.for_account(&acct);
         let mut rb = client.post(&prepared.url);
         for (k, v) in &prepared.headers {
             rb = rb.header(k.as_str(), v.as_str());
@@ -425,6 +459,15 @@ pub async fn execute(app: Arc<App>, call: Call) -> Reply {
                 let msg = format!("upstream connection failed: {e}");
                 tracing::warn!(account = %acct.label, "{msg}");
                 acct.state.lock().last_error = Some(msg.clone());
+                // A dropped connection is usually a blip on the provider's side: one more try.
+                let n = soft_tries.entry(acct.id.clone()).or_default();
+                if *n < 1 {
+                    *n += 1;
+                    tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+                    retry_same = Some(acct.id.clone());
+                    last_error = Some((502, formats::error_body(call.format, 502, &msg)));
+                    continue;
+                }
                 tried.push(acct.id.clone());
                 last_error = Some((502, formats::error_body(call.format, 502, &msg)));
                 continue;
@@ -443,6 +486,28 @@ pub async fn execute(app: Arc<App>, call: Call) -> Reply {
             } else {
                 formats::error_body(call.format, status, &msg)
             };
+            if let Some(delay) = soft_failure(provider, status, &headers, &text) {
+                let n = soft_tries.entry(acct.id.clone()).or_default();
+                if *n < 2 {
+                    *n += 1;
+                    let wait = delay.max(std::time::Duration::from_secs(if *n == 1 { 1 } else { 3 }));
+                    tracing::info!(account = %acct.label, status, "upstream busy, retrying in {}s", wait.as_secs());
+                    tokio::time::sleep(wait).await;
+                    retry_same = Some(acct.id.clone());
+                    last_error = Some((status, client_body));
+                    continue;
+                }
+                // Still busy: step aside briefly, without the escalating backoff.
+                if status == 429 {
+                    acct.cool(Some(&model), Utc::now() + Duration::seconds(15), &format!("429: {msg}"));
+                } else {
+                    acct.state.lock().last_error = Some(format!("{status}: {msg}"));
+                }
+                app.broadcast("accounts", Value::Null);
+                tried.push(acct.id.clone());
+                last_error = Some((status, client_body));
+                continue;
+            }
             match status {
                 429 => {
                     let until = reset_after(&headers, &text).unwrap_or_else(|| backoff(&acct));
@@ -782,4 +847,27 @@ pub fn estimate_tokens(body: &Value) -> u64 {
         }
     }
     (chars as u64 / 4).max(1)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn soft_failures_retry_and_quota_does_not() {
+        let h = reqwest::header::HeaderMap::new();
+        let busy = r#"{"error":{"code":429,"message":"Resource has been exhausted (e.g. check quota).","status":"RESOURCE_EXHAUSTED"}}"#;
+        assert!(soft_failure(Provider::Antigravity, 429, &h, busy).is_some());
+        assert!(soft_failure(Provider::Claude, 429, &h, busy).is_none());
+        let quota = r#"{"error":{"status":"RESOURCE_EXHAUSTED","details":[{"reason":"QUOTA_EXHAUSTED"}]}}"#;
+        assert!(soft_failure(Provider::Antigravity, 429, &h, quota).is_none());
+        assert!(soft_failure(Provider::Antigravity, 503, &h, "No capacity available").is_some());
+        let mut later = reqwest::header::HeaderMap::new();
+        later.insert("retry-after", "3600".parse().unwrap());
+        assert!(soft_failure(Provider::Codex, 429, &later, "{}").is_none());
+        let mut soon = reqwest::header::HeaderMap::new();
+        soon.insert("retry-after", "2".parse().unwrap());
+        assert!(soft_failure(Provider::Codex, 429, &soon, "{}").is_some());
+        assert!(soft_failure(Provider::Codex, 400, &h, "{}").is_none());
+    }
 }

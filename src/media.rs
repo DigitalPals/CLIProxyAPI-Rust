@@ -124,7 +124,7 @@ async fn send(
     headers: &[(String, String)],
     body: &Value,
 ) -> Result<reqwest::Response, (u16, Value)> {
-    let mut rb = app.http.client(acct.proxy_url.as_deref()).post(url);
+    let mut rb = app.http.for_account(acct).post(url);
     for (k, v) in headers {
         rb = rb.header(k.as_str(), v.as_str());
     }

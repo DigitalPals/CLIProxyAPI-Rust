@@ -35,6 +35,19 @@ const NODE_CLIENT: &str = "google-api-nodejs-client/10.3.0";
 const GOOG_API_CLIENT: &str = "gl-node/22.21.1";
 
 static VERSION: RwLock<String> = RwLock::new(String::new());
+/// Deprecated model id -> its replacement, from `fetchAvailableModels`
+/// (`gemini-3.1-pro-high` -> `gemini-pro-agent`). Old ids still list but fail.
+static RENAMED: RwLock<Vec<(String, String)>> = RwLock::new(Vec::new());
+
+/// The id to send upstream for a requested Antigravity model.
+pub fn current_id(model: &str) -> String {
+    RENAMED
+        .read()
+        .iter()
+        .find(|(old, _)| old.eq_ignore_ascii_case(model))
+        .map(|(_, new)| new.clone())
+        .unwrap_or_else(|| model.to_string())
+}
 
 pub fn version() -> String {
     let v = VERSION.read();
@@ -176,7 +189,7 @@ pub async fn ensure_ready(app: &App, acct: &Arc<Account>) -> Result<()> {
     if project(acct).is_none() {
         let _guard = acct.refresh_lock.lock().await;
         if project(acct).is_none() {
-            let http = app.http.client(acct.proxy_url.as_deref());
+            let http = app.http.for_account(acct);
             let id = fetch_project(app, &http, &base(acct, BASE_PROD), &token(acct)).await?;
             let snapshot = {
                 let mut cred = acct.cred.write();
@@ -191,7 +204,7 @@ pub async fn ensure_ready(app: &App, acct: &Arc<Account>) -> Result<()> {
         }
     }
     if acct.discovered.read().is_empty() {
-        let app_http = app.http.client(acct.proxy_url.as_deref());
+        let app_http = app.http.for_account(acct);
         if let Ok(models) = fetch_models(&app_http, &request_base(acct), &token(acct)).await
             && !models.is_empty()
         {
@@ -221,6 +234,13 @@ pub async fn fetch_models(http: &reqwest::Client, base: &str, token: &str) -> Re
         _ => vec![],
     };
     out.retain(|m| !m.starts_with("chat_") && !m.starts_with("tab_") && !m.starts_with("gemini-2.5"));
+    if let Some(Value::Object(dep)) = v.get("deprecatedModelIds") {
+        let renamed: Vec<(String, String)> = dep
+            .iter()
+            .filter_map(|(old, info)| Some((old.clone(), info["newModelId"].as_str()?.to_string())))
+            .collect();
+        *RENAMED.write() = renamed;
+    }
     out.sort();
     Ok(out)
 }
