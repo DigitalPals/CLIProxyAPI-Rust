@@ -263,17 +263,13 @@ function patch(id, fn, lit = false) {
   el.innerHTML = fn(lit);
 }
 
+// Silent while connected; only a lost connection is worth showing.
 function renderStatus() {
   const el = $('#live-status');
   if (!el) return;
-  const up = S.overview ? span((Date.now() - Date.parse(S.overview.started_at)) / 1000) : '';
-  const [cls, text] = {
-    live: ['ok', 'Live'],
-    connecting: ['dim', 'Connecting'],
-    offline: ['err', 'Reconnecting'],
-  }[S.live];
-  const dot = { ok: 'var(--ok)', dim: 'var(--fg-3)', err: 'var(--err)' }[cls];
-  el.innerHTML = `<span class="dot" style="background:${dot}" title="${text}"></span><span class="live-word">${text}</span>${up ? `<span class="uptime dim">· up <span data-uptime>${up}</span></span>` : ''}`;
+  el.innerHTML = S.live === 'offline'
+    ? '<span class="dot" style="background:var(--err)" title="Reconnecting"></span><span class="live-word">Reconnecting</span>'
+    : '';
 }
 
 function renderPrivacy() {
@@ -1155,8 +1151,6 @@ setInterval(() => {
     el.textContent = until(el.dataset.until);
   }
   for (const el of document.querySelectorAll('[data-ago]')) el.textContent = ago(el.dataset.ago);
-  const up = $('[data-uptime]');
-  if (up && S.overview) up.textContent = span((Date.now() - Date.parse(S.overview.started_at)) / 1000);
   if (expired) refreshAccounts();
 }, 1000);
 

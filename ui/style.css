@@ -53,7 +53,8 @@ a { color: inherit; text-decoration: none; }
 .tabs a[aria-current="page"] { color: var(--fg); }
 .tabs a[aria-current="page"]::after { content: ""; position: absolute; left: 0; right: 0; bottom: -1px; height: 2px; background: var(--fg); border-radius: 2px; }
 .bar-end { margin-left: auto; display: flex; align-items: center; gap: 14px; }
-.bar-status { display: flex; align-items: center; gap: 8px; color: var(--fg-3); font-size: 13px; white-space: nowrap; }
+.bar-status { display: flex; align-items: center; gap: 8px; color: var(--err); font-size: 13px; white-space: nowrap; }
+.bar-status:empty { display: none; }
 .icon-btn { width: 30px; height: 30px; padding: 0; }
 .icon-btn svg { width: 16px; height: 16px; }
 .icon-btn[aria-pressed="true"] { color: var(--fg); background: #18181b; }
@@ -314,7 +315,7 @@ textarea.mono { resize: vertical; min-height: 120px; }
 @media (max-width: 720px) {
   .bar-inner { padding: 0 16px; gap: 16px; }
   .tabs { gap: 16px; overflow-x: auto; scrollbar-width: none; }
-  .bar-status .uptime, .bar-status .live-word { display: none; }
+  .bar-status .live-word { display: none; }
   .bar-end { gap: 8px; }
   .view { padding: 20px 16px 64px; }
   .bars { gap: 2px; height: 56px; }
