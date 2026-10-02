@@ -10,12 +10,15 @@ use crate::sse::SseEvent;
 /// (Claude Code) send it back on the next turn.
 const CODEX_SIG: &str = "cpx-codex:";
 const GEMINI_SIG: &str = "cpx-gemini:";
+const DEVIN_SIG: &str = "cpx-devin:";
 
 fn sig_from_signature(s: &str) -> Sig {
     if let Some(enc) = s.strip_prefix(CODEX_SIG) {
         Sig::Codex { id: None, encrypted: enc.to_string() }
     } else if let Some(g) = s.strip_prefix(GEMINI_SIG) {
         Sig::Gemini(g.to_string())
+    } else if let Some(d) = s.strip_prefix(DEVIN_SIG) {
+        Sig::Devin(d.to_string())
     } else {
         Sig::Claude(s.to_string())
     }
@@ -26,6 +29,7 @@ fn sig_to_signature(sig: &Sig) -> String {
         Sig::Claude(s) => s.clone(),
         Sig::Codex { encrypted, .. } => format!("{CODEX_SIG}{encrypted}"),
         Sig::Gemini(g) => format!("{GEMINI_SIG}{g}"),
+        Sig::Devin(d) => format!("{DEVIN_SIG}{d}"),
     }
 }
 
@@ -642,6 +646,16 @@ impl StreamRenderer for Renderer {
                     self.delta(json!({ "type": "input_json_delta", "partial_json": delta }), out);
                 }
             }
+            Event::Image { mime, data } => {
+                // Assistant turns can't carry image blocks; inline it as a markdown data URL.
+                if self.block != Block::Text {
+                    self.open(Block::Text, json!({ "type": "text", "text": "" }), out);
+                }
+                self.delta(
+                    json!({ "type": "text_delta", "text": format!("![image](data:{mime};base64,{data})") }),
+                    out,
+                );
+            }
             Event::Finish(f) => self.finish = Some(*f),
             Event::Error { status, message } => {
                 self.errored = true;
@@ -688,6 +702,7 @@ pub fn render_full(agg: &Aggregate, model: &str) -> Value {
                 content.push(json!({ "type": "thinking", "thinking": text, "signature": s }));
             }
             Part::RedactedReasoning(d) => content.push(json!({ "type": "redacted_thinking", "data": d })),
+            Part::Image(i) => content.push(json!({ "type": "text", "text": format!("![image]({})", i.to_url()) })),
             Part::ToolCall { id, name, args, .. } => content.push(json!({
                 "type": "tool_use", "id": sanitize_tool_id(id), "name": name, "input": parse_args(args)
             })),

@@ -277,7 +277,11 @@ mod tests {
             { "role": "user", "content": "q2" }
         ]});
         let parsed = parse_request(Format::Claude, &body).unwrap();
-        let out = responses::build_request(&parsed, "gpt-6-astra", &responses::BuildOpts { chatgpt_backend: true });
+        let out = responses::build_request(
+            &parsed,
+            "gpt-6-astra",
+            &responses::BuildOpts { chatgpt_backend: true, custom_tools: true, default_reasoning: true },
+        );
         let reasoning = out["input"].as_array().unwrap().iter().find(|i| i["type"] == "reasoning").unwrap();
         assert_eq!(reasoning["encrypted_content"], "ENC");
     }

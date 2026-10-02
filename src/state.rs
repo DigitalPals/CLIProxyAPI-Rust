@@ -106,7 +106,10 @@ impl Http {
             .read_timeout(Duration::from_secs(600))
             .pool_idle_timeout(Duration::from_secs(90))
             .tcp_keepalive(Duration::from_secs(30));
-        if !proxy.is_empty() {
+        if proxy == "direct" || proxy == "none" {
+            // CLIProxyAPI's spelling for "no proxy, not even the default one".
+            b = b.no_proxy();
+        } else if !proxy.is_empty() {
             match reqwest::Proxy::all(&proxy) {
                 Ok(p) => b = b.proxy(p),
                 Err(e) => tracing::error!("invalid proxy-url {proxy}: {e}"),

@@ -217,6 +217,11 @@ async fn native_turn(app: &Arc<App>, sess: &mut Session, body: &Value, full: &[V
         return Native::Fallback;
     }
 
+    let (only, model) = app.pool.route(&model);
+    if only.as_ref().is_some_and(|o| *o != crate::accounts::Only::Provider(Provider::Codex)) {
+        return Native::Fallback;
+    }
+
     // Reuse the session's upstream socket when it can serve this model.
     let reuse = sess.upstream.as_ref().is_some_and(|(a, _)| {
         a.resolve(&model).is_some() && a.cooling_until(&model).is_none() && !a.state.lock().disabled
@@ -225,7 +230,7 @@ async fn native_turn(app: &Arc<App>, sess: &mut Session, body: &Value, full: &[V
         if let Some((_, mut up)) = sess.upstream.take() {
             let _ = up.close(None).await;
         }
-        let (acct, _) = match app.pool.pick(&model, &[], cfg.routing, sess.pinned.as_deref()) {
+        let (acct, _) = match app.pool.pick(&model, &[], cfg.routing, sess.pinned.as_deref(), only.as_ref()) {
             Pick::Ok(a, m) => (a, m),
             _ => return Native::Fallback,
         };

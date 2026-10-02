@@ -68,6 +68,8 @@ pub enum Sig {
         encrypted: String,
     },
     Gemini(String),
+    /// Devin thinking signature as `type:signature` (anthropic, openai, gemini, sealed).
+    Devin(String),
 }
 
 #[derive(Debug, Clone)]
@@ -209,17 +211,38 @@ impl Usage {
 
 #[derive(Debug, Clone)]
 pub enum Event {
-    Start { id: Option<String>, model: Option<String> },
+    Start {
+        id: Option<String>,
+        model: Option<String>,
+    },
     Text(String),
     Reasoning(String),
     ReasoningSig(Sig),
     RedactedReasoning(String),
-    ToolStart { key: usize, id: String, name: String },
-    ToolArgs { key: usize, delta: String },
-    ToolSig { key: usize, sig: Sig },
+    ToolStart {
+        key: usize,
+        id: String,
+        name: String,
+    },
+    ToolArgs {
+        key: usize,
+        delta: String,
+    },
+    ToolSig {
+        key: usize,
+        sig: Sig,
+    },
+    /// A generated image (Gemini image models).
+    Image {
+        mime: String,
+        data: String,
+    },
     Usage(Usage),
     Finish(Finish),
-    Error { status: u16, message: String },
+    Error {
+        status: u16,
+        message: String,
+    },
 }
 
 /// Collects a stream of events into a complete assistant turn.
@@ -271,6 +294,9 @@ impl Aggregate {
                 if let Some(Part::ToolCall { sig, .. }) = self.tool_part(*key) {
                     *sig = Some(s.clone());
                 }
+            }
+            Event::Image { mime, data } => {
+                self.parts.push(Part::Image(Image::Base64 { mime: mime.clone(), data: data.clone() }))
             }
             Event::Usage(u) => self.usage.merge(u),
             Event::Finish(f) => self.finish = Some(*f),

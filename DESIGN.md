@@ -22,6 +22,12 @@ colors:
   provider-codex: "#d4d4d8"
   provider-gemini: "#7aa2f7"
   provider-compat: "#a78bfa"
+  provider-vertex: "#4cc9b0"
+  provider-antigravity: "#f472b6"
+  provider-kimi: "#67d2f0"
+  provider-xai: "#ffffff"
+  provider-meta: "#5b8def"
+  provider-devin: "#b6e35a"
 typography:
   body:
     fontFamily: "ui-sans-serif, -apple-system, BlinkMacSystemFont, Segoe UI, system-ui, sans-serif"

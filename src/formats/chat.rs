@@ -482,6 +482,13 @@ impl StreamRenderer for Renderer {
                     out.push(f);
                 }
             }
+            Event::Image { mime, data } => {
+                // OpenRouter-style image output.
+                let img =
+                    json!([{ "type": "image_url", "image_url": { "url": format!("data:{mime};base64,{data}") } }]);
+                let f = self.chunk(delta("images", img), None);
+                out.push(f);
+            }
             Event::Usage(u) => self.usage.merge(u),
             Event::Finish(f) => self.finish = Some(*f),
             Event::Error { status, message } => {
@@ -539,6 +546,17 @@ pub fn render_full(agg: &Aggregate, model: &str) -> Value {
         .collect();
     if !calls.is_empty() {
         msg["tool_calls"] = Value::Array(calls);
+    }
+    let images: Vec<Value> = agg
+        .parts
+        .iter()
+        .filter_map(|p| match p {
+            Part::Image(i) => Some(json!({ "type": "image_url", "image_url": { "url": i.to_url() } })),
+            _ => None,
+        })
+        .collect();
+    if !images.is_empty() {
+        msg["images"] = Value::Array(images);
     }
     json!({
         "id": new_id("chatcmpl-"),

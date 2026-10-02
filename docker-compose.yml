@@ -1,0 +1,20 @@
+# Same layout and variables as CLIProxyAPI's docker-compose.yml.
+# Already running CLIProxyAPI with Docker? You don't need this file: set
+#   CLI_PROXY_IMAGE=ghcr.io/iucc123/cliproxyapi-rust:latest
+# in the .env next to your existing compose file and run `docker compose up -d`.
+services:
+  cli-proxy-api:
+    image: ${CLI_PROXY_IMAGE:-ghcr.io/iucc123/cliproxyapi-rust:latest}
+    pull_policy: always
+    build:
+      context: .
+    container_name: cli-proxy-api
+    ports:
+      - "8317:8317"
+      - "1455:1455"
+      - "54545:54545"
+      - "51121:51121"
+    volumes:
+      - ${CLI_PROXY_CONFIG_PATH:-./config.yaml}:/CLIProxyAPI/config.yaml
+      - ${CLI_PROXY_AUTH_PATH:-./auths}:/root/.cli-proxy-api
+    restart: unless-stopped

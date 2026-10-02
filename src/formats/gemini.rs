@@ -280,7 +280,12 @@ pub fn build_request(req: &Request, model: &str) -> Value {
         },
         None => json!({ "includeThoughts": true }),
     };
-    gc.insert("thinkingConfig".into(), thinking);
+    if model.contains("-image") {
+        // Image models answer with pictures and don't take thinking settings.
+        gc.insert("responseModalities".into(), json!(["TEXT", "IMAGE"]));
+    } else {
+        gc.insert("thinkingConfig".into(), thinking);
+    }
     match &req.response_format {
         Some(ResponseFormat::JsonObject) => {
             gc.insert("responseMimeType".into(), "application/json".into());
@@ -358,6 +363,11 @@ impl Parser {
                 if let Some(s) = sig {
                     out.push(Event::ToolSig { key, sig: s });
                 }
+            } else if let Some(img) = p.get("inlineData").or_else(|| p.get("inline_data")) {
+                if let Some(data) = img["data"].as_str() {
+                    let mime = g(img, "mimeType", "mime_type").as_str().unwrap_or("image/png").to_string();
+                    out.push(Event::Image { mime, data: data.to_string() });
+                }
             } else if let Some(t) = p["text"].as_str() {
                 if p["thought"].as_bool() == Some(true) {
                     if !t.is_empty() {
@@ -383,7 +393,8 @@ impl Parser {
 impl StreamParser for Parser {
     fn feed(&mut self, ev: &SseEvent, out: &mut Vec<Event>) {
         if let Ok(v) = serde_json::from_str::<Value>(&ev.data) {
-            self.chunk(&v, out);
+            // Cloud Code (Antigravity) wraps every chunk in {"response": ...}.
+            self.chunk(&crate::antigravity::unwrap(v), out);
         }
     }
 }
@@ -391,6 +402,7 @@ impl StreamParser for Parser {
 pub fn full_to_events(v: &Value) -> Vec<Event> {
     let mut p = Parser::default();
     let mut out = Vec::new();
+    let v = &crate::antigravity::unwrap(v.clone());
     match v {
         Value::Array(chunks) => chunks.iter().for_each(|c| p.chunk(c, &mut out)),
         _ => p.chunk(v, &mut out),
@@ -487,6 +499,9 @@ impl StreamRenderer for Renderer {
         match ev {
             Event::Text(t) => out.push(self.chunk(vec![json!({ "text": t })])),
             Event::Reasoning(t) => out.push(self.chunk(vec![json!({ "text": t, "thought": true })])),
+            Event::Image { mime, data } => {
+                out.push(self.chunk(vec![json!({ "inlineData": { "mimeType": mime, "data": data } })]))
+            }
             Event::ReasoningSig(Sig::Gemini(s)) => {
                 out.push(self.chunk(vec![json!({ "text": "", "thought": true, "thoughtSignature": s })]))
             }
@@ -525,6 +540,9 @@ pub fn render_full(agg: &Aggregate, model: &str) -> Value {
     for p in &agg.parts {
         match p {
             Part::Text(t) => parts.push(json!({ "text": t })),
+            Part::Image(Image::Base64 { mime, data }) => {
+                parts.push(json!({ "inlineData": { "mimeType": mime, "data": data } }))
+            }
             Part::Reasoning { text, sig } => {
                 let mut part = json!({ "text": text, "thought": true });
                 if let Some(Sig::Gemini(s)) = sig {

@@ -24,7 +24,30 @@ const S = {
   config: { text: null, saved: null, path: '', msg: null, busy: false },
 };
 
-const PROVIDER = { claude: 'Claude', codex: 'Codex', gemini: 'Gemini', 'openai-compat': 'Compatible' };
+const PROVIDER = {
+  claude: 'Claude', codex: 'Codex', gemini: 'Gemini', vertex: 'Vertex AI', antigravity: 'Antigravity',
+  kimi: 'Kimi', xai: 'Grok', meta: 'Meta', devin: 'Devin', 'openai-compat': 'Compatible',
+};
+// Accounts you can sign in to: [id, name, what it connects].
+const SIGNIN = [
+  ['claude', 'Claude', 'Pro or Max subscription'],
+  ['codex', 'ChatGPT', 'Plus, Pro or Team, for Codex models'],
+  ['antigravity', 'Antigravity', 'Google account, Gemini and Claude models'],
+  ['xai', 'Grok', 'SuperGrok or X Premium'],
+  ['kimi', 'Kimi', 'Kimi Code membership'],
+  ['meta', 'Meta', 'Muse Spark'],
+  ['devin', 'Devin', 'Devin or Windsurf account'],
+  ['vertex', 'Vertex AI', 'Google Cloud service account key'],
+];
+const LOGIN = {
+  claude: { name: 'Claude', intro: 'Connect a Claude Pro or Max subscription.', port: 54545, example: 'http://localhost:54545/callback?code=…&state=…' },
+  codex: { name: 'ChatGPT', intro: 'Connect a ChatGPT Plus, Pro or Team subscription for Codex models.', port: 1455, example: 'http://localhost:1455/auth/callback?code=…&state=…' },
+  antigravity: { name: 'Antigravity', intro: 'Connect a Google account with Antigravity access for Gemini and Claude models.', port: 51121, example: 'http://localhost:51121/oauth-callback?code=…&state=…' },
+  devin: { name: 'Devin', intro: 'Connect a Devin or Windsurf account.', example: 'http://127.0.0.1:…/callback?code=…, or a session token' },
+  kimi: { name: 'Kimi', intro: 'Connect a Kimi Code membership.' },
+  xai: { name: 'Grok', intro: 'Connect a SuperGrok or X Premium subscription.' },
+  meta: { name: 'Meta', intro: 'Connect a Meta account for Muse models.' },
+};
 const CLIENT = { openai: 'OpenAI', responses: 'Responses', claude: 'Anthropic', gemini: 'Gemini' };
 
 const ICON = {
@@ -299,7 +322,9 @@ function acctStatus(a, withScope = true) {
 
 function acctSub(a) {
   const parts = [a.provider === 'openai-compat' ? (a.group || 'Compatible') : PROVIDER[a.provider]];
-  if (a.kind === 'oauth') {
+  if (a.kind === 'service-account') {
+    parts.push('Service account');
+  } else if (a.kind === 'oauth') {
     parts.push('OAuth');
     if (a.expires_at) {
       const left = (Date.parse(a.expires_at) - Date.now()) / 1000;
@@ -326,6 +351,7 @@ function ovAccountsHTML() {
       <div class="actions">
         <button class="btn" data-act="start-login" data-provider="claude"><span class="pdot" style="background:var(--claude)"></span>Sign in with Claude</button>
         <button class="btn" data-act="start-login" data-provider="codex"><span class="pdot" style="background:var(--codex)"></span>Sign in with ChatGPT</button>
+        <button class="btn" data-act="open-panel" data-panel="connect">Other accounts</button>
         <button class="btn" data-act="open-panel" data-panel="key">Add API key</button>
       </div></div>`;
   }
@@ -400,7 +426,8 @@ function connectHTML() {
 
 function routeHTML(r, tags = false) {
   const provider = PROVIDER[r.provider] || (r.provider ? r.provider : '—');
-  const extra = tags ? [r.transport === 'ws' ? 'ws' : null, r.attempts > 1 ? `${r.attempts} tries` : null].filter(Boolean) : [];
+  const kind = { ws: 'ws', images: 'image', video: 'video' }[r.transport];
+  const extra = tags ? [kind, r.attempts > 1 ? `${r.attempts} tries` : null].filter(Boolean) : [];
   return `<span class="route"><span>${esc(CLIENT[r.client] || r.client)}</span><span class="arrow">→</span><span class="dot ${esc(r.provider)}"></span><span>${esc(provider)}</span>${extra.map((t) => `<span class="tag">${t}</span>`).join('')}</span>`;
 }
 
@@ -449,53 +476,70 @@ function accountsHTML() {
 
 function accountHeadHTML() {
   const n = (S.accounts || []).length;
-  const btn = (p, label, color) => `<button class="btn" data-act="start-login" data-provider="${p}" aria-expanded="${S.panel === p}"><span class="pdot" style="background:var(--${color})"></span>${label}</button>`;
+  const connecting = S.panel === 'connect' || !!LOGIN[S.panel] || S.panel === 'vertex';
   return `<div class="page-head">
     <div><h1>Accounts</h1><p>${n ? `${n} connected · stored in <span class="mono">${esc(S.overview.auth_dir)}</span> and config.yaml` : 'Nothing connected yet'}</p></div>
     <div class="actions">
-      ${btn('claude', 'Sign in with Claude', 'claude')}
-      ${btn('codex', 'Sign in with ChatGPT', 'codex')}
+      <button class="btn" data-act="open-panel" data-panel="connect" aria-expanded="${connecting}">Connect account</button>
       <button class="btn" data-act="open-panel" data-panel="key" aria-expanded="${S.panel === 'key'}">Add API key</button>
     </div></div>`;
 }
 
 function panelHTML() {
   if (S.panel === 'key') return keyPanelHTML();
-  if (S.panel === 'claude' || S.panel === 'codex') return loginPanelHTML();
+  if (S.panel === 'connect') return connectPanelHTML();
+  if (S.panel === 'vertex') return vertexPanelHTML();
+  if (S.panel === 'vertex-done') return doneHTML('Vertex AI', S.login);
+  if (LOGIN[S.panel]) return S.login && S.login.kind === 'device' ? devicePanelHTML() : loginPanelHTML();
   return '';
 }
 
+function connectPanelHTML() {
+  return `<div class="panel" role="region" aria-label="Connect an account">
+    <h3>Connect an account</h3>
+    <p>Sign in with a subscription. Credentials are stored in the auth directory on this machine.</p>
+    <div class="choices">${SIGNIN.map(([id, name, sub]) => `
+      <button class="choice" data-act="start-login" data-provider="${id}">
+        <span class="dot ${id}"></span><span class="who"><span class="label">${name}</span><span class="sub">${sub}</span></span>
+      </button>`).join('')}
+    </div>
+    <div class="actions" style="margin-top:16px"><button class="btn ghost" data-act="close-panel">Cancel</button></div>
+  </div>`;
+}
+
+function loginStatus(L, port) {
+  if (!L || L.status === 'starting') return `<span class="wait"><span class="pulse"></span>Opening the sign-in page…</span>`;
+  if (L.status === 'done') return `<span class="ok">Connected ${esc(L.message || '')}</span>`;
+  if (L.status === 'error') return `<span class="err">${esc(L.message || 'Sign-in failed')}</span>`;
+  if (L.kind === 'device') return `<span class="wait"><span class="pulse"></span>Waiting for you to approve…</span>`;
+  if (L.callback) return `<span class="wait"><span class="pulse"></span>Waiting for you to approve in the browser…</span>`;
+  return `<span class="warn">This server can't receive the redirect${port ? ` (port ${port} is busy)` : ''}. Paste the URL below.</span>`;
+}
+
+function doneHTML(name, L) {
+  return `<div class="panel" role="region" aria-label="Sign in with ${name}">
+    <h3>Signed in</h3><p>${esc(L.message || '')} is ready to serve requests.</p>
+    <div class="actions"><button class="btn" data-act="close-panel">Done</button></div></div>`;
+}
+
+const reopen = (L, text) => L && L.url ? ` <a class="link" href="${esc(L.url)}" target="_blank" rel="noopener">${text} ${ICON.external.replace('<svg', '<svg style="width:12px;height:12px;vertical-align:-1px"')}</a>` : '';
+
 function loginPanelHTML() {
   const L = S.login;
-  const isClaude = S.panel === 'claude';
-  const name = isClaude ? 'Claude' : 'ChatGPT';
-  const port = isClaude ? 54545 : 1455;
-  const example = isClaude ? 'http://localhost:54545/callback?code=…&state=…' : 'http://localhost:1455/auth/callback?code=…&state=…';
-  const intro = isClaude ? 'Connect a Claude Pro or Max subscription.' : 'Connect a ChatGPT Plus, Pro or Team subscription for Codex models.';
-  let status;
-  if (!L || L.status === 'starting') status = `<span class="wait"><span class="pulse"></span>Opening the sign-in page…</span>`;
-  else if (L.status === 'done') status = `<span class="ok">Connected ${esc(L.message || '')}</span>`;
-  else if (L.status === 'error') status = `<span class="err">${esc(L.message || 'Sign-in failed')}</span>`;
-  else if (L.callback) status = `<span class="wait"><span class="pulse"></span>Waiting for you to approve in the browser…</span>`;
-  else status = `<span class="warn">This server can't receive the redirect (port ${port} is busy). Paste the URL below.</span>`;
-
-  if (L && L.status === 'done') {
-    return `<div class="panel" role="region" aria-label="Sign in with ${name}">
-      <h3>Signed in</h3><p>${esc(L.message || '')} is ready to serve requests.</p>
-      <div class="actions"><button class="btn" data-act="close-panel">Done</button></div></div>`;
-  }
-  return `<div class="panel" role="region" aria-label="Sign in with ${name}">
-    <h3>Sign in with ${name}</h3>
-    <p>${intro} Credentials stay on this machine.</p>
+  const info = LOGIN[S.panel];
+  if (L && L.status === 'done') return doneHTML(info.name, L);
+  return `<div class="panel" role="region" aria-label="Sign in with ${info.name}">
+    <h3>Sign in with ${info.name}</h3>
+    <p>${info.intro} Credentials stay on this machine.</p>
     <ol class="steps">
-      <li><span class="n">1</span><div class="t"><b>Approve access</b> in the tab that opened.${L && L.url ? ` <a class="link" href="${esc(L.url)}" target="_blank" rel="noopener">Open sign-in page again ${ICON.external.replace('<svg', '<svg style="width:12px;height:12px;vertical-align:-1px"')}</a>` : ''}</div></li>
-      <li><span class="n">2</span><div class="t" aria-live="polite">${status}</div></li>
+      <li><span class="n">1</span><div class="t"><b>Approve access</b> in the tab that opened.${reopen(L, 'Open sign-in page again')}</div></li>
+      <li><span class="n">2</span><div class="t" aria-live="polite">${loginStatus(L, info.port)}</div></li>
     </ol>
     <div class="divider"></div>
     <form class="field" data-form="paste">
       <label for="paste-url"><span class="dim" style="font-size:12.5px;font-weight:500">Signed in from another device? Paste the address the browser was sent to</span></label>
       <div class="inline">
-        <input id="paste-url" class="mono" type="text" name="input" placeholder="${esc(example)}" autocomplete="off" spellcheck="false" ${L && L.state ? '' : 'disabled'}>
+        <input id="paste-url" class="mono" type="text" name="input" placeholder="${esc(info.example)}" autocomplete="off" spellcheck="false" ${L && L.state ? '' : 'disabled'}>
         <button class="btn" type="submit" ${L && L.state ? '' : 'disabled'}>Connect</button>
       </div>
       <small>After you approve, that localhost page won't load when the browser runs elsewhere. Copy its full address from the address bar.</small>
@@ -505,10 +549,45 @@ function loginPanelHTML() {
   </div>`;
 }
 
+function devicePanelHTML() {
+  const L = S.login;
+  const info = LOGIN[S.panel];
+  if (L.status === 'done') return doneHTML(info.name, L);
+  let host = '';
+  try { host = new URL(L.url).host; } catch {}
+  return `<div class="panel" role="region" aria-label="Sign in with ${info.name}">
+    <h3>Sign in with ${info.name}</h3>
+    <p>${info.intro} Credentials stay on this machine.</p>
+    <ol class="steps">
+      <li><span class="n">1</span><div class="t"><b>Open ${esc(host || 'the sign-in page')}</b> in the tab that opened.${reopen(L, 'Open it again')}</div></li>
+      <li><span class="n">2</span><div class="t"><b>Check the code matches</b> <span class="code mono">${esc(L.user_code || '')}</span> <button class="linkbtn" data-act="copy" data-text="${esc(L.user_code || '')}">Copy</button></div></li>
+      <li><span class="n">3</span><div class="t" aria-live="polite">${loginStatus(L)}</div></li>
+    </ol>
+    <div class="actions" style="margin-top:18px"><button class="btn ghost" data-act="close-panel">Cancel</button></div>
+  </div>`;
+}
+
+function vertexPanelHTML() {
+  return `<form class="panel" data-form="vertex" aria-label="Add a Vertex AI service account">
+    <h3>Add a Vertex AI service account</h3>
+    <p>Paste a Google Cloud service account key (JSON) with the Vertex AI User role. It is saved to the auth directory.</p>
+    <div class="grid">
+      <label class="field wide"><span>Service account key</span><textarea class="mono" name="json" rows="6" spellcheck="false" placeholder='{ "type": "service_account", "project_id": "…", "private_key": "…", "client_email": "…" }' required></textarea></label>
+      <label class="field"><span>Region</span><input class="mono" type="text" name="location" placeholder="us-central1" autocomplete="off" spellcheck="false"><small>Use global for the newest models.</small></label>
+    </div>
+    <div class="actions"><button class="btn primary" type="submit">Add service account</button><button class="btn ghost" type="button" data-act="close-panel">Cancel</button></div>
+    <p class="msg" id="vertex-msg" aria-live="polite"></p>
+  </form>`;
+}
+
 function keyPanelHTML() {
   const p = S.keyProvider;
-  const opts = [['claude', 'Claude'], ['codex', 'OpenAI'], ['gemini', 'Gemini'], ['compat', 'OpenAI-compatible']];
-  const base = { claude: 'https://api.anthropic.com', codex: 'https://api.openai.com/v1', gemini: 'https://generativelanguage.googleapis.com', compat: 'https://openrouter.ai/api/v1' }[p];
+  const opts = [['claude', 'Claude'], ['codex', 'OpenAI'], ['gemini', 'Gemini'], ['vertex', 'Vertex AI'], ['kimi', 'Kimi'], ['xai', 'xAI'], ['meta', 'Meta'], ['compat', 'OpenAI-compatible']];
+  const base = {
+    claude: 'https://api.anthropic.com', codex: 'https://api.openai.com/v1', gemini: 'https://generativelanguage.googleapis.com',
+    vertex: 'https://aiplatform.googleapis.com', kimi: 'https://api.kimi.com/coding', xai: 'https://api.x.ai/v1',
+    meta: 'https://api.meta.ai/v1', compat: 'https://openrouter.ai/api/v1',
+  }[p];
   const compat = p === 'compat';
   return `<form class="panel" data-form="key" aria-label="Add an API key">
     <h3>Add an API key</h3>
@@ -529,7 +608,7 @@ function accountListHTML() {
   const list = S.accounts || [];
   if (!list.length) {
     return `<div class="empty" style="border-top:1px solid var(--line)"><h3>No accounts yet</h3>
-      <p>Sign in with Claude or ChatGPT above, add an API key, or run <code>cliproxyapi-rust login claude</code> on the server. Existing CLIProxyAPI credentials in the auth directory are picked up automatically.</p></div>`;
+      <p>Connect a subscription or add an API key above, or run <code>cliproxyapi-rust login &lt;provider&gt;</code> on the server. Existing CLIProxyAPI credentials in the auth directory are picked up automatically.</p></div>`;
   }
   const head = `<div class="row" style="min-height:36px;color:var(--fg-3);font-size:12px;font-weight:500"><span>Account</span><span>Status</span><span class="hide-md">Usage</span><span class="hide-md">Last used</span><span></span></div>`;
   const rows = list.map((a) => {
@@ -691,6 +770,13 @@ function bindLock() {
 
 async function startLogin(provider) {
   S.panel = provider;
+  if (provider === 'vertex') {
+    S.login = null;
+    if (S.route !== 'accounts') location.hash = '#/accounts';
+    else { patch('acct-panel', panelHTML); patch('acct-head', accountHeadHTML); }
+    $('textarea[name="json"]')?.focus();
+    return;
+  }
   S.login = { provider, status: 'starting' };
   if (S.route !== 'accounts') location.hash = '#/accounts';
   else { patch('acct-panel', panelHTML); patch('acct-head', accountHeadHTML); }
@@ -698,7 +784,7 @@ async function startLogin(provider) {
   const tab = window.open('about:blank', '_blank');
   try {
     const r = await api(`/login/${provider}`, { method: 'POST' });
-    S.login = { provider, state: r.state, url: r.url, callback: r.callback, status: 'pending' };
+    S.login = { provider, state: r.state, url: r.url, callback: r.callback, kind: r.kind, user_code: r.user_code, status: 'pending' };
     if (tab) { tab.opener = null; tab.location.href = r.url; }
   } catch (e) {
     tab?.close();
@@ -747,6 +833,27 @@ async function submitPaste(form) {
   }
   patch('acct-panel', panelHTML);
   schedulePoll();
+}
+
+async function submitVertex(form) {
+  const data = Object.fromEntries(new FormData(form).entries());
+  const msg = $('#vertex-msg');
+  const btn = form.querySelector('button[type="submit"]');
+  btn.disabled = true;
+  btn.textContent = 'Checking…';
+  try {
+    const r = await api('/vertex', { method: 'POST', body: JSON.stringify(data) });
+    S.panel = 'vertex-done';
+    S.login = { provider: 'vertex', status: 'done', message: r.label };
+    patch('acct-panel', panelHTML);
+    patch('acct-head', accountHeadHTML);
+    refreshAccounts();
+  } catch (e) {
+    msg.className = 'msg err';
+    msg.textContent = e.message;
+    btn.disabled = false;
+    btn.textContent = 'Add service account';
+  }
 }
 
 async function submitKey(form) {
@@ -804,7 +911,8 @@ async function copy(btn) {
     ta.remove();
   }
   const prev = btn.innerHTML;
-  btn.innerHTML = btn.querySelector('span') ? `${ICON.check}<span>Copied</span>` : ICON.check;
+  if (btn.classList.contains('linkbtn')) btn.textContent = 'Copied';
+  else btn.innerHTML = btn.querySelector('span') ? `${ICON.check}<span>Copied</span>` : ICON.check;
   btn.classList.add('copied');
   setTimeout(() => { btn.innerHTML = prev; btn.classList.remove('copied'); }, 1400);
 }
@@ -865,6 +973,7 @@ document.addEventListener('submit', async (e) => {
   const kind = form.dataset.form;
   if (kind === 'paste') return submitPaste(form);
   if (kind === 'key') return submitKey(form);
+  if (kind === 'vertex') return submitVertex(form);
   if (kind === 'unlock') {
     S.key = form.elements.key.value.trim();
     try {

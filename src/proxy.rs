@@ -178,7 +178,34 @@ fn reset_after(headers: &reqwest::header::HeaderMap, body: &str) -> Option<chron
     if let Some(s) = e["resets_in_seconds"].as_i64() {
         return Some(Utc::now() + Duration::seconds(s.max(1)));
     }
-    e["resets_at"].as_i64().and_then(|t| chrono::DateTime::from_timestamp(t, 0))
+    if let Some(t) = e["resets_at"].as_i64() {
+        return chrono::DateTime::from_timestamp(t, 0);
+    }
+    // Google: {"details": [{"@type": "...RetryInfo", "retryDelay": "3.5s"}]}
+    for d in e["details"].as_array().into_iter().flatten() {
+        if let Some(delay) = d["retryDelay"].as_str().and_then(|s| s.trim_end_matches('s').parse::<f64>().ok()) {
+            return Some(Utc::now() + Duration::milliseconds((delay * 1000.0).max(1000.0) as i64));
+        }
+        if let Some(ts) = d["metadata"]["quotaResetTimeStamp"].as_str()
+            && let Ok(t) = chrono::DateTime::parse_from_rfc3339(ts)
+        {
+            return Some(t.with_timezone(&Utc));
+        }
+    }
+    None
+}
+
+/// Responses backends that understand freeform `custom` tools.
+fn native_custom_tools(p: Provider) -> bool {
+    matches!(p, Provider::Codex | Provider::Compat)
+}
+
+/// 403s that a token refresh won't fix (region / plan / ToS blocks).
+fn forbidden_for_good(body: &str) -> bool {
+    let b = body.to_ascii_lowercase();
+    ["not available in your", "unsupported_country", "permission_denied", "terms of service"]
+        .iter()
+        .any(|k| b.contains(k))
 }
 
 fn backoff(acct: &Account) -> chrono::DateTime<Utc> {
@@ -274,6 +301,7 @@ pub async fn execute(app: Arc<App>, call: Call) -> Reply {
         return error_reply(call.format, 400, "`model` is required");
     }
     let (model, suffix) = ir::split_model_suffix(&raw_model);
+    let (only, model) = app.pool.route(&model);
     let mut tracker = Tracker::new(&app, call.format, call.stream, call.transport, &model);
 
     let mut parsed: Option<Request> = None;
@@ -285,7 +313,7 @@ pub async fn execute(app: Arc<App>, call: Call) -> Reply {
 
     while tried.len() < attempts {
         let pin = retry_same.take().or_else(|| call.pinned.clone());
-        let (acct, upstream_model) = match app.pool.pick(&model, &tried, cfg.routing, pin.as_deref()) {
+        let (acct, upstream_model) = match app.pool.pick(&model, &tried, cfg.routing, pin.as_deref(), only.as_ref()) {
             Pick::Ok(a, m) => (a, m),
             Pick::Cooling(until) => {
                 if let Some((s, b)) = last_error {
@@ -303,7 +331,7 @@ pub async fn execute(app: Arc<App>, call: Call) -> Reply {
         };
         tracker.attempt(&acct);
 
-        if let Err(e) = crate::oauth::ensure_fresh(&app, &acct, Duration::minutes(5), false).await {
+        if let Err(e) = crate::oauth::ensure_ready(&app, &acct).await {
             tracing::warn!(account = %acct.label, "refresh failed: {e:#}");
             acct.cool(None, Utc::now() + Duration::minutes(5), &format!("token refresh failed: {e}"));
             tried.push(acct.id.clone());
@@ -311,8 +339,13 @@ pub async fn execute(app: Arc<App>, call: Call) -> Reply {
             continue;
         }
 
-        let native = acct.provider.native();
-        let passthrough = native == call.format;
+        let provider = acct.provider;
+        let devin = provider == Provider::Devin;
+        // Freeform (custom) tools only exist on OpenAI's own Responses backends.
+        let custom_tools = call.format == Format::Responses
+            && call.body["tools"].as_array().is_some_and(|t| t.iter().any(|t| t["type"] == "custom"));
+        let passthrough = provider.wires().contains(&call.format) && !(custom_tools && !native_custom_tools(provider));
+        let native = if passthrough { call.format } else { provider.wires().first().copied().unwrap_or(Format::Chat) };
         let mut names = HashMap::new();
         let body = if passthrough {
             let mut b = call.body.clone();
@@ -340,15 +373,20 @@ pub async fn execute(app: Arc<App>, call: Call) -> Reply {
                 }
             }
             let mut req = parsed.clone().unwrap();
-            if acct.provider != Provider::Claude {
+            if native != Format::Claude {
                 names = shorten_tool_names(&mut req);
             }
             match native {
+                _ if devin => crate::devin::build_request(&req, &upstream_model),
                 Format::Claude => formats::claude::build_request(&req, &upstream_model),
                 Format::Responses => formats::responses::build_request(
                     &req,
                     &upstream_model,
-                    &formats::responses::BuildOpts { chatgpt_backend: acct.is_oauth() },
+                    &formats::responses::BuildOpts {
+                        chatgpt_backend: provider == Provider::Codex && acct.is_oauth(),
+                        custom_tools: native_custom_tools(provider),
+                        default_reasoning: provider == Provider::Codex,
+                    },
                 ),
                 Format::Gemini => formats::gemini::build_request(&req, &upstream_model),
                 Format::Chat => formats::chat::build_request(&req, &upstream_model),
@@ -356,13 +394,14 @@ pub async fn execute(app: Arc<App>, call: Call) -> Reply {
         };
 
         // Upstream streaming: always when translating (we re-render), and for Codex OAuth.
-        let upstream_stream = !passthrough || call.stream || (native == Format::Responses && acct.is_oauth());
+        let upstream_stream = !passthrough || call.stream || (provider == Provider::Codex && acct.is_oauth());
         let prepared = upstream::prepare(
             &Target {
                 acct: &acct,
                 cfg: &cfg,
                 client_headers: &call.headers,
                 model: &upstream_model,
+                wire: native,
                 passthrough,
                 stream: upstream_stream,
                 count_tokens: false,
@@ -378,7 +417,7 @@ pub async fn execute(app: Arc<App>, call: Call) -> Reply {
         for (k, v) in &prepared.headers {
             rb = rb.header(k.as_str(), v.as_str());
         }
-        let payload = serde_json::to_vec(&prepared.body).unwrap_or_default();
+        let payload = prepared.raw.unwrap_or_else(|| serde_json::to_vec(&prepared.body).unwrap_or_default());
         let resp = match rb.body(payload).send().await {
             Ok(r) => r,
             Err(e) => {
@@ -408,7 +447,7 @@ pub async fn execute(app: Arc<App>, call: Call) -> Reply {
                     acct.cool(Some(&model), until, &format!("429: {msg}"));
                     app.broadcast("accounts", Value::Null);
                 }
-                401 | 403 if acct.is_oauth() && !refreshed.contains(&acct.id) => {
+                401 | 403 if acct.is_oauth() && !refreshed.contains(&acct.id) && !forbidden_for_good(&text) => {
                     refreshed.push(acct.id.clone());
                     if crate::oauth::ensure_fresh(&app, &acct, Duration::minutes(5), true).await.is_ok() {
                         // Retry the same account with the new token.
@@ -434,31 +473,43 @@ pub async fn execute(app: Arc<App>, call: Call) -> Reply {
         }
 
         acct.record_ok();
-        let is_sse = resp
-            .headers()
-            .get("content-type")
-            .and_then(|v| v.to_str().ok())
-            .is_some_and(|c| c.contains("event-stream"));
+        // The ChatGPT backend streams without any Content-Type, so a stream we
+        // asked for counts as one unless it says it's JSON.
+        let ctype = resp.headers().get("content-type").and_then(|v| v.to_str().ok()).unwrap_or_default();
+        let is_sse = ctype.contains("event-stream") || (upstream_stream && !ctype.contains("json"));
         let account = acct.label.clone();
         let req = Arc::new(parsed.clone().unwrap_or_default());
 
+        let unwrap = provider == Provider::Antigravity;
         if passthrough {
             if call.stream && is_sse {
-                return Reply::Stream { frames: passthrough_stream(resp, native, tracker), account };
+                return Reply::Stream { frames: passthrough_stream(resp, native, tracker, unwrap), account };
             }
             if is_sse {
                 // Codex only streams: rebuild the final response object.
-                return collect_passthrough(resp, native, tracker, call.format).await;
+                return collect_passthrough(Box::pin(resp.bytes_stream()), native, tracker, call.format).await;
             }
             let text = resp.text().await.unwrap_or_default();
-            let v: Value = serde_json::from_str(&text).unwrap_or(Value::String(text));
+            let mut v: Value = match serde_json::from_str(&text) {
+                Ok(v) => v,
+                // An unlabelled stream after all: rebuild the final object from it.
+                Err(_) if text.contains("data:") => {
+                    let body = futures::stream::once(async move { Ok(bytes::Bytes::from(text)) });
+                    return collect_passthrough(Box::pin(body), native, tracker, call.format).await;
+                }
+                Err(_) => Value::String(text),
+            };
+            if unwrap {
+                v = crate::antigravity::unwrap(v);
+            }
             let mut agg = Aggregate::default();
             formats::full_to_events(native, &v).iter().for_each(|e| agg.push(e));
             tracker.finish(status, &agg.usage, None);
             return Reply::Json(v);
         }
 
-        let events = event_stream(resp, native, is_sse, names);
+        let events =
+            if devin { crate::devin::event_stream(resp, names) } else { event_stream(resp, native, is_sse, names) };
         let client_model = model.clone();
         if call.stream {
             let frames = render_stream(events, call.format, client_model, req, tracker);
@@ -490,8 +541,20 @@ fn event_stream(resp: reqwest::Response, native: Format, is_sse: bool, names: Ha
     if !is_sse {
         return Box::pin(async_stream::stream! {
             let text = resp.text().await.unwrap_or_default();
-            let v: Value = serde_json::from_str(&text).unwrap_or(Value::Null);
-            for ev in formats::full_to_events(native, &v) {
+            let evs = match serde_json::from_str::<Value>(&text) {
+                Ok(v) => formats::full_to_events(native, &v),
+                // Mislabelled stream: decode it as SSE after all.
+                Err(_) => {
+                    let mut dec = SseDecoder::default();
+                    let mut parser = formats::parser(native);
+                    let mut out = Vec::new();
+                    for sse in dec.push(text.as_bytes()).into_iter().chain(dec.finish()) {
+                        parser.feed(&sse, &mut out);
+                    }
+                    out
+                }
+            };
+            for ev in evs {
                 yield rename(ev);
             }
         });
@@ -578,7 +641,7 @@ async fn collect(mut events: EventStream, format: Format, model: &str, req: &Req
 }
 
 /// Forwards upstream SSE events untouched while tapping usage.
-fn passthrough_stream(resp: reqwest::Response, native: Format, mut tracker: Tracker) -> FrameStream {
+fn passthrough_stream(resp: reqwest::Response, native: Format, mut tracker: Tracker, unwrap: bool) -> FrameStream {
     Box::pin(async_stream::stream! {
         let mut body = resp.bytes_stream();
         let mut dec = SseDecoder::default();
@@ -605,7 +668,14 @@ fn passthrough_stream(resp: reqwest::Response, native: Format, mut tracker: Trac
                         _ => {}
                     }
                 }
-                yield Frame { event: sse.event.map(std::borrow::Cow::Owned), data: sse.data };
+                let data = if unwrap {
+                    serde_json::from_str::<Value>(&sse.data)
+                        .map(|v| crate::antigravity::unwrap(v).to_string())
+                        .unwrap_or(sse.data)
+                } else {
+                    sse.data
+                };
+                yield Frame { event: sse.event.map(std::borrow::Cow::Owned), data };
             }
             if end {
                 break;
@@ -619,8 +689,9 @@ fn passthrough_stream(resp: reqwest::Response, native: Format, mut tracker: Trac
 }
 
 /// Non-streaming client on a stream-only upstream (Codex): return the final response object.
-async fn collect_passthrough(resp: reqwest::Response, native: Format, mut tracker: Tracker, format: Format) -> Reply {
-    let mut body = resp.bytes_stream();
+type ByteStream = Pin<Box<dyn Stream<Item = reqwest::Result<bytes::Bytes>> + Send>>;
+
+async fn collect_passthrough(mut body: ByteStream, native: Format, mut tracker: Tracker, format: Format) -> Reply {
     let mut dec = SseDecoder::default();
     let mut parser = formats::parser(native);
     let mut agg = Aggregate::default();
@@ -670,7 +741,7 @@ async fn collect_passthrough(resp: reqwest::Response, native: Format, mut tracke
 pub async fn count_tokens(app: Arc<App>, headers: HeaderMap, body: Value) -> Value {
     let cfg = app.cfg();
     let (model, _) = ir::split_model_suffix(body["model"].as_str().unwrap_or_default());
-    if let Pick::Ok(acct, upstream_model) = app.pool.pick(&model, &[], cfg.routing, None)
+    if let Pick::Ok(acct, upstream_model) = app.pool.pick(&model, &[], cfg.routing, None, None)
         && acct.provider == Provider::Claude
         && crate::oauth::ensure_fresh(&app, &acct, Duration::minutes(5), false).await.is_ok()
     {
@@ -680,6 +751,7 @@ pub async fn count_tokens(app: Arc<App>, headers: HeaderMap, body: Value) -> Val
                 cfg: &cfg,
                 client_headers: &headers,
                 model: &upstream_model,
+                wire: Format::Claude,
                 passthrough: true,
                 stream: false,
                 count_tokens: true,

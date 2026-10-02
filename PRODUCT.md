@@ -8,7 +8,7 @@ web
 
 ## Users
 
-Developers who pay for Claude (Pro/Max), ChatGPT (Plus/Pro) or Gemini and want to use those subscriptions from any tool: Claude Code, Codex, Cursor-style editors, OpenAI/Anthropic SDKs, scripts. They run CLIProxyAPI-Rust either on their own laptop or on a small VPS shared with a few teammates (confirmed: both matter equally). They glance at the dashboard between terminal sessions to answer three questions: is it running, which accounts are healthy, and where is my traffic going.
+Developers who pay for Claude (Pro/Max), ChatGPT (Plus/Pro), Gemini, Antigravity, Grok, Kimi, Meta, Devin or Vertex AI and want to use those subscriptions from any tool: Claude Code, Codex, Cursor-style editors, OpenAI/Anthropic SDKs, scripts. They run CLIProxyAPI-Rust either on their own laptop or on a small VPS shared with a few teammates (confirmed: both matter equally). They glance at the dashboard between terminal sessions to answer three questions: is it running, which accounts are healthy, and where is my traffic going.
 
 ## Product Purpose
 
@@ -22,12 +22,12 @@ A lean rewrite of CLIProxyAPI (Go): one binary, no runtime, an embedded dashboar
 
 - Clients: Claude Code (`ANTHROPIC_BASE_URL`), Codex (`config.toml` provider, websocket transport), OpenAI SDKs, Gemini clients.
 - Accounts are added with `cliproxyapi-rust login claude|codex`, from the dashboard, or as API keys in `config.yaml`.
-- OAuth redirects go to fixed localhost ports (54545 Claude, 1455 Codex). On a remote server the user pastes the redirect URL back into the dashboard.
+- OAuth redirects go to fixed localhost ports (54545 Claude, 1455 Codex, 51121 Antigravity; Devin uses any free port). On a remote server the user pastes the redirect URL back into the dashboard. Grok, Kimi and Meta use device codes, which need no redirect. Vertex takes a pasted service account key.
 - Config hot-reloads; the dashboard edits the same `config.yaml`.
 
 ## Capabilities and Constraints
 
-- Providers: Claude (OAuth + key), Codex/ChatGPT (OAuth + key), Gemini (key), any OpenAI-compatible endpoint.
+- Providers: Claude (OAuth + key), Codex/ChatGPT (OAuth + key), Gemini (key), Vertex AI (service account + key), Antigravity (OAuth), Grok/xAI (device code + key), Kimi (device code + key), Meta (device code + key), Devin (OAuth), any OpenAI-compatible endpoint. Images through `/v1/images/*`, xAI video through `/v1/videos/*`.
 - Dashboard is vanilla HTML/CSS/JS embedded in the binary; no build step, no external requests (no CDNs, no web fonts).
 - Management API is localhost-only unless `management-key` is set.
 - Usage statistics are in-memory (reset on restart).

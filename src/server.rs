@@ -5,7 +5,7 @@ use std::time::Duration;
 use axum::Router;
 use axum::body::{Body, Bytes};
 use axum::extract::ws::WebSocketUpgrade;
-use axum::extract::{DefaultBodyLimit, Path, Query, Request, State};
+use axum::extract::{DefaultBodyLimit, FromRequest, Path, Query, Request, State};
 use axum::http::{HeaderMap, HeaderValue, StatusCode, header};
 use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
@@ -26,6 +26,11 @@ pub fn router(app: Arc<App>) -> Router {
         .route("/v1/messages/count_tokens", post(count_tokens))
         .route("/v1/responses", post(responses).get(responses_ws))
         .route("/backend-api/codex/responses", post(responses).get(responses_ws))
+        .route("/v1/completions", post(completions))
+        .route("/v1/responses/compact", post(compact))
+        .route("/v1/images/generations", post(image_generations))
+        .route("/v1/images/edits", post(image_edits))
+        .route("/v1/videos/{kind}", post(video_create).get(video_status))
         .route("/v1/models", get(models))
         .route("/v1beta/models", get(gemini_models))
         .route("/v1beta/models/{*rest}", post(gemini))
@@ -118,6 +123,136 @@ async fn responses_ws(State(app): State<Arc<App>>, headers: HeaderMap, ws: WebSo
     ws.max_message_size(256 << 20)
         .max_frame_size(256 << 20)
         .on_upgrade(move |socket| crate::ws::handle(app, headers, socket))
+}
+
+fn outcome(o: crate::media::Outcome) -> Response {
+    match o {
+        Ok(v) => axum::Json(v).into_response(),
+        Err((status, body)) => {
+            (StatusCode::from_u16(status).unwrap_or(StatusCode::BAD_GATEWAY), axum::Json(body)).into_response()
+        }
+    }
+}
+
+async fn image_generations(State(app): State<Arc<App>>, headers: HeaderMap, body: Bytes) -> Response {
+    match parse_body(Format::Chat, &body) {
+        Ok(v) => outcome(crate::media::images(app, headers, v, false).await),
+        Err(r) => *r,
+    }
+}
+
+async fn image_edits(State(app): State<Arc<App>>, req: Request) -> Response {
+    let headers = req.headers().clone();
+    let multipart =
+        headers.get(header::CONTENT_TYPE).and_then(|v| v.to_str().ok()).is_some_and(|c| c.starts_with("multipart/"));
+    let body = if multipart {
+        let form = match axum::extract::Multipart::from_request(req, &app).await {
+            Ok(f) => f,
+            Err(e) => return outcome(Err((400, formats::error_body(Format::Chat, 400, &e.body_text())))),
+        };
+        match crate::media::multipart_to_json(form).await {
+            Ok(v) => v,
+            Err(e) => return outcome(Err((400, formats::error_body(Format::Chat, 400, &e)))),
+        }
+    } else {
+        let bytes = match axum::body::to_bytes(req.into_body(), 256 << 20).await {
+            Ok(b) => b,
+            Err(e) => return outcome(Err((400, formats::error_body(Format::Chat, 400, &e.to_string())))),
+        };
+        match parse_body(Format::Chat, &bytes) {
+            Ok(v) => v,
+            Err(r) => return *r,
+        }
+    };
+    outcome(crate::media::images(app, headers, body, true).await)
+}
+
+async fn video_create(
+    State(app): State<Arc<App>>,
+    Path(kind): Path<String>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Response {
+    if !matches!(kind.as_str(), "generations" | "edits" | "extensions") {
+        return outcome(Err((404, formats::error_body(Format::Chat, 404, "unknown video endpoint"))));
+    }
+    match parse_body(Format::Chat, &body) {
+        Ok(v) => outcome(crate::media::video_create(app, headers, v, &kind).await),
+        Err(r) => *r,
+    }
+}
+
+async fn video_status(State(app): State<Arc<App>>, Path(id): Path<String>, headers: HeaderMap) -> Response {
+    outcome(crate::media::video_status(app, headers, id).await)
+}
+
+async fn compact(State(app): State<Arc<App>>, headers: HeaderMap, body: Bytes) -> Response {
+    match parse_body(Format::Responses, &body) {
+        Ok(v) => outcome(crate::media::compact(app, headers, v).await),
+        Err(r) => *r,
+    }
+}
+
+/// Legacy `/v1/completions`, served through the chat pipeline.
+async fn completions(State(app): State<Arc<App>>, headers: HeaderMap, body: Bytes) -> Response {
+    let body = match parse_body(Format::Chat, &body) {
+        Ok(v) => v,
+        Err(r) => return *r,
+    };
+    let prompt = match &body["prompt"] {
+        Value::String(s) => s.clone(),
+        Value::Array(a) => a.iter().filter_map(Value::as_str).collect::<Vec<_>>().join("\n"),
+        _ => String::new(),
+    };
+    let mut chat = json!({ "model": body["model"], "messages": [{ "role": "user", "content": prompt }] });
+    for k in ["max_tokens", "temperature", "top_p", "stop", "stream", "stream_options", "user"] {
+        if !body[k].is_null() {
+            chat[k] = body[k].clone();
+        }
+    }
+    let stream = body["stream"].as_bool().unwrap_or(false);
+    let call =
+        Call { format: Format::Chat, body: chat, headers, stream, transport: "http", path_model: None, pinned: None };
+    match proxy::execute(app, call).await {
+        Reply::Json(v) => {
+            let choice = &v["choices"][0];
+            axum::Json(json!({
+                "id": v["id"].as_str().map(|s| s.replace("chatcmpl-", "cmpl-")),
+                "object": "text_completion", "created": v["created"], "model": v["model"],
+                "choices": [{
+                    "text": choice["message"]["content"].as_str().unwrap_or_default(), "index": 0,
+                    "logprobs": null, "finish_reason": choice["finish_reason"],
+                }],
+                "usage": v["usage"],
+            }))
+            .into_response()
+        }
+        Reply::Stream { frames, account } => {
+            let frames: FrameStream = Box::pin(frames.filter_map(|f| async move {
+                let Ok(v) = serde_json::from_str::<Value>(&f.data) else { return Some(f) };
+                if v["error"].is_object() {
+                    return Some(f);
+                }
+                let choice = &v["choices"][0];
+                let text = choice["delta"]["content"].as_str().unwrap_or_default();
+                if text.is_empty() && choice["finish_reason"].is_null() && v["usage"].is_null() {
+                    return None;
+                }
+                let mut out = json!({
+                    "id": v["id"].as_str().map(|s| s.replace("chatcmpl-", "cmpl-")), "object": "text_completion", "created": v["created"], "model": v["model"],
+                    "choices": if choice.is_null() { json!([]) } else { json!([{
+                        "text": text, "index": 0, "logprobs": null, "finish_reason": choice["finish_reason"],
+                    }]) },
+                });
+                if !v["usage"].is_null() {
+                    out["usage"] = v["usage"].clone();
+                }
+                Some(Frame::data(out.to_string()))
+            }));
+            reply(Format::Chat, Reply::Stream { frames, account }, false)
+        }
+        other => reply(Format::Chat, other, false),
+    }
 }
 
 async fn count_tokens(State(app): State<Arc<App>>, headers: HeaderMap, body: Bytes) -> Response {

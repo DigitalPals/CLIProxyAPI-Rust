@@ -1,14 +1,21 @@
 mod accounts;
+mod antigravity;
+mod compat;
 mod config;
+mod device;
+mod devin;
 mod formats;
 mod ir;
+mod media;
 mod mgmt;
 mod oauth;
 mod proxy;
+mod schema;
 mod server;
 mod sse;
 mod state;
 mod upstream;
+mod vertex;
 mod ws;
 
 use std::net::SocketAddr;
@@ -27,7 +34,7 @@ use crate::state::App;
 #[command(
     name = "cliproxyapi-rust",
     version,
-    about = "OpenAI / Claude / Gemini compatible proxy for your Claude Code, Codex and Gemini accounts"
+    about = "OpenAI / Claude / Gemini compatible proxy for your Claude, ChatGPT, Gemini, Antigravity, Grok, Kimi, Meta, Devin and Vertex accounts"
 )]
 struct Cli {
     /// Path to the config file (created with defaults if missing).
@@ -41,18 +48,31 @@ struct Cli {
 enum Cmd {
     /// Run the proxy server (default).
     Serve,
-    /// Sign in to an account: claude or codex.
+    /// Sign in to an account: claude, codex, antigravity, kimi, xai, meta, devin or vertex.
     Login {
         provider: String,
         /// Print the URL instead of opening a browser.
         #[arg(long)]
         no_browser: bool,
+        /// Vertex: path to a service account key (JSON).
+        #[arg(long)]
+        file: Option<PathBuf>,
+        /// Vertex: region, e.g. us-central1 or global.
+        #[arg(long, default_value = "us-central1")]
+        location: String,
     },
+    /// Show what the config and auth directory contain, without starting the server.
+    /// Handy before switching from CLIProxyAPI.
+    Check,
 }
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    let cli = Cli::parse();
+    // CLIProxyAPI's Go-style flags (-config, -claude-login, ...) work too.
+    let cli = Cli::parse_from(compat::translate_args(std::env::args().collect()));
+    if matches!(cli.cmd, Some(Cmd::Check)) {
+        return check(&cli.config);
+    }
     let cfg = Config::load(&cli.config)?;
     let filter = std::env::var("RUST_LOG")
         .unwrap_or_else(|_| if cfg.debug { "cliproxyapi_rust=debug".into() } else { "cliproxyapi_rust=info".into() });
@@ -61,7 +81,9 @@ async fn main() -> Result<()> {
 
     let app = App::new(cfg, cli.config.clone());
     match cli.cmd {
-        Some(Cmd::Login { provider, no_browser }) => login(app, &provider, no_browser).await,
+        Some(Cmd::Login { provider, no_browser, file, location }) => {
+            login(app, &provider, no_browser, file, &location).await
+        }
         _ => serve(app).await,
     }
 }
@@ -79,12 +101,29 @@ async fn serve(app: Arc<App>) -> Result<()> {
         .or_else(|_| format!("[{}]:{}", cfg.host, cfg.port).parse())
         .context("invalid host/port")?;
     let listener = tokio::net::TcpListener::bind(addr).await.with_context(|| format!("binding {addr}"))?;
+    if !cfg.ignored.is_empty() {
+        tracing::warn!("these CLIProxyAPI settings have no effect here: {}", cfg.ignored.join(", "));
+    }
+    let tls = if cfg.tls.enable {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let tls = axum_server::tls_rustls::RustlsConfig::from_pem_file(&cfg.tls.cert, &cfg.tls.key)
+            .await
+            .context("loading tls.cert / tls.key")?;
+        Some(tls)
+    } else {
+        None
+    };
 
     tokio::spawn(oauth::refresher(app.clone()));
+    tokio::spawn(antigravity::version_updater(app.clone()));
     tokio::spawn(watch(app.clone()));
 
-    let shown =
-        if addr.ip().is_unspecified() { format!("http://127.0.0.1:{}", addr.port()) } else { format!("http://{addr}") };
+    let scheme = if cfg.tls.enable { "https" } else { "http" };
+    let shown = if addr.ip().is_unspecified() {
+        format!("{scheme}://127.0.0.1:{}", addr.port())
+    } else {
+        format!("{scheme}://{addr}")
+    };
     let accounts = app.pool.all();
     println!();
     println!("  \x1b[1mCLIProxyAPI-Rust\x1b[0m {}", env!("CARGO_PKG_VERSION"));
@@ -95,18 +134,38 @@ async fn serve(app: Arc<App>) -> Result<()> {
     println!("  accounts   {} loaded from {}", accounts.len(), cfg.auth_dir().display());
     if accounts.is_empty() {
         println!(
-            "\n  No accounts yet. Run `cliproxyapi-rust login claude` / `cliproxyapi-rust login codex` or open the dashboard."
+            "\n  No accounts yet. Run `cliproxyapi-rust login <provider>` (claude, codex, antigravity, kimi, xai,\n  meta, devin, vertex) or open the dashboard."
         );
     }
     println!();
 
-    let router = server::router(app);
-    axum::serve(listener, router.into_make_service_with_connect_info::<SocketAddr>())
-        .with_graceful_shutdown(async {
-            let _ = tokio::signal::ctrl_c().await;
-        })
-        .await?;
+    let service = server::router(app).into_make_service_with_connect_info::<SocketAddr>();
+    if let Some(tls) = tls {
+        let handle = axum_server::Handle::new();
+        let stop = handle.clone();
+        tokio::spawn(async move {
+            shutdown_signal().await;
+            stop.graceful_shutdown(Some(Duration::from_secs(10)));
+        });
+        axum_server::from_tcp_rustls(listener.into_std()?, tls)?.handle(handle).serve(service).await?;
+    } else {
+        axum::serve(listener, service).with_graceful_shutdown(shutdown_signal()).await?;
+    }
     Ok(())
+}
+
+/// Ctrl-C, or SIGTERM from `docker stop` / systemd.
+async fn shutdown_signal() {
+    #[cfg(unix)]
+    {
+        let mut term = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()).ok();
+        tokio::select! {
+            _ = tokio::signal::ctrl_c() => {}
+            _ = async { if let Some(t) = term.as_mut() { t.recv().await; } else { std::future::pending::<()>().await } } => {}
+        }
+    }
+    #[cfg(not(unix))]
+    let _ = tokio::signal::ctrl_c().await;
 }
 
 fn mtime(p: &Path) -> Option<SystemTime> {
@@ -154,18 +213,33 @@ async fn watch(app: Arc<App>) {
     }
 }
 
-async fn login(app: Arc<App>, provider: &str, no_browser: bool) -> Result<()> {
-    let provider = match provider {
-        "claude" | "anthropic" => Provider::Claude,
-        "codex" | "openai" | "chatgpt" => Provider::Codex,
-        other => anyhow::bail!("unknown provider `{other}` (use claude or codex)"),
+async fn login(app: Arc<App>, provider: &str, no_browser: bool, file: Option<PathBuf>, location: &str) -> Result<()> {
+    let Some(provider) = Provider::parse(provider) else {
+        anyhow::bail!("unknown provider `{provider}` (claude, codex, antigravity, kimi, xai, meta, devin, vertex)")
     };
+    if provider == Provider::Vertex {
+        let Some(path) = file else { anyhow::bail!("pass the service account key with --file key.json") };
+        let text = std::fs::read_to_string(&path).with_context(|| format!("reading {}", path.display()))?;
+        let label = vertex::import(&app, &text, location).await?;
+        println!("\n✓ Added Vertex service account {label}");
+        return Ok(());
+    }
     let (state, login) = mgmt::start_login(&app, provider).await?;
-    println!("\nOpen this URL to sign in:\n\n  {}\n", login.url);
+    if login.kind == "device" {
+        println!(
+            "\nOpen this URL and enter the code:\n\n  {}\n\n  code: \x1b[1m{}\x1b[0m\n",
+            login.url,
+            login.user_code.unwrap_or_default()
+        );
+    } else {
+        println!("\nOpen this URL to sign in:\n\n  {}\n", login.url);
+    }
     if !no_browser && open::that(&login.url).is_err() {
         println!("(could not open a browser automatically)");
     }
-    if login.callback {
+    if login.kind == "device" {
+        println!("Waiting for approval…");
+    } else if login.callback {
         println!("Waiting for the browser to finish… (or paste the redirect URL here)");
     } else {
         println!("Paste the URL your browser was redirected to:");
@@ -183,7 +257,7 @@ async fn login(app: Arc<App>, provider: &str, no_browser: bool) -> Result<()> {
     });
     loop {
         tokio::select! {
-            Some(input) = rx.recv() => {
+            Some(input) = rx.recv(), if login.kind != "device" => {
                 let (code, _) = mgmt::parse_pasted(&input);
                 match mgmt::complete_login(&app, &state, &code).await {
                     Ok(label) => { println!("\n✓ Signed in as {label}"); return Ok(()); }
@@ -200,4 +274,77 @@ async fn login(app: Arc<App>, provider: &str, no_browser: bool) -> Result<()> {
             }
         }
     }
+}
+
+fn check(path: &Path) -> Result<()> {
+    let text = std::fs::read_to_string(path).with_context(|| format!("reading {}", path.display()))?;
+    let cfg = Config::parse(&text)?;
+    let bind = if cfg.host.is_empty() { "0.0.0.0" } else { &cfg.host };
+    let key = &cfg.management_key;
+    let hashed = ["$2a$", "$2b$", "$2y$"].iter().any(|p| key.starts_with(p));
+    println!("\n  \x1b[1mCLIProxyAPI-Rust\x1b[0m {} · {}\n", env!("CARGO_PKG_VERSION"), path.display());
+    println!("  listen       {bind}:{}{}", cfg.port, if cfg.tls.enable { " (https)" } else { "" });
+    println!(
+        "  client keys  {}",
+        if cfg.api_keys.is_empty() { "none (open)".to_string() } else { cfg.api_keys.len().to_string() }
+    );
+    println!(
+        "  dashboard    {}",
+        match (key.is_empty(), hashed, cfg.management_allow_remote) {
+            (true, _, _) => "localhost only, no key".to_string(),
+            (false, h, remote) => format!(
+                "management key{}{}",
+                if h { " (bcrypt hash)" } else { "" },
+                if remote == Some(false) { ", localhost only" } else { "" }
+            ),
+        }
+    );
+    println!("  routing      {:?}, {} accounts per request", cfg.routing, cfg.request_retry.max(1));
+    if !cfg.proxy_url.is_empty() {
+        println!("  proxy        {}", cfg.proxy_url);
+    }
+    let dir = cfg.auth_dir();
+    println!("  auth dir     {}", dir.display());
+
+    let pool = accounts::Pool::default();
+    pool.reload(&cfg);
+    let all = pool.all();
+    println!("\n  accounts     {}", all.len());
+    let mut by: std::collections::BTreeMap<&str, (usize, usize)> = Default::default();
+    for a in &all {
+        let e = by.entry(a.provider.as_str()).or_default();
+        if a.is_oauth() { e.0 += 1 } else { e.1 += 1 }
+    }
+    for (p, (oauth, keys)) in by {
+        let mut parts = vec![];
+        if oauth > 0 {
+            parts.push(format!("{oauth} signed in"));
+        }
+        if keys > 0 {
+            parts.push(format!("{keys} API key{}", if keys == 1 { "" } else { "s" }));
+        }
+        println!("    {p:<14}{}", parts.join(", "));
+    }
+    println!("  models       {}", pool.models().len());
+
+    let mut skipped = vec![];
+    for e in std::fs::read_dir(&dir).into_iter().flatten().flatten() {
+        let p = e.path();
+        if p.extension().is_some_and(|x| x == "json") && accounts::read_oauth_file(&p).is_none() {
+            let kind = std::fs::read_to_string(&p)
+                .ok()
+                .and_then(|t| serde_json::from_str::<serde_json::Value>(&t).ok())
+                .and_then(|v| v["type"].as_str().map(String::from))
+                .unwrap_or_else(|| "unknown".into());
+            skipped.push(format!("{} (type {kind})", p.file_name().unwrap_or_default().to_string_lossy()));
+        }
+    }
+    if !cfg.ignored.is_empty() {
+        println!("\n  not used here: {}", cfg.ignored.join(", "));
+    }
+    if !skipped.is_empty() {
+        println!("  skipped credential files: {}", skipped.join(", "));
+    }
+    println!();
+    Ok(())
 }

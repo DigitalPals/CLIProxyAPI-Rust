@@ -12,12 +12,15 @@ use crate::sse::SseEvent;
 /// so they survive a round trip through Responses clients such as Codex.
 const CLAUDE_SIG: &str = "cpx-claude:";
 const GEMINI_SIG: &str = "cpx-gemini:";
+const DEVIN_SIG: &str = "cpx-devin:";
 
 fn sig_from_encrypted(id: Option<String>, enc: &str) -> Sig {
     if let Some(s) = enc.strip_prefix(CLAUDE_SIG) {
         Sig::Claude(s.to_string())
     } else if let Some(s) = enc.strip_prefix(GEMINI_SIG) {
         Sig::Gemini(s.to_string())
+    } else if let Some(s) = enc.strip_prefix(DEVIN_SIG) {
+        Sig::Devin(s.to_string())
     } else {
         Sig::Codex { id, encrypted: enc.to_string() }
     }
@@ -27,6 +30,7 @@ fn sig_to_encrypted(sig: &Sig) -> String {
     match sig {
         Sig::Claude(s) => format!("{CLAUDE_SIG}{s}"),
         Sig::Gemini(s) => format!("{GEMINI_SIG}{s}"),
+        Sig::Devin(s) => format!("{DEVIN_SIG}{s}"),
         Sig::Codex { encrypted, .. } => encrypted.clone(),
     }
 }
@@ -197,6 +201,10 @@ fn content_parts(v: &Value) -> Vec<Part> {
 pub struct BuildOpts {
     /// ChatGPT Codex backend rejects sampling / length parameters.
     pub chatgpt_backend: bool,
+    /// Backend understands freeform `custom` tools (else they become functions taking `input`).
+    pub custom_tools: bool,
+    /// Ask for medium reasoning when the client didn't say (Codex models always reason).
+    pub default_reasoning: bool,
 }
 
 pub fn build_request(req: &Request, model: &str, opts: &BuildOpts) -> Value {
@@ -207,7 +215,8 @@ pub fn build_request(req: &Request, model: &str, opts: &BuildOpts) -> Value {
             "content": [{ "type": "input_text", "text": req.system.join("\n\n") }]
         }));
     }
-    let custom: HashSet<&str> = req.custom_tools.iter().map(String::as_str).collect();
+    let custom: HashSet<&str> =
+        if opts.custom_tools { req.custom_tools.iter().map(String::as_str).collect() } else { HashSet::new() };
     let mut custom_calls: HashSet<String> = HashSet::new();
     for m in &req.messages {
         let mut content = Vec::new();
@@ -278,12 +287,15 @@ pub fn build_request(req: &Request, model: &str, opts: &BuildOpts) -> Value {
         "include": ["reasoning.encrypted_content"],
     });
     let o = out.as_object_mut().unwrap();
-    let effort = req.reasoning.as_ref().and_then(|r| r.effort_level()).unwrap_or_else(|| "medium".into());
-    let effort = match effort.as_str() {
-        "max" => "xhigh".to_string(),
-        other => other.to_string(),
-    };
-    o.insert("reasoning".into(), json!({ "effort": effort, "summary": "auto" }));
+    let effort = req
+        .reasoning
+        .as_ref()
+        .and_then(|r| r.effort_level())
+        .or_else(|| opts.default_reasoning.then(|| "medium".to_string()));
+    if let Some(effort) = effort {
+        let effort = if effort == "max" { "xhigh".to_string() } else { effort };
+        o.insert("reasoning".into(), json!({ "effort": effort, "summary": "auto" }));
+    }
     if !req.tools.is_empty() {
         let tools: Vec<Value> = req
             .tools
@@ -848,6 +860,18 @@ impl StreamRenderer for Renderer {
                     }
                 }
             }
+            Event::Image { mime, data } => {
+                self.close(out);
+                let idx = self.index();
+                let format = mime.rsplit('/').next().unwrap_or("png");
+                let item = json!({
+                    "id": new_id("ig_"), "type": "image_generation_call", "status": "completed",
+                    "result": data, "output_format": format,
+                });
+                self.emit("response.output_item.added", json!({ "output_index": idx, "item": item }), out);
+                self.emit("response.output_item.done", json!({ "output_index": idx, "item": item }), out);
+                self.output.push(item);
+            }
             Event::Error { status, message } => {
                 self.close(out);
                 self.done = true;
@@ -887,6 +911,9 @@ pub fn render_full(agg: &Aggregate, model: &str, req: &Request) -> Value {
     for p in &agg.parts {
         match p {
             Part::Text(t) => r.push(&Event::Text(t.clone()), &mut sink),
+            Part::Image(Image::Base64 { mime, data }) => {
+                r.push(&Event::Image { mime: mime.clone(), data: data.clone() }, &mut sink)
+            }
             Part::Reasoning { text, sig } => {
                 if !text.is_empty() {
                     r.push(&Event::Reasoning(text.clone()), &mut sink);

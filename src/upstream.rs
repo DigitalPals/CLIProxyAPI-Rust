@@ -4,8 +4,10 @@ use axum::http::HeaderMap;
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 
-use crate::accounts::{Account, Credential};
+use crate::accounts::{Account, Credential, Provider};
 use crate::config::Config;
+use crate::device;
+use crate::ir::Format;
 
 pub const CLAUDE_API: &str = "https://api.anthropic.com";
 pub const CODEX_BACKEND: &str = "https://chatgpt.com/backend-api/codex";
@@ -24,6 +26,8 @@ pub struct Prepared {
     pub url: String,
     pub headers: Vec<(String, String)>,
     pub body: Value,
+    /// Pre-encoded body (Devin's protobuf); `body` is then only for logging.
+    pub raw: Option<Vec<u8>>,
 }
 
 pub struct Target<'a> {
@@ -31,6 +35,8 @@ pub struct Target<'a> {
     pub cfg: &'a Config,
     pub client_headers: &'a HeaderMap,
     pub model: &'a str,
+    /// Dialect of `body` (one of the provider's wires).
+    pub wire: Format,
     pub passthrough: bool,
     pub stream: bool,
     pub count_tokens: bool,
@@ -102,6 +108,11 @@ pub fn prepare(t: &Target, body: Value) -> Prepared {
         Claude => claude(t, body),
         Codex => codex(t, body),
         Gemini => gemini(t, body),
+        Vertex => vertex(t, body),
+        Antigravity => antigravity(t, body),
+        Kimi => kimi(t, body),
+        Xai | Meta => responses_api(t, body),
+        Devin => crate::devin::prepare(t, body),
         Compat => compat(t, body),
     };
     push_custom(t.acct, &mut p.headers);
@@ -196,7 +207,7 @@ fn claude(t: &Target, mut body: Value) -> Prepared {
     headers.retain(|(k, _)| k != "content-type" && k != "accept");
     headers.push(("content-type".into(), "application/json".into()));
     headers.push(("accept".into(), if t.stream { "text/event-stream" } else { "application/json" }.into()));
-    Prepared { url, headers, body }
+    Prepared { url, headers, body, raw: None }
 }
 
 /// Thinking blocks that carried another provider's reasoning through a Claude
@@ -324,6 +335,13 @@ pub fn sanitize_codex_body(body: &mut Value, model: &str, keep_previous: bool) {
         for k in CODEX_STRIP {
             o.remove(*k);
         }
+        // The ChatGPT backend only takes a list ("Input must be a list").
+        if let Some(Value::String(text)) = o.get("input").cloned() {
+            o.insert(
+                "input".into(),
+                json!([{ "type": "message", "role": "user", "content": [{ "type": "input_text", "text": text }] }]),
+            );
+        }
         if !keep_previous {
             o.remove("previous_response_id");
         }
@@ -392,7 +410,7 @@ fn codex(t: &Target, mut body: Value) -> Prepared {
     }
     headers.push(("content-type".into(), "application/json".into()));
     headers.push(("accept".into(), if oauth || t.stream { "text/event-stream" } else { "application/json" }.into()));
-    Prepared { url: format!("{base}/responses"), headers, body }
+    Prepared { url: format!("{base}/responses"), headers, body, raw: None }
 }
 
 pub fn codex_ws_url(acct: &Account) -> (String, Vec<(String, String)>) {
@@ -409,13 +427,7 @@ pub fn codex_ws_url(acct: &Account) -> (String, Vec<(String, String)>) {
 fn gemini(t: &Target, mut body: Value) -> Prepared {
     let (token, base, _, _) = creds(t.acct);
     let base = base.unwrap_or_else(|| GEMINI_API.into());
-    let action = if t.count_tokens {
-        "countTokens"
-    } else if t.stream {
-        "streamGenerateContent?alt=sse"
-    } else {
-        "generateContent"
-    };
+    let action = gemini_action(t);
     if let Some(o) = body.as_object_mut() {
         o.remove("model");
     }
@@ -424,7 +436,195 @@ fn gemini(t: &Target, mut body: Value) -> Prepared {
         ("content-type".into(), "application/json".into()),
         ("user-agent".into(), format!("CLIProxyAPI-Rust/{}", env!("CARGO_PKG_VERSION"))),
     ];
-    Prepared { url: format!("{base}/v1beta/models/{}:{action}", t.model), headers, body }
+    Prepared { url: format!("{base}/v1beta/models/{}:{action}", t.model), headers, body, raw: None }
+}
+
+// ---------------------------------------------------------------------- vertex
+
+fn gemini_action(t: &Target) -> &'static str {
+    if t.count_tokens {
+        "countTokens"
+    } else if t.stream {
+        "streamGenerateContent?alt=sse"
+    } else {
+        "generateContent"
+    }
+}
+
+fn vertex(t: &Target, mut body: Value) -> Prepared {
+    let (token, base, oauth, _) = creds(t.acct);
+    if let Some(o) = body.as_object_mut() {
+        o.remove("model");
+    }
+    let action = gemini_action(t);
+    let mut headers = vec![
+        ("content-type".into(), "application/json".into()),
+        ("user-agent".into(), format!("CLIProxyAPI-Rust/{}", env!("CARGO_PKG_VERSION"))),
+    ];
+    let url = if oauth {
+        let (project, location) = match &*t.acct.cred.read() {
+            Credential::OAuth(o) => {
+                (o.project_id.clone().unwrap_or_default(), o.field("location").unwrap_or("us-central1").to_string())
+            }
+            _ => Default::default(),
+        };
+        let base = base.unwrap_or_else(|| crate::vertex::base_url(&location));
+        headers.push(("authorization".into(), format!("Bearer {token}")));
+        format!("{base}/v1/projects/{project}/locations/{location}/publishers/google/models/{}:{action}", t.model)
+    } else {
+        // Express mode: API key, no project.
+        let base = base.unwrap_or_else(|| "https://aiplatform.googleapis.com".into());
+        headers.push(("x-goog-api-key".into(), token));
+        format!("{base}/v1/publishers/google/models/{}:{action}", t.model)
+    };
+    Prepared { url, headers, body, raw: None }
+}
+
+// ----------------------------------------------------------------- antigravity
+
+fn antigravity(t: &Target, body: Value) -> Prepared {
+    let (token, _, _, _) = creds(t.acct);
+    let project = crate::antigravity::project(t.acct);
+    let base = crate::antigravity::request_base(t.acct);
+    let path = if t.stream { "streamGenerateContent?alt=sse" } else { "generateContent" };
+    Prepared {
+        url: format!("{base}/v1internal:{path}"),
+        headers: vec![
+            ("authorization".into(), format!("Bearer {token}")),
+            ("content-type".into(), "application/json".into()),
+            ("user-agent".into(), crate::antigravity::user_agent()),
+            ("accept".into(), if t.stream { "text/event-stream" } else { "application/json" }.into()),
+        ],
+        body: crate::antigravity::envelope(body, t.model, project.as_deref()),
+        raw: None,
+    }
+}
+
+// ------------------------------------------------------------------------ kimi
+
+/// Inlines local `$ref`s and makes sure every tool schema is an object (Moonshot is strict).
+fn normalize_chat_tools(body: &mut Value) {
+    for tool in body["tools"].as_array_mut().into_iter().flatten() {
+        let params = &mut tool["function"]["parameters"];
+        if params.is_object() {
+            let mut p = crate::schema::inline_only(params);
+            if p.get("type").is_none() {
+                p["type"] = "object".into();
+            }
+            *params = p;
+        }
+    }
+}
+
+fn kimi(t: &Target, mut body: Value) -> Prepared {
+    let (token, base, oauth, _) = creds(t.acct);
+    let base = base.unwrap_or_else(|| device::kimi::API_BASE.into());
+    let root = base.trim_end_matches("/v1").to_string();
+    let v1 = format!("{root}/v1");
+    body["model"] = t.model.into();
+    let mut headers = vec![
+        ("authorization".into(), format!("Bearer {token}")),
+        ("content-type".into(), "application/json".into()),
+        ("user-agent".into(), format!("CLIProxyAPI-Rust/{}", env!("CARGO_PKG_VERSION"))),
+        ("accept".into(), if t.stream { "text/event-stream" } else { "application/json" }.into()),
+    ];
+    if oauth {
+        let device_id = match &*t.acct.cred.read() {
+            Credential::OAuth(o) => o.field("device_id").map(String::from),
+            _ => None,
+        };
+        headers.extend(device::kimi_headers(&device_id.unwrap_or_else(|| t.acct.device_id.clone())));
+    }
+    let url = match t.wire {
+        Format::Claude => {
+            headers.push(("x-api-key".into(), token));
+            let version = header(t.client_headers, "anthropic-version").unwrap_or_else(|| "2023-06-01".into());
+            headers.push(("anthropic-version".into(), version));
+            if let Some(b) = header(t.client_headers, "anthropic-beta") {
+                headers.push(("anthropic-beta".into(), b));
+            }
+            strip_foreign_thinking(&mut body);
+            format!("{root}/v1/messages")
+        }
+        Format::Responses => {
+            body["stream"] = t.stream.into();
+            strip_responses_extras(&mut body);
+            format!("{v1}/responses")
+        }
+        _ => {
+            body["stream"] = t.stream.into();
+            if t.stream {
+                body["stream_options"] = json!({ "include_usage": true });
+            }
+            normalize_chat_tools(&mut body);
+            // Kimi only accepts its fixed temperatures; let it choose.
+            let thinking_off = body["thinking"]["type"] == "disabled";
+            let temp = body["temperature"].as_f64();
+            if temp.is_some_and(|x| (thinking_off && x != 0.6) || (!thinking_off && x != 1.0))
+                && let Some(o) = body.as_object_mut()
+            {
+                o.remove("temperature");
+            }
+            format!("{v1}/chat/completions")
+        }
+    };
+    Prepared { url, headers, body, raw: None }
+}
+
+// ------------------------------------------------------------------ xai / meta
+
+/// Fields the stateless Responses backends (xAI, Meta) reject.
+fn strip_responses_extras(body: &mut Value) {
+    if let Some(o) = body.as_object_mut() {
+        for k in ["previous_response_id", "prompt_cache_retention", "safety_identifier", "stream_options", "stop"] {
+            o.remove(k);
+        }
+        if let Some(Value::Array(items)) = o.get_mut("input") {
+            items.retain(|it| {
+                !(it["type"] == "reasoning" && it["encrypted_content"].as_str().is_some_and(|e| e.starts_with("cpx-")))
+            });
+        }
+    }
+}
+
+fn responses_api(t: &Target, mut body: Value) -> Prepared {
+    let (token, base, oauth, _) = creds(t.acct);
+    body["model"] = t.model.into();
+    body["stream"] = t.stream.into();
+    strip_responses_extras(&mut body);
+    let mut headers = vec![
+        ("authorization".into(), format!("Bearer {token}")),
+        ("content-type".into(), "application/json".into()),
+        ("accept".into(), if t.stream { "text/event-stream" } else { "application/json" }.into()),
+    ];
+    let base = if t.acct.provider == Provider::Meta {
+        headers.push(("user-agent".into(), device::meta::API_UA.into()));
+        headers.push(("x-client-id".into(), "tbh:tui".into()));
+        base.unwrap_or_else(|| device::meta::API_BASE.into())
+    } else {
+        if let Some(key) = body["prompt_cache_key"].as_str() {
+            headers.push(("x-grok-conv-id".into(), key.to_string()));
+        }
+        let official = base.as_deref().is_none_or(|b| b.trim_end_matches('/') == device::xai::API_BASE);
+        if oauth && official {
+            // Grok subscriptions (SuperGrok / X Premium) go through the CLI chat proxy.
+            headers.extend(
+                [
+                    ("x-xai-token-auth", "xai-grok-cli".to_string()),
+                    ("x-grok-client-version", device::xai::CLIENT_VERSION.to_string()),
+                    ("user-agent", format!("xai-grok-workspace/{}", device::xai::CLIENT_VERSION)),
+                    ("x-grok-client-identifier", "grok-shell".to_string()),
+                    ("x-authenticateresponse", "authenticate-response".to_string()),
+                ]
+                .map(|(k, v)| (k.to_string(), v)),
+            );
+            device::xai::CLI_BASE.into()
+        } else {
+            headers.push(("user-agent".into(), format!("CLIProxyAPI-Rust/{}", env!("CARGO_PKG_VERSION"))));
+            base.unwrap_or_else(|| device::xai::API_BASE.into())
+        }
+    };
+    Prepared { url: format!("{}/responses", base.trim_end_matches('/')), headers, body, raw: None }
 }
 
 // ---------------------------------------------------------------------- compat
@@ -443,12 +643,21 @@ fn compat(t: &Target, mut body: Value) -> Prepared {
     if !token.is_empty() {
         headers.push(("authorization".into(), format!("Bearer {token}")));
     }
-    Prepared { url: format!("{base}/chat/completions"), headers, body }
+    Prepared { url: format!("{base}/chat/completions"), headers, body, raw: None }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn codex_input_strings_become_lists() {
+        let mut body = json!({ "input": "hi", "max_output_tokens": 5 });
+        sanitize_codex_body(&mut body, "gpt-6-astra", false);
+        assert_eq!(body["input"][0]["content"][0]["text"], "hi");
+        assert!(body.get("max_output_tokens").is_none());
+        assert_eq!(body["store"], false);
+    }
 
     #[test]
     fn fingerprint_is_three_hex_chars() {

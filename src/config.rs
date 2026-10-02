@@ -2,7 +2,8 @@ use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize};
+use serde_yaml::Value as Yaml;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case", default)]
@@ -16,10 +17,15 @@ pub struct Config {
     /// Empty means no client authentication.
     pub api_keys: Vec<String>,
     /// Protects the dashboard and management API. Empty means localhost-only access.
+    /// A bcrypt hash (as CLIProxyAPI stores it) works too.
     pub management_key: String,
+    /// With a management key set, allow the dashboard from other machines (default true).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub management_allow_remote: Option<bool>,
     /// Optional upstream proxy (http://, https://, socks5://).
     pub proxy_url: String,
     /// How many different accounts to try before giving up on a request.
+    #[serde(deserialize_with = "lenient_u32")]
     pub request_retry: u32,
     /// round-robin or fill-first.
     pub routing: Routing,
@@ -28,18 +34,84 @@ pub struct Config {
     /// Rewrite non-Claude-Code requests on Claude OAuth accounts so they look like Claude Code.
     pub claude_cloak: bool,
     pub debug: bool,
+    /// Serve HTTPS with this certificate.
+    #[serde(skip_serializing_if = "Tls::is_off")]
+    pub tls: Tls,
+    /// Only route unprefixed model names to accounts without a `prefix`.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub force_model_prefix: bool,
+    /// Per-provider renames for OAuth accounts (`claude: [{name, alias, fork}]`).
+    #[serde(skip_serializing_if = "BTreeMap::is_empty")]
+    pub oauth_model_alias: BTreeMap<String, Vec<OAuthAlias>>,
+    /// Per-provider model patterns OAuth accounts must not serve (`*` wildcards).
+    #[serde(skip_serializing_if = "BTreeMap::is_empty")]
+    pub oauth_excluded_models: BTreeMap<String, Vec<String>>,
+    /// CLIProxyAPI settings found in the file that have no effect here.
+    #[serde(skip)]
+    pub ignored: Vec<String>,
     pub claude_api_key: Vec<KeyEntry>,
     pub codex_api_key: Vec<KeyEntry>,
     pub gemini_api_key: Vec<KeyEntry>,
+    /// Vertex AI express-mode API keys (service accounts go in the auth dir).
+    pub vertex_api_key: Vec<KeyEntry>,
+    /// Kimi Code (api.kimi.com/coding) or Moonshot platform keys.
+    pub kimi_api_key: Vec<KeyEntry>,
+    pub xai_api_key: Vec<KeyEntry>,
+    pub meta_api_key: Vec<KeyEntry>,
     pub openai_compatibility: Vec<CompatEntry>,
 }
 
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq, Default)]
 #[serde(rename_all = "kebab-case")]
 pub enum Routing {
     #[default]
     RoundRobin,
     FillFirst,
+}
+
+/// Accepts `routing: fill-first` and CLIProxyAPI's `routing: { strategy: fill-first }`.
+/// Strategies this crate doesn't have (weighted-round-robin) fall back to round-robin.
+impl<'de> Deserialize<'de> for Routing {
+    fn deserialize<D: Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        let v = Yaml::deserialize(d)?;
+        let s = match &v {
+            Yaml::String(s) => s.as_str(),
+            Yaml::Mapping(m) => m.get("strategy").and_then(Yaml::as_str).unwrap_or_default(),
+            _ => "",
+        };
+        Ok(if s.trim().eq_ignore_ascii_case("fill-first") { Routing::FillFirst } else { Routing::RoundRobin })
+    }
+}
+
+fn lenient_u32<'de, D: Deserializer<'de>>(d: D) -> Result<u32, D::Error> {
+    let v = Yaml::deserialize(d)?;
+    Ok(v.as_i64().map(|n| n.clamp(0, u32::MAX as i64) as u32).unwrap_or(3))
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(rename_all = "kebab-case", default)]
+pub struct Tls {
+    pub enable: bool,
+    pub cert: String,
+    pub key: String,
+}
+
+impl Tls {
+    fn is_off(&self) -> bool {
+        !self.enable && self.cert.is_empty() && self.key.is_empty()
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq)]
+#[serde(rename_all = "kebab-case", default)]
+pub struct OAuthAlias {
+    /// Upstream model name.
+    pub name: String,
+    /// Name clients use.
+    pub alias: String,
+    /// Keep serving `name` as well (otherwise the alias replaces it).
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub fork: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -57,6 +129,12 @@ pub struct KeyEntry {
     pub models: Vec<ModelAlias>,
     #[serde(skip_serializing_if = "BTreeMap::is_empty")]
     pub headers: BTreeMap<String, String>,
+    /// Clients must call `prefix/model` to reach this key.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub prefix: Option<String>,
+    /// Model patterns this key must not serve (`*` wildcards).
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub excluded_models: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -70,6 +148,12 @@ pub struct CompatEntry {
     pub headers: BTreeMap<String, String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub proxy_url: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub prefix: Option<String>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub excluded_models: Vec<String>,
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub disabled: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -91,26 +175,36 @@ impl ModelAlias {
 impl Default for Config {
     fn default() -> Self {
         Self {
-            host: "127.0.0.1".into(),
+            host: default_host(),
             port: 8317,
             auth_dir: "~/.cli-proxy-api".into(),
             api_keys: vec![],
             management_key: String::new(),
+            management_allow_remote: None,
             proxy_url: String::new(),
             request_retry: 3,
             routing: Routing::RoundRobin,
             codex_websockets: true,
             claude_cloak: true,
             debug: false,
+            tls: Tls::default(),
+            force_model_prefix: false,
+            oauth_model_alias: BTreeMap::new(),
+            oauth_excluded_models: BTreeMap::new(),
+            ignored: vec![],
             claude_api_key: vec![],
             codex_api_key: vec![],
             gemini_api_key: vec![],
+            vertex_api_key: vec![],
+            kimi_api_key: vec![],
+            xai_api_key: vec![],
+            meta_api_key: vec![],
             openai_compatibility: vec![],
         }
     }
 }
 
-pub const TEMPLATE: &str = r#"# CLIProxyAPI-Rust configuration. Changes are picked up automatically.
+const TEMPLATE: &str = r#"# CLIProxyAPI-Rust configuration. Changes are picked up automatically.
 
 host: "127.0.0.1"          # use 0.0.0.0 to expose on your network (set api-keys first!)
 port: 8317
@@ -129,7 +223,8 @@ codex-websockets: true      # native upstream websocket for Codex websocket clie
 claude-cloak: true          # make non-Claude-Code clients look like Claude Code on OAuth accounts
 debug: false
 
-# API keys (optional). OAuth accounts are added with `cliproxyapi-rust login` or the dashboard.
+# API keys (optional). Accounts (Claude, Codex, Antigravity, Kimi, xAI, Meta, Devin, Vertex)
+# are added with `cliproxyapi-rust login <provider>` or from the dashboard.
 claude-api-key: []
 #  - api-key: "sk-ant-..."
 #    base-url: "https://api.anthropic.com"   # optional
@@ -141,6 +236,20 @@ codex-api-key: []
 gemini-api-key: []
 #  - api-key: "AIza..."
 
+vertex-api-key: []          # Vertex AI express mode; service accounts: `cliproxyapi-rust login vertex --file sa.json`
+#  - api-key: "AQ..."
+
+kimi-api-key: []
+#  - api-key: "sk-kimi-..."                 # Kimi Code key
+#  - api-key: "sk-..."                      # Moonshot platform key
+#    base-url: "https://api.moonshot.ai/v1"
+
+xai-api-key: []
+#  - api-key: "xai-..."
+
+meta-api-key: []
+#  - api-key: "..."
+
 openai-compatibility: []
 #  - name: openrouter
 #    base-url: "https://openrouter.ai/api/v1"
@@ -149,6 +258,16 @@ openai-compatibility: []
 #      - name: "moonshotai/kimi-k3"
 #        alias: "kimi-k3"
 "#;
+
+/// 127.0.0.1, unless the environment says otherwise (the Docker image binds all interfaces).
+fn default_host() -> String {
+    std::env::var("CLIPROXYAPI_RUST_DEFAULT_HOST").unwrap_or_else(|_| "127.0.0.1".into())
+}
+
+/// The commented starter config, bound to the default host.
+pub fn template() -> String {
+    TEMPLATE.replacen("host: \"127.0.0.1\"", &format!("host: \"{}\"", default_host()), 1)
+}
 
 pub fn expand_home(p: &str) -> PathBuf {
     if let Some(rest) = p.strip_prefix("~/").or_else(|| (p == "~").then_some(""))
@@ -165,7 +284,7 @@ impl Config {
             if let Some(dir) = path.parent().filter(|d| !d.as_os_str().is_empty()) {
                 std::fs::create_dir_all(dir).ok();
             }
-            std::fs::write(path, TEMPLATE).with_context(|| format!("writing {}", path.display()))?;
+            std::fs::write(path, template()).with_context(|| format!("writing {}", path.display()))?;
             tracing::info!("created default config at {}", path.display());
         }
         let text = std::fs::read_to_string(path).with_context(|| format!("reading {}", path.display()))?;
@@ -176,7 +295,10 @@ impl Config {
         if text.trim().is_empty() {
             return Ok(Self::default());
         }
-        let cfg: Config = serde_yaml::from_str(text).context("invalid config")?;
+        let mut doc: Yaml = serde_yaml::from_str(text).context("invalid config")?;
+        let ignored = crate::compat::normalize(&mut doc);
+        let mut cfg: Config = serde_yaml::from_value(doc).context("invalid config")?;
+        cfg.ignored = ignored;
         Ok(cfg)
     }
 

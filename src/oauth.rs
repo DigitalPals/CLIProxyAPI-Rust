@@ -1,4 +1,5 @@
-//! OAuth (PKCE) login + token refresh for Claude and Codex accounts.
+//! Browser OAuth login (Claude, Codex, Antigravity) and token refresh for
+//! every provider with expiring credentials.
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -11,6 +12,8 @@ use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 
 use crate::accounts::{Account, Credential, OAuth, Provider, write_oauth_file};
+use crate::antigravity;
+use crate::device;
 use crate::state::App;
 
 pub mod claude {
@@ -60,6 +63,18 @@ pub fn auth_url(provider: Provider, state: &str, p: &Pkce) -> String {
                 ("scope", claude::SCOPE),
                 ("code_challenge", &p.challenge),
                 ("code_challenge_method", "S256"),
+                ("state", state),
+            ],
+        ),
+        Provider::Antigravity => (
+            antigravity::AUTH_URL,
+            vec![
+                ("access_type", "offline"),
+                ("client_id", antigravity::CLIENT_ID),
+                ("prompt", "consent"),
+                ("redirect_uri", antigravity::REDIRECT),
+                ("response_type", "code"),
+                ("scope", antigravity::SCOPES),
                 ("state", state),
             ],
         ),
@@ -140,7 +155,7 @@ pub async fn exchange(
                 expires_at: expiry(&v),
                 email: v["account"]["email_address"].as_str().map(String::from),
                 account_id: v["account"]["uuid"].as_str().map(String::from),
-                base_url: None,
+                ..Default::default()
             };
             if o.email.is_none()
                 && let Ok(p) = claude_profile(app, &o.access_token).await
@@ -151,6 +166,49 @@ pub async fn exchange(
             let name = format!("claude-{}.json", file_safe(o.email.as_deref().unwrap_or("account")));
             let device: String = (0..32).map(|_| format!("{:02x}", rand::random::<u8>())).collect();
             Ok((o, name, vec![("claude_device_ids", json!([device]))]))
+        }
+        Provider::Antigravity => {
+            let form = [
+                ("code", code),
+                ("client_id", antigravity::CLIENT_ID),
+                ("client_secret", antigravity::CLIENT_SECRET),
+                ("redirect_uri", antigravity::REDIRECT),
+                ("grant_type", "authorization_code"),
+            ];
+            let v = read_json(http.post(antigravity::TOKEN_URL).form(&form).send().await?).await?;
+            let access = v["access_token"].as_str().unwrap_or_default().to_string();
+            let info = read_json(
+                http.get(antigravity::USERINFO_URL)
+                    .bearer_auth(&access)
+                    .header("user-agent", antigravity::user_agent())
+                    .send()
+                    .await?,
+            )
+            .await
+            .unwrap_or_default();
+            let email = info["email"].as_str().map(String::from);
+            let project = match antigravity::fetch_project(app, &http, antigravity::BASE_PROD, &access).await {
+                Ok(p) => Some(p),
+                Err(e) => {
+                    tracing::warn!("antigravity: could not resolve the Cloud project yet: {e:#}");
+                    None
+                }
+            };
+            let o = OAuth {
+                access_token: access,
+                refresh_token: v["refresh_token"].as_str().unwrap_or_default().to_string(),
+                expires_at: expiry(&v),
+                email,
+                project_id: project,
+                ..Default::default()
+            };
+            let name = match &o.email {
+                Some(e) => format!("antigravity-{}.json", file_safe(e)),
+                None => "antigravity.json".into(),
+            };
+            let extra =
+                vec![("expires_in", v["expires_in"].clone()), ("timestamp", Utc::now().timestamp_millis().into())];
+            Ok((o, name, extra))
         }
         _ => {
             let form = [
@@ -172,7 +230,7 @@ pub async fn exchange(
                 expires_at: expiry(&v),
                 email: claims["email"].as_str().map(String::from),
                 account_id: auth["chatgpt_account_id"].as_str().map(String::from),
-                base_url: None,
+                ..Default::default()
             };
             let plan = auth["chatgpt_plan_type"].as_str().unwrap_or("free").to_string();
             let name =
@@ -187,7 +245,7 @@ async fn claude_profile(app: &App, token: &str) -> Result<Value> {
     read_json(resp).await
 }
 
-fn file_safe(s: &str) -> String {
+pub fn file_safe(s: &str) -> String {
     s.chars().map(|c| if c.is_ascii_alphanumeric() || "@._-".contains(c) { c } else { '_' }).collect()
 }
 
@@ -215,11 +273,18 @@ pub async fn ensure_fresh(app: &App, acct: &Arc<Account>, margin: chrono::Durati
     if old.access_token != token_before {
         return Ok(());
     }
-    if old.refresh_token.is_empty() {
+    let self_minted = matches!(acct.provider, Provider::Vertex | Provider::Meta);
+    if old.refresh_token.is_empty() && !self_minted {
         bail!("no refresh token");
     }
     let http = app.http.client(acct.proxy_url.as_deref().or(Some(&app.cfg().proxy_url)));
     let mut extra: Vec<(&str, Value)> = vec![];
+    let keep = |access: String, v: &Value| OAuth {
+        access_token: access,
+        refresh_token: v["refresh_token"].as_str().map(String::from).unwrap_or(old.refresh_token.clone()),
+        expires_at: expiry(v),
+        ..old.clone()
+    };
     let new = match acct.provider {
         Provider::Claude => {
             let body = json!({
@@ -230,12 +295,9 @@ pub async fn ensure_fresh(app: &App, acct: &Arc<Account>, margin: chrono::Durati
             });
             let v = read_json(claude_headers(http.post(claude::TOKEN_URL)).json(&body).send().await?).await?;
             OAuth {
-                access_token: v["access_token"].as_str().ok_or_else(|| anyhow!("missing access_token"))?.to_string(),
-                refresh_token: v["refresh_token"].as_str().map(String::from).unwrap_or(old.refresh_token.clone()),
-                expires_at: expiry(&v),
                 email: v["account"]["email_address"].as_str().map(String::from).or(old.email.clone()),
                 account_id: v["account"]["uuid"].as_str().map(String::from).or(old.account_id.clone()),
-                base_url: old.base_url.clone(),
+                ..keep(access_of(&v)?, &v)
             }
         }
         Provider::Codex => {
@@ -254,16 +316,76 @@ pub async fn ensure_fresh(app: &App, acct: &Arc<Account>, margin: chrono::Durati
                 extra.push(("id_token", t.into()));
             }
             OAuth {
-                access_token: v["access_token"].as_str().ok_or_else(|| anyhow!("missing access_token"))?.to_string(),
-                refresh_token: v["refresh_token"].as_str().map(String::from).unwrap_or(old.refresh_token.clone()),
-                expires_at: expiry(&v),
                 email: claims["email"].as_str().map(String::from).or(old.email.clone()),
                 account_id: claims["https://api.openai.com/auth"]["chatgpt_account_id"]
                     .as_str()
                     .map(String::from)
                     .or(old.account_id.clone()),
-                base_url: old.base_url.clone(),
+                ..keep(access_of(&v)?, &v)
             }
+        }
+        Provider::Antigravity => {
+            let form = [
+                ("client_id", antigravity::CLIENT_ID),
+                ("client_secret", antigravity::CLIENT_SECRET),
+                ("grant_type", "refresh_token"),
+                ("refresh_token", old.refresh_token.as_str()),
+            ];
+            let v = read_json(http.post(antigravity::TOKEN_URL).form(&form).send().await?).await?;
+            extra.push(("expires_in", v["expires_in"].clone()));
+            extra.push(("timestamp", Utc::now().timestamp_millis().into()));
+            keep(access_of(&v)?, &v)
+        }
+        Provider::Kimi => {
+            let device_id = old.field("device_id").map(String::from).unwrap_or_else(|| acct.device_id.clone());
+            let form = [
+                ("client_id", device::kimi::CLIENT_ID),
+                ("grant_type", "refresh_token"),
+                ("refresh_token", old.refresh_token.as_str()),
+            ];
+            let mut rb = http.post(device::kimi::TOKEN_URL).header("accept", "application/json").form(&form);
+            for (k, v) in device::kimi_headers(&device_id) {
+                rb = rb.header(k, v);
+            }
+            let v = read_json(rb.send().await?).await?;
+            keep(access_of(&v)?, &v)
+        }
+        Provider::Xai => {
+            let endpoint = match old.field("token_endpoint") {
+                Some(e) => e.to_string(),
+                None => device::xai_token_endpoint(&http).await?,
+            };
+            let form = [
+                ("grant_type", "refresh_token"),
+                ("client_id", device::xai::CLIENT_ID),
+                ("refresh_token", old.refresh_token.as_str()),
+            ];
+            let v =
+                read_json(http.post(&endpoint).header("accept", "application/json").form(&form).send().await?).await?;
+            if let Some(t) = v["id_token"].as_str() {
+                extra.push(("id_token", t.into()));
+            }
+            keep(access_of(&v)?, &v)
+        }
+        Provider::Meta => {
+            let dca =
+                old.field("dca_token").ok_or_else(|| anyhow!("no device token to mint a new key; sign in again"))?;
+            let minted = device::meta_mint(&http, dca).await?;
+            OAuth {
+                access_token: minted["api_key"].as_str().unwrap_or_default().to_string(),
+                base_url: minted["base_url"]
+                    .as_str()
+                    .filter(|s| !s.is_empty())
+                    .map(String::from)
+                    .or(old.base_url.clone()),
+                expires_at: None,
+                ..old.clone()
+            }
+        }
+        Provider::Vertex => {
+            let sa = old.raw.get("service_account").cloned().ok_or_else(|| anyhow!("no service account"))?;
+            let (token, expires) = crate::vertex::mint(&http, &sa).await?;
+            OAuth { access_token: token, expires_at: Some(expires), ..old.clone() }
         }
         _ => return Ok(()),
     };
@@ -273,6 +395,19 @@ pub async fn ensure_fresh(app: &App, acct: &Arc<Account>, margin: chrono::Durati
     }
     tracing::info!(account = %acct.label, "refreshed {} token", acct.provider.as_str());
     *acct.cred.write() = Credential::OAuth(new);
+    Ok(())
+}
+
+fn access_of(v: &Value) -> Result<String> {
+    Ok(v["access_token"].as_str().ok_or_else(|| anyhow!("missing access_token"))?.to_string())
+}
+
+/// Fresh credentials plus any per-provider setup (Antigravity's Cloud project).
+pub async fn ensure_ready(app: &App, acct: &Arc<Account>) -> Result<()> {
+    ensure_fresh(app, acct, chrono::Duration::minutes(5), false).await?;
+    if acct.provider == Provider::Antigravity && acct.is_oauth() {
+        antigravity::ensure_ready(app, acct).await?;
+    }
     Ok(())
 }
 

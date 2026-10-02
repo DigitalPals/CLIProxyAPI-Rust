@@ -18,7 +18,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
 use crate::accounts::{Credential, Provider, set_file_disabled, write_oauth_file};
-use crate::config::{CompatEntry, Config, KeyEntry, ModelAlias};
+use crate::config::{Config, ModelAlias};
 use crate::oauth;
 use crate::state::App;
 
@@ -29,6 +29,9 @@ pub struct Login {
     pub message: Option<String>,
     pub url: String,
     pub callback: bool,
+    /// "redirect" (browser OAuth) or "device" (enter `user_code` at `url`).
+    pub kind: &'static str,
+    pub user_code: Option<String>,
     #[serde(skip)]
     pub verifier: String,
     #[serde(skip)]
@@ -37,34 +40,118 @@ pub struct Login {
 
 static CLAUDE_CB: AtomicBool = AtomicBool::new(false);
 static CODEX_CB: AtomicBool = AtomicBool::new(false);
+static ANTIGRAVITY_CB: AtomicBool = AtomicBool::new(false);
 
-pub async fn start_login(app: &Arc<App>, provider: Provider) -> Result<(String, Login)> {
-    if !matches!(provider, Provider::Claude | Provider::Codex) {
-        return Err(anyhow!("OAuth login is available for claude and codex"));
-    }
-    let pkce = oauth::pkce();
-    let state = oauth::random_state();
-    let url = oauth::auth_url(provider, &state, &pkce);
-    let callback = ensure_callback_server(app, provider).await;
-    let login = Login {
-        provider,
-        status: "pending",
-        message: None,
-        url,
-        callback,
-        verifier: pkce.verifier,
-        created: Instant::now(),
-    };
+fn remember(app: &Arc<App>, state: &str, login: &Login) {
     let mut logins = app.logins.lock();
     logins.retain(|_, l| l.created.elapsed() < Duration::from_secs(1800));
-    logins.insert(state.clone(), login.clone());
-    Ok((state, login))
+    logins.insert(state.to_string(), login.clone());
+}
+
+fn settle(app: &Arc<App>, state: &str, result: &Result<String>) {
+    if let Some(l) = app.logins.lock().get_mut(state) {
+        match result {
+            Ok(label) => {
+                l.status = "done";
+                l.message = Some(label.clone());
+            }
+            Err(e) => {
+                l.status = "error";
+                l.message = Some(format!("{e:#}"));
+            }
+        }
+    }
+    app.broadcast("login", json!({ "state": state }));
+}
+
+pub async fn start_login(app: &Arc<App>, provider: Provider) -> Result<(String, Login)> {
+    let state = oauth::random_state();
+    match provider {
+        Provider::Claude | Provider::Codex | Provider::Antigravity => {
+            let pkce = oauth::pkce();
+            let url = oauth::auth_url(provider, &state, &pkce);
+            let callback = ensure_callback_server(app, provider).await;
+            let login = Login {
+                provider,
+                status: "pending",
+                message: None,
+                url,
+                callback,
+                kind: "redirect",
+                user_code: None,
+                verifier: pkce.verifier,
+                created: Instant::now(),
+            };
+            remember(app, &state, &login);
+            Ok((state, login))
+        }
+        Provider::Kimi | Provider::Xai | Provider::Meta => {
+            let dev = crate::device::start(app, provider).await?;
+            let login = Login {
+                provider,
+                status: "pending",
+                message: None,
+                url: dev.verification_uri.clone(),
+                callback: true,
+                kind: "device",
+                user_code: Some(dev.user_code.clone()),
+                verifier: String::new(),
+                created: Instant::now(),
+            };
+            remember(app, &state, &login);
+            let (app2, state2) = (app.clone(), state.clone());
+            tokio::spawn(async move {
+                let result = async {
+                    let signed = crate::device::wait(&app2, provider, &dev).await?;
+                    save_signed(&app2, provider, signed)
+                }
+                .await;
+                settle(&app2, &state2, &result);
+            });
+            Ok((state, login))
+        }
+        Provider::Devin => {
+            // Devin accepts any localhost redirect, so use a fresh port per login.
+            let pkce = oauth::pkce();
+            let (callback, redirect) = match tokio::net::TcpListener::bind(("127.0.0.1", 0)).await {
+                Ok(listener) => {
+                    let port = listener.local_addr()?.port();
+                    serve_callback(app, listener, "/callback", provider, None);
+                    (true, format!("http://127.0.0.1:{port}/callback"))
+                }
+                Err(_) => (false, String::new()),
+            };
+            let login = Login {
+                provider,
+                status: "pending",
+                message: None,
+                url: crate::devin::auth_url(&redirect, &state, &pkce.challenge),
+                callback,
+                kind: "redirect",
+                user_code: None,
+                verifier: pkce.verifier,
+                created: Instant::now(),
+            };
+            remember(app, &state, &login);
+            Ok((state, login))
+        }
+        Provider::Vertex => Err(anyhow!("Vertex uses a service account key: import the JSON instead")),
+        Provider::Gemini | Provider::Compat => Err(anyhow!("{} uses API keys", provider.as_str())),
+    }
+}
+
+fn save_signed(app: &Arc<App>, provider: Provider, s: crate::device::Signed) -> Result<String> {
+    let path = app.cfg().auth_dir().join(&s.file);
+    write_oauth_file(&path, provider, &s.oauth, &s.extra)?;
+    app.reload_accounts();
+    Ok(s.oauth.email.unwrap_or(s.file))
 }
 
 /// Listens on the fixed OAuth redirect port while logins are pending.
 async fn ensure_callback_server(app: &Arc<App>, provider: Provider) -> bool {
     let (flag, port, path) = match provider {
         Provider::Claude => (&CLAUDE_CB, oauth::claude::PORT, "/callback"),
+        Provider::Antigravity => (&ANTIGRAVITY_CB, crate::antigravity::PORT, "/oauth-callback"),
         _ => (&CODEX_CB, oauth::codex::PORT, "/auth/callback"),
     };
     if flag.load(Ordering::SeqCst) {
@@ -80,6 +167,18 @@ async fn ensure_callback_server(app: &Arc<App>, provider: Provider) -> bool {
         }
     };
     flag.store(true, Ordering::SeqCst);
+    serve_callback(app, listener, path, provider, Some(flag));
+    true
+}
+
+/// Serves the OAuth redirect on `listener` until no login for `provider` is pending.
+fn serve_callback(
+    app: &Arc<App>,
+    listener: tokio::net::TcpListener,
+    path: &'static str,
+    provider: Provider,
+    flag: Option<&'static AtomicBool>,
+) {
     let router = Router::new().route(path, get(callback)).with_state(app.clone());
     let app2 = app.clone();
     tokio::spawn(async move {
@@ -95,9 +194,10 @@ async fn ensure_callback_server(app: &Arc<App>, provider: Provider) -> bool {
             }
         };
         let _ = axum::serve(listener, router).with_graceful_shutdown(shutdown).await;
-        flag.store(false, Ordering::SeqCst);
+        if let Some(f) = flag {
+            f.store(false, Ordering::SeqCst);
+        }
     });
-    true
 }
 
 #[derive(Deserialize)]
@@ -137,9 +237,16 @@ pub async fn complete_login(app: &Arc<App>, state: &str, code: &str) -> Result<S
         if l.status != "pending" {
             return Err(anyhow!("this login was already completed"));
         }
+        if l.kind == "device" {
+            return Err(anyhow!("approve the code in your browser; there is nothing to paste"));
+        }
         (l.provider, l.verifier.clone())
     };
     let result = async {
+        if provider == Provider::Devin {
+            let signed = crate::devin::complete_login(app, code.trim(), &verifier).await?;
+            return save_signed(app, provider, signed);
+        }
         let (cred, name, extra) = oauth::exchange(app, provider, code.trim(), state, &verifier).await?;
         let path = app.cfg().auth_dir().join(&name);
         write_oauth_file(&path, provider, &cred, &extra)?;
@@ -147,21 +254,7 @@ pub async fn complete_login(app: &Arc<App>, state: &str, code: &str) -> Result<S
         Ok::<_, anyhow::Error>(cred.email.unwrap_or(name))
     }
     .await;
-    let mut logins = app.logins.lock();
-    if let Some(l) = logins.get_mut(state) {
-        match &result {
-            Ok(label) => {
-                l.status = "done";
-                l.message = Some(label.clone());
-            }
-            Err(e) => {
-                l.status = "error";
-                l.message = Some(format!("{e:#}"));
-            }
-        }
-    }
-    drop(logins);
-    app.broadcast("login", json!({ "state": state }));
+    settle(app, state, &result);
     result
 }
 
@@ -194,6 +287,7 @@ pub fn router(app: Arc<App>) -> Router<Arc<App>> {
         .route("/accounts/{id}/refresh", post(refresh_account))
         .route("/accounts/{id}/reset", post(reset_account))
         .route("/keys", post(add_key))
+        .route("/vertex", post(import_vertex))
         .route("/requests", get(requests))
         .route("/models", get(models))
         .route("/config", get(get_config).put(put_config))
@@ -209,7 +303,8 @@ async fn auth(
     req: Request,
     next: Next,
 ) -> Response {
-    let key = app.cfg().management_key.clone();
+    let cfg = app.cfg();
+    let key = cfg.management_key.clone();
     if key.is_empty() {
         if addr.ip().is_loopback() {
             return next.run(req).await;
@@ -218,6 +313,9 @@ async fn auth(
             StatusCode::FORBIDDEN,
             "the dashboard is only reachable from localhost until you set management-key",
         );
+    }
+    if cfg.management_allow_remote == Some(false) && !addr.ip().is_loopback() {
+        return err(StatusCode::FORBIDDEN, "remote management is off (allow-remote: false)");
     }
     let bearer = req
         .headers()
@@ -229,10 +327,29 @@ async fn auth(
         .uri()
         .query()
         .and_then(|q| url::form_urlencoded::parse(q.as_bytes()).find(|(k, _)| k == "key").map(|(_, v)| v.into_owned()));
-    if bearer.or(query).is_some_and(|k| constant_eq(&k, &key)) {
+    if bearer.or(query).is_some_and(|k| management_key_matches(&k, &key)) {
         return next.run(req).await;
     }
     err(StatusCode::UNAUTHORIZED, "management key required")
+}
+
+/// Plain keys compare in constant time; bcrypt hashes (CLIProxyAPI hashes
+/// `secret-key` on first start) are verified once per key and remembered.
+fn management_key_matches(provided: &str, configured: &str) -> bool {
+    use sha2::{Digest, Sha256};
+    static VERIFIED: parking_lot::Mutex<Vec<[u8; 32]>> = parking_lot::Mutex::new(Vec::new());
+    if !["$2a$", "$2b$", "$2y$"].iter().any(|p| configured.starts_with(p)) {
+        return constant_eq(provided, configured);
+    }
+    let id: [u8; 32] = Sha256::digest(format!("{configured}\0{provided}").as_bytes()).into();
+    if VERIFIED.lock().contains(&id) {
+        return true;
+    }
+    let ok = bcrypt::verify(provided, configured).unwrap_or(false);
+    if ok {
+        VERIFIED.lock().push(id);
+    }
+    ok
 }
 
 pub fn constant_eq(a: &str, b: &str) -> bool {
@@ -350,22 +467,8 @@ async fn delete_account(State(app): State<Arc<App>>, Path(id): Path<String>) -> 
         Credential::ApiKey { key, .. } => key.clone(),
         _ => String::new(),
     };
-    let mut cfg = (*app.cfg()).clone();
-    let keep = |e: &KeyEntry| e.api_key.trim() != key;
-    match acct.provider {
-        Provider::Claude => cfg.claude_api_key.retain(keep),
-        Provider::Codex => cfg.codex_api_key.retain(keep),
-        Provider::Gemini => cfg.gemini_api_key.retain(keep),
-        Provider::Compat => {
-            // Removing a group's last key removes the group (a keyless group would remain usable).
-            let group = acct.group.clone();
-            for c in cfg.openai_compatibility.iter_mut().filter(|c| Some(&c.name) == group.as_ref()) {
-                c.api_keys.retain(|k| !key.is_empty() && k.trim() != key);
-            }
-            cfg.openai_compatibility.retain(|c| Some(&c.name) != group.as_ref() || !c.api_keys.is_empty());
-        }
-    }
-    save_config(&app, cfg)
+    let group = if acct.provider == Provider::Compat { acct.group.clone() } else { None };
+    edit_config(&app, |doc| crate::compat::remove_key(doc, &key, group.as_deref()))
 }
 
 #[derive(Deserialize)]
@@ -393,57 +496,84 @@ async fn add_key(State(app): State<Arc<App>>, Json(b): Json<KeyBody>) -> Respons
             None => ModelAlias { name: m.into(), alias: None },
         })
         .collect();
-    let mut cfg = (*app.cfg()).clone();
-    let entry = KeyEntry { api_key: key.clone(), base_url: base.clone(), models: models.clone(), ..Default::default() };
-    match b.provider.as_str() {
-        "claude" | "codex" | "gemini" if key.is_empty() => return err(StatusCode::BAD_REQUEST, "API key is required"),
-        "claude" => cfg.claude_api_key.push(entry),
-        "codex" => cfg.codex_api_key.push(entry),
-        "gemini" => cfg.gemini_api_key.push(entry),
-        "compat" | "openai-compat" => {
-            let Some(base) = base else { return err(StatusCode::BAD_REQUEST, "base URL is required") };
+    let models: Vec<(String, Option<String>)> = models.into_iter().map(|m| (m.name, m.alias)).collect();
+    let (group, name) = match Provider::parse(&b.provider) {
+        Some(Provider::Compat) => {
+            let Some(base) = &base else { return err(StatusCode::BAD_REQUEST, "base URL is required") };
             if models.is_empty() {
                 return err(StatusCode::BAD_REQUEST, "list at least one model");
             }
             let name = if b.name.trim().is_empty() {
-                url::Url::parse(&base)
+                url::Url::parse(base)
                     .ok()
                     .and_then(|u| u.host_str().map(String::from))
                     .unwrap_or_else(|| "provider".into())
             } else {
                 b.name.trim().to_string()
             };
-            match cfg.openai_compatibility.iter_mut().find(|c| c.name == name && c.base_url == base) {
-                Some(c) => {
-                    if !key.is_empty() {
-                        c.api_keys.push(key);
-                    }
-                    for m in models {
-                        if !c.models.iter().any(|x| x.public() == m.public()) {
-                            c.models.push(m);
-                        }
-                    }
-                }
-                None => cfg.openai_compatibility.push(CompatEntry {
-                    name,
-                    base_url: base,
-                    api_keys: if key.is_empty() { vec![] } else { vec![key] },
-                    models,
-                    ..Default::default()
-                }),
-            }
+            ("openai-compatibility", Some(name))
         }
-        _ => return err(StatusCode::BAD_REQUEST, "unknown provider"),
-    }
-    save_config(&app, cfg)
+        Some(
+            p @ (Provider::Claude
+            | Provider::Codex
+            | Provider::Gemini
+            | Provider::Vertex
+            | Provider::Kimi
+            | Provider::Xai
+            | Provider::Meta),
+        ) => {
+            if key.is_empty() {
+                return err(StatusCode::BAD_REQUEST, "API key is required");
+            }
+            (p.as_str(), None)
+        }
+        Some(p) => return err(StatusCode::BAD_REQUEST, format!("{} does not take API keys", p.as_str())),
+        None => return err(StatusCode::BAD_REQUEST, "unknown provider"),
+    };
+    let new = crate::compat::NewKey { group, api_key: &key, base_url: base.as_deref(), models, name: name.as_deref() };
+    edit_config(&app, |doc| crate::compat::add_key(doc, &new))
 }
 
-fn save_config(app: &Arc<App>, cfg: Config) -> Response {
-    let text = match serde_yaml::to_string(&cfg) {
+#[derive(Deserialize)]
+struct VertexBody {
+    json: String,
+    #[serde(default)]
+    location: String,
+}
+
+async fn import_vertex(State(app): State<Arc<App>>, Json(b): Json<VertexBody>) -> Response {
+    match crate::vertex::import(&app, &b.json, &b.location).await {
+        Ok(label) => Json(json!({ "ok": true, "label": label })).into_response(),
+        Err(e) => err(StatusCode::BAD_REQUEST, format!("{e:#}")),
+    }
+}
+
+/// Applies an edit to the config file's YAML tree, keeping every setting this
+/// binary doesn't know about (so the file still works with CLIProxyAPI).
+fn edit_config(app: &Arc<App>, edit: impl FnOnce(&mut serde_yaml::Value)) -> Response {
+    let text = std::fs::read_to_string(&app.cfg_path).unwrap_or_default();
+    let mut doc: serde_yaml::Value = match serde_yaml::from_str(&text) {
+        Ok(serde_yaml::Value::Null) | Err(_) if text.trim().is_empty() => {
+            serde_yaml::Value::Mapping(Default::default())
+        }
+        Ok(v) => v,
+        Err(e) => return err(StatusCode::BAD_REQUEST, format!("config.yaml doesn't parse: {e}")),
+    };
+    edit(&mut doc);
+    let out = match serde_yaml::to_string(&doc) {
         Ok(t) => t,
         Err(e) => return err(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
     };
-    if let Err(e) = std::fs::write(&app.cfg_path, text) {
+    let cfg = match Config::parse(&out) {
+        Ok(c) => c,
+        Err(e) => return err(StatusCode::INTERNAL_SERVER_ERROR, format!("{e:#}")),
+    };
+    // Rewriting drops YAML comments; keep the original once.
+    let backup = app.cfg_path.with_extension("yaml.bak");
+    if text.contains('#') && !backup.exists() {
+        let _ = std::fs::write(&backup, &text);
+    }
+    if let Err(e) = std::fs::write(&app.cfg_path, out) {
         return err(StatusCode::INTERNAL_SERVER_ERROR, e.to_string());
     }
     app.set_config(cfg);
@@ -475,14 +605,13 @@ async fn put_config(State(app): State<Arc<App>>, Json(b): Json<ConfigBody>) -> R
 }
 
 async fn login_start(State(app): State<Arc<App>>, Path(target): Path<String>) -> Response {
-    let provider = match target.as_str() {
-        "claude" | "anthropic" => Provider::Claude,
-        "codex" | "openai" | "chatgpt" => Provider::Codex,
-        _ => return err(StatusCode::BAD_REQUEST, "unknown provider"),
-    };
+    let Some(provider) = Provider::parse(&target) else { return err(StatusCode::BAD_REQUEST, "unknown provider") };
     match start_login(&app, provider).await {
-        Ok((state, l)) => Json(json!({ "state": state, "url": l.url, "callback": l.callback })).into_response(),
-        Err(e) => err(StatusCode::BAD_REQUEST, e.to_string()),
+        Ok((state, l)) => Json(json!({
+            "state": state, "url": l.url, "callback": l.callback, "kind": l.kind, "user_code": l.user_code,
+        }))
+        .into_response(),
+        Err(e) => err(StatusCode::BAD_REQUEST, format!("{e:#}")),
     }
 }
 
@@ -537,4 +666,19 @@ async fn live(State(app): State<Arc<App>>, ws: WebSocketUpgrade) -> Response {
             }
         }
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn bcrypt_management_keys() {
+        let hash = bcrypt::hash("open sesame", 4).unwrap();
+        assert!(management_key_matches("open sesame", &hash));
+        assert!(management_key_matches("open sesame", &hash));
+        assert!(!management_key_matches("wrong", &hash));
+        assert!(management_key_matches("plain", "plain"));
+        assert!(!management_key_matches("plain", "other"));
+    }
 }
