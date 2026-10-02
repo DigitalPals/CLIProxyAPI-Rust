@@ -218,6 +218,7 @@ async fn native_turn(app: &Arc<App>, sess: &mut Session, body: &Value, full: &[V
     }
 
     let (only, model) = app.pool.route(&model);
+    let model = app.pool.canonical(&model, only.as_ref());
     if only.as_ref().is_some_and(|o| *o != crate::accounts::Only::Provider(Provider::Codex)) {
         return Native::Fallback;
     }
@@ -297,6 +298,7 @@ async fn native_turn(app: &Arc<App>, sess: &mut Session, body: &Value, full: &[V
         };
         let v: Value = serde_json::from_str(&text).unwrap_or(Value::Null);
         let kind = v["type"].as_str().unwrap_or_default().to_string();
+        crate::quota::observe_codex_event(&acct, &v);
         parser.feed(&SseEvent { event: None, data: text.clone() }, &mut evs);
         for ev in evs.drain(..) {
             match ev {

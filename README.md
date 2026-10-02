@@ -33,7 +33,7 @@ Point Claude Code, Codex, your editor or any SDK at one URL and stop caring whic
 - **Ten providers.** Subscription sign-in for Claude, ChatGPT (Codex), Antigravity, Grok, Kimi, Meta and Devin; service accounts for Vertex AI; API keys for Anthropic, OpenAI, Gemini, Vertex, Kimi, xAI, Meta and anything OpenAI-compatible.
 - **Images and video too.** `/v1/images/generations` and `/v1/images/edits` work with ChatGPT accounts, OpenAI and xAI keys, Vertex Imagen and Gemini image models. xAI video generation is behind `/v1/videos`.
 - **WebSockets.** Codex WebSocket sessions are relayed to ChatGPT's own WebSocket upstream, so `previous_response_id` works on the server side. Switch to a Claude or Gemini model mid-session and CLIProxyAPI-Rust carries the conversation over.
-- **Many accounts, no babysitting.** Requests rotate across accounts (round-robin or fill-first). A rate limit cools down only that model on that account, until the reset time the provider reports. Failed requests move to the next account, and OAuth tokens refresh themselves.
+- **Many accounts, no babysitting.** Each request goes to the account with the most quota left, using the 5-hour and weekly usage Claude and ChatGPT report. An account whose limit is used up sits out until it resets, a rate limit cools down only that model on that account, failed requests move to the next account, and OAuth tokens refresh themselves.
 - **A dashboard you'll actually open.** Pure black, live over WebSocket: traffic, account health with countdown timers, sign-in flows, a request log and a config editor.
 - **Drop-in for CLIProxyAPI users.** Same credential files, same `config.yaml` (both of its layouts), same Docker paths and flags. Swap the image and keep everything else.
 
@@ -186,6 +186,8 @@ Clients authenticate with `Authorization: Bearer`, `x-api-key`, `x-goog-api-key`
 | Devin | OAuth (Devin / Windsurf) | Claude, GPT, Gemini, Grok, Kimi, GLM, DeepSeek and SWE models | Connect protobuf |
 | OpenAI-compatible | API key or none (OpenRouter, Ollama, LM Studio, vLLM, …) | whatever you list, with optional aliases | Chat Completions |
 
+Model names are forgiving: `gpt-6-1-sol` finds `gpt-6.1-sol`, and `gemini-3-8-flash` finds Antigravity's `gemini-3.8-flash-high` when that's the account you have.
+
 When more than one provider has a model, the vendor's own accounts answer first and Antigravity or Devin take the overflow when those are rate limited. To choose a provider yourself, prefix the model: `antigravity/claude-sonnet-4-6`, `devin/gpt-6-astra`, `vertex/gemini-3.1-pro`.
 
 ### Reasoning effort, from the model name
@@ -219,7 +221,7 @@ Everything is served from the binary at `/`, with no external requests.
 <td width="50%" valign="top"><img src="assets/screenshots/requests.png" alt="Live request log showing routes between client formats and providers, latency and tokens"></td>
 </tr>
 <tr>
-<td valign="top"><b>Accounts:</b> token expiry, cooldown timers per model, usage, and one-click enable, refresh or remove.</td>
+<td valign="top"><b>Accounts:</b> how much of each 5-hour and weekly limit is used, token expiry, cooldown timers per model, and one-click enable, refresh or remove.</td>
 <td valign="top"><b>Requests:</b> every request as it happens, showing which client format went to which provider, time to first token, and tokens.</td>
 </tr>
 <tr>
@@ -244,7 +246,7 @@ api-keys: ["sk-pick-anything"] # keys your clients must send; empty = open
 management-key: ""            # empty = dashboard only from localhost
 proxy-url: ""                 # optional http://, https:// or socks5:// upstream proxy
 request-retry: 3              # accounts to try before giving up
-routing: round-robin          # or fill-first
+routing: least-used           # most quota left first; or round-robin, fill-first
 codex-websockets: true        # native WebSocket relay to ChatGPT
 claude-cloak: true            # present non-Claude-Code clients as Claude Code on OAuth accounts
 

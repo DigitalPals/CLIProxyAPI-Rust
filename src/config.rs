@@ -27,7 +27,7 @@ pub struct Config {
     /// How many different accounts to try before giving up on a request.
     #[serde(deserialize_with = "lenient_u32")]
     pub request_retry: u32,
-    /// round-robin or fill-first.
+    /// least-used, round-robin or fill-first.
     pub routing: Routing,
     /// Keep an upstream websocket open to Codex when clients connect over websocket.
     pub codex_websockets: bool,
@@ -64,7 +64,9 @@ pub struct Config {
 #[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq, Default)]
 #[serde(rename_all = "kebab-case")]
 pub enum Routing {
+    /// The account with the most subscription quota left (falls back to round-robin).
     #[default]
+    LeastUsed,
     RoundRobin,
     FillFirst,
 }
@@ -79,7 +81,11 @@ impl<'de> Deserialize<'de> for Routing {
             Yaml::Mapping(m) => m.get("strategy").and_then(Yaml::as_str).unwrap_or_default(),
             _ => "",
         };
-        Ok(if s.trim().eq_ignore_ascii_case("fill-first") { Routing::FillFirst } else { Routing::RoundRobin })
+        Ok(match s.trim().to_ascii_lowercase().as_str() {
+            "fill-first" => Routing::FillFirst,
+            "round-robin" | "weighted-round-robin" => Routing::RoundRobin,
+            _ => Routing::LeastUsed,
+        })
     }
 }
 
@@ -183,7 +189,7 @@ impl Default for Config {
             management_allow_remote: None,
             proxy_url: String::new(),
             request_retry: 3,
-            routing: Routing::RoundRobin,
+            routing: Routing::LeastUsed,
             codex_websockets: true,
             claude_cloak: true,
             debug: false,
@@ -218,7 +224,7 @@ management-key: ""
 
 proxy-url: ""               # optional upstream proxy, e.g. socks5://127.0.0.1:1080
 request-retry: 3            # accounts to try before failing a request
-routing: round-robin        # round-robin | fill-first
+routing: least-used         # least-used (most quota left) | round-robin | fill-first
 codex-websockets: true      # native upstream websocket for Codex websocket clients
 claude-cloak: true          # make non-Claude-Code clients look like Claude Code on OAuth accounts
 debug: false

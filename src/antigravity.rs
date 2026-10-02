@@ -215,7 +215,8 @@ pub async fn fetch_models(http: &reqwest::Client, base: &str, token: &str) -> Re
     }
     let v: Value = resp.json().await?;
     let mut out: Vec<String> = match &v["models"] {
-        Value::Object(m) => m.keys().cloned().collect(),
+        // Internal helpers (tab completion, tiered routers) have no display name.
+        Value::Object(m) => m.iter().filter(|(_, v)| v.get("displayName").is_some()).map(|(k, _)| k.clone()).collect(),
         Value::Array(a) => a.iter().filter_map(|x| x["id"].as_str().or(x["name"].as_str()).map(String::from)).collect(),
         _ => vec![],
     };

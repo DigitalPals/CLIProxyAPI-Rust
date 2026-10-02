@@ -300,6 +300,8 @@ pub struct AccountState {
     pub last_error: Option<String>,
     pub last_used: Option<DateTime<Utc>>,
     pub counters: Counters,
+    /// Subscription usage windows (Claude, ChatGPT).
+    pub quota: crate::quota::Quota,
 }
 
 pub struct Account {
@@ -327,6 +329,24 @@ pub struct Account {
     pub excluded: Vec<String>,
     /// OAuth model renames (config `oauth-model-alias` + the file's `model_aliases`).
     pub aliases: Vec<OAuthAlias>,
+}
+
+/// `gemini-3-8-flash` -> `gemini-3.8-flash`, `gpt-6-1-sol` -> `gpt-6.1-sol`
+/// (single digits joined by a hyphen are a version number).
+fn dot_versions(m: &str) -> String {
+    let b = m.as_bytes();
+    let mut out = String::with_capacity(m.len());
+    for (i, c) in m.char_indices() {
+        let digit = |j: usize| b.get(j).is_some_and(|c| c.is_ascii_digit());
+        let lone = |j: usize| digit(j) && !digit(j.wrapping_sub(1)) && !digit(j + 1);
+        // Only between two single digits, so dates (20251001) are left alone.
+        if c == '-' && i > 0 && lone(i - 1) && lone(i + 1) && (i < 2 || b[i - 2] == b'-') {
+            out.push('.');
+        } else {
+            out.push(c);
+        }
+    }
+    out
 }
 
 /// `*` wildcard match, case-insensitive (`gemini-2.5-*`, `*-preview`, `*flash*`).
@@ -438,7 +458,14 @@ impl Account {
     pub fn cooling_until(&self, model: &str) -> Option<DateTime<Utc>> {
         let st = self.state.lock();
         let now = Utc::now();
-        [st.cooldowns.get("*"), st.cooldowns.get(model)].into_iter().flatten().filter(|t| **t > now).max().copied()
+        // A used-up quota window counts as a cooldown, so we don't wait for the 429.
+        let spent = st.quota.exhausted_until(model);
+        [st.cooldowns.get("*"), st.cooldowns.get(model), spent.as_ref()]
+            .into_iter()
+            .flatten()
+            .filter(|t| **t > now)
+            .max()
+            .copied()
     }
 
     pub fn cool(&self, model: Option<&str>, until: DateTime<Utc>, reason: &str) {
@@ -456,8 +483,12 @@ impl Account {
     pub fn snapshot(&self) -> Value {
         let st = self.state.lock();
         let now = Utc::now();
-        let cooldowns: BTreeMap<&str, String> =
+        let mut cooldowns: BTreeMap<&str, String> =
             st.cooldowns.iter().filter(|(_, t)| **t > now).map(|(k, t)| (k.as_str(), t.to_rfc3339())).collect();
+        // A used-up usage window blocks every model until it resets.
+        if let Some(t) = st.quota.exhausted_until("") {
+            cooldowns.entry("*").or_insert(t.to_rfc3339());
+        }
         let (kind, expires, email) = match &*self.cred.read() {
             Credential::OAuth(o) if o.raw.contains_key("service_account") => ("service-account", None, o.email.clone()),
             Credential::OAuth(o) => ("oauth", o.expires_at.map(|t| t.to_rfc3339()), o.email.clone()),
@@ -477,6 +508,7 @@ impl Account {
             "last_used": st.last_used.map(|t| t.to_rfc3339()),
             "expires_at": expires,
             "counters": st.counters,
+            "quota": st.quota,
             "models": self.public_models(),
         })
     }
@@ -843,7 +875,66 @@ impl Pool {
                 aliases: s.aliases,
             }));
         }
+        // Another program (CLIProxyAPI itself) may be rewriting a credential file
+        // right now; keep the account rather than dropping it for a moment.
+        for (id, prev) in &old {
+            if let Some(p) = &prev.path
+                && p.exists()
+                && !next.iter().any(|a| a.id == *id)
+                && read_oauth_file(p).is_none()
+            {
+                next.push(prev.clone());
+            }
+        }
         *self.accounts.write() = next;
+    }
+
+    /// The model name some account actually serves, for names that are close:
+    /// `gemini-3-8-flash` -> `gemini-3.8-flash`, `google-gemini-...`, `-preview`,
+    /// and tiered providers (Antigravity) -> `...-high`.
+    pub fn canonical(&self, model: &str, only: Option<&Only>) -> String {
+        let force = self.force_prefix.load(std::sync::atomic::Ordering::Relaxed);
+        let accounts = self.accounts.read();
+        let usable: Vec<&Arc<Account>> = accounts
+            .iter()
+            .filter(|a| match only {
+                Some(Only::Provider(p)) => *p == a.provider,
+                Some(Only::Prefix(x)) => a.prefix.as_deref().is_some_and(|p| p.eq_ignore_ascii_case(x)),
+                None => !(force && a.prefix.is_some()),
+            })
+            .filter(|a| !a.state.lock().disabled)
+            .collect();
+        // A listed model beats one that only matches a family (`gpt-*` takes anything).
+        let listed: Vec<String> = usable.iter().flat_map(|a| a.public_models()).collect();
+        let known = |m: &str| listed.iter().any(|l| l.eq_ignore_ascii_case(m));
+        let forced = matches!(only, Some(Only::Provider(_)));
+        let served = |m: &str| usable.iter().any(|a| a.resolve_with(m, forced).is_some());
+        if known(model) {
+            return model.to_string();
+        }
+        let mut bases = vec![model.to_ascii_lowercase()];
+        for strip in ["google-", "google/", "models/", "anthropic/", "openai/"] {
+            if let Some(rest) = bases[0].strip_prefix(strip) {
+                bases.push(rest.to_string());
+            }
+        }
+        for b in bases.clone() {
+            bases.push(dot_versions(&b));
+        }
+        for b in bases.clone() {
+            if let Some(rest) = b.strip_suffix("-preview") {
+                bases.push(rest.to_string());
+            }
+        }
+        let candidates: Vec<String> =
+            bases.iter().flat_map(|b| ["", "-high", "-medium", "-low"].map(|t| format!("{b}{t}"))).collect();
+        if let Some(c) = candidates.iter().find(|c| known(c)) {
+            return c.clone();
+        }
+        if served(model) {
+            return model.to_string();
+        }
+        candidates.into_iter().find(|c| served(c)).unwrap_or_else(|| model.to_string())
     }
 
     pub fn all(&self) -> Vec<Arc<Account>> {
@@ -937,6 +1028,20 @@ impl Pool {
         }
         let idx = match routing {
             Routing::FillFirst => 0,
+            Routing::LeastUsed => {
+                // Most headroom in its tightest usage window; near-ties take turns.
+                let scores: Vec<f64> = candidates
+                    .iter()
+                    .map(|(a, _)| a.state.lock().quota.pressure(model).unwrap_or(crate::quota::UNKNOWN))
+                    .collect();
+                let best = scores.iter().copied().fold(f64::INFINITY, f64::min);
+                let tied: Vec<usize> = (0..candidates.len()).filter(|i| scores[*i] <= best + 2.0).collect();
+                let mut cur = self.cursor.lock();
+                let c = cur.entry(model.to_ascii_lowercase()).or_insert(0);
+                let i = tied[*c % tied.len()];
+                *c = c.wrapping_add(1);
+                i
+            }
             Routing::RoundRobin => {
                 let mut cur = self.cursor.lock();
                 let c = cur.entry(model.to_ascii_lowercase()).or_insert(0);
@@ -984,6 +1089,24 @@ mod tests {
         assert!(matches!(pool.pick("claude-opus-5-5", &[], Routing::RoundRobin, None, Some(&claude)), Pick::Ok(..)));
         let codex = Only::Provider(Provider::Codex);
         assert!(matches!(pool.pick("claude-opus-5-5", &[], Routing::RoundRobin, None, Some(&codex)), Pick::None));
+    }
+
+    #[test]
+    fn close_model_names_resolve() {
+        assert_eq!(dot_versions("gemini-3-8-flash"), "gemini-3.8-flash");
+        assert_eq!(dot_versions("gpt-6-1-sol"), "gpt-6.1-sol");
+        assert_eq!(dot_versions("claude-haiku-4-5-20251001"), "claude-haiku-4.5-20251001");
+        assert_eq!(dot_versions("gpt-5.5"), "gpt-5.5");
+        let cfg = Config {
+            auth_dir: "/nonexistent".into(),
+            codex_api_key: vec![crate::config::KeyEntry { api_key: "k".into(), ..Default::default() }],
+            ..Default::default()
+        };
+        let pool = Pool::default();
+        pool.reload(&cfg);
+        assert_eq!(pool.canonical("gpt-6-1-sol", None), "gpt-6.1-sol");
+        assert_eq!(pool.canonical("openai/gpt-6-astra", None), "gpt-6-astra");
+        assert_eq!(pool.canonical("nothing-like-it", None), "nothing-like-it");
     }
 
     #[test]

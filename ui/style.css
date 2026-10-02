@@ -129,6 +129,14 @@ a { color: inherit; text-decoration: none; }
 
 .acct-table .row { grid-template-columns: minmax(0, 2fr) minmax(0, 1.3fr) minmax(0, 1.3fr) 96px 132px; }
 .stack { display: flex; flex-direction: column; gap: 2px; min-width: 0; }
+.status-line { display: inline-flex; align-items: center; gap: 14px; }
+.limits { display: inline-flex; align-items: center; gap: 12px; }
+.limit { display: inline-flex; align-items: center; gap: 6px; color: var(--fg-3); font-size: 12px; font-variant-numeric: tabular-nums; }
+.limit .bar { width: 28px; height: 4px; border-radius: 2px; background: #232327; overflow: hidden; }
+.limit .bar i { display: block; height: 100%; border-radius: 2px; background: var(--fg-3); }
+.limit.warn .bar i { background: var(--warn); }
+.limit.err .bar i { background: var(--err); }
+.limit .pct { color: var(--fg-2); }
 .stack .main { color: var(--fg-2); font-size: 13px; white-space: nowrap; }
 .stack .main b { color: var(--fg); font-weight: 500; }
 .stack .sub { color: var(--fg-3); font-size: 12.5px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }

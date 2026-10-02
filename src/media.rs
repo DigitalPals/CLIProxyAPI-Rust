@@ -364,6 +364,7 @@ where
 {
     let cfg = app.cfg();
     let (only, model) = app.pool.route(model);
+    let model = app.pool.canonical(&model, only.as_ref());
     let mut tracker = Tracker::new(app, Format::Chat, false, kind, &model);
     let mut tried: Vec<String> = Vec::new();
     let mut last: Option<(u16, Value)> = None;

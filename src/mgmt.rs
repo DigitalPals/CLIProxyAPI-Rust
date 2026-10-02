@@ -435,6 +435,7 @@ async fn refresh_account(State(app): State<Arc<App>>, Path(id): Path<String>) ->
     }
     match oauth::ensure_fresh(&app, &acct, chrono::Duration::minutes(5), true).await {
         Ok(()) => {
+            let _ = crate::quota::poll(&app, &acct).await;
             acct.state.lock().cooldowns.remove("*");
             app.broadcast("accounts", Value::Null);
             ok()

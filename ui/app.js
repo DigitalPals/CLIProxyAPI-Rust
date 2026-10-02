@@ -336,6 +336,22 @@ function acctSub(a) {
   return parts.join(' · ');
 }
 
+// Subscription usage windows (Claude 5h / week, ChatGPT), tightest first.
+function limitsHTML(a, max = 2) {
+  const now = Date.now();
+  const ws = ((a.quota && a.quota.windows) || [])
+    .filter((w) => !w.model && (!w.resets_at || Date.parse(w.resets_at) > now))
+    .sort((x, y) => y.used - x.used)
+    .slice(0, max);
+  if (!ws.length) return '';
+  return `<span class="limits">${ws.map((w) => {
+    const p = Math.round(w.used);
+    const cls = p >= 95 ? 'err' : p >= 75 ? 'warn' : '';
+    const resets = w.resets_at ? `, resets in ${until(w.resets_at)}` : '';
+    return `<span class="limit ${cls}" title="${esc(w.name)} limit: ${p}% used${resets}"><span>${esc(w.name)}</span><span class="bar"><i style="width:${Math.min(100, p)}%"></i></span><span class="pct">${p}%</span></span>`;
+  }).join('')}</span>`;
+}
+
 function statusHTML(a, withScope = true) {
   const st = acctStatus(a, withScope);
   return `<span class="status ${st.cls}"><span class="dot"></span><span>${st.html}</span></span>`;
@@ -359,7 +375,7 @@ function ovAccountsHTML() {
   const rows = shown.map((a) => `
     <div class="row acct-row">
       <div class="acct-name"><span class="dot ${esc(a.provider)}"></span><span class="who"><span class="label">${esc(a.label)}</span><span class="sub">${esc(acctSub(a))}</span></span></div>
-      ${statusHTML(a)}
+      <span class="status-line">${Object.keys(a.cooldowns || {}).length ? '' : `<span class="hide-sm">${limitsHTML(a, 1)}</span>`}${statusHTML(a)}</span>
       <span class="num hide-sm"><b>${fmt(a.counters.requests)}</b> req</span>
     </div>`).join('');
   const more = list.length > shown.length ? `<p class="note"><a class="link" href="#/accounts">${list.length - shown.length} more</a></p>` : '';
@@ -622,8 +638,8 @@ function accountListHTML() {
     const c = a.counters;
     return `<div class="row">
       <div class="acct-name"><span class="dot ${esc(a.provider)}"></span><span class="who"><span class="label">${esc(a.label)}</span><span class="sub">${esc(acctSub(a))}</span></span></div>
-      <div class="stack">${statusHTML(a, false)}${cooling ? `<span class="sub">${esc(acctStatus(a).scope)} · <button class="linkbtn" data-act="reset" data-id="${esc(a.id)}" title="Make this account available again now">Clear</button></span>` : ''}</div>
-      <div class="stack hide-md"><span class="main"><b>${fmt(c.requests)}</b> requests</span><span class="sub">${fmt(c.input_tokens)} in · ${fmt(c.output_tokens)} out${c.failures ? ` · <span class="err">${fmt(c.failures)} failed</span>` : ''}</span></div>
+      <div class="stack">${statusHTML(a, false)}${cooling ? `<span class="sub">${esc(acctStatus(a).scope)} · <button class="linkbtn" data-act="reset" data-id="${esc(a.id)}" title="Make this account available again now">Clear</button></span>` : limitsHTML(a) ? `<span class="sub">${limitsHTML(a)}</span>` : ''}</div>
+      <div class="stack hide-md"><span class="main"><b>${fmt(c.requests)}</b> ${c.requests === 1 ? 'request' : 'requests'}</span><span class="sub">${fmt(c.input_tokens)} in · ${fmt(c.output_tokens)} out${c.failures ? ` · <span class="err">${fmt(c.failures)} failed</span>` : ''}</span></div>
       <span class="num hide-md" style="text-align:left" data-ago="${esc(a.last_used || '')}">${ago(a.last_used)}</span>
       <div class="row-actions">${actions}</div>
       ${a.last_error ? `<div class="acct-err">${esc(a.last_error)}</div>` : ''}

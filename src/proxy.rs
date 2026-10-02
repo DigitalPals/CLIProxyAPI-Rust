@@ -302,6 +302,7 @@ pub async fn execute(app: Arc<App>, call: Call) -> Reply {
     }
     let (model, suffix) = ir::split_model_suffix(&raw_model);
     let (only, model) = app.pool.route(&model);
+    let model = app.pool.canonical(&model, only.as_ref());
     let mut tracker = Tracker::new(&app, call.format, call.stream, call.transport, &model);
 
     let mut parsed: Option<Request> = None;
@@ -431,6 +432,7 @@ pub async fn execute(app: Arc<App>, call: Call) -> Reply {
         };
 
         let status = resp.status().as_u16();
+        crate::quota::observe(&acct, resp.headers());
         if !resp.status().is_success() {
             let headers = resp.headers().clone();
             let text = resp.text().await.unwrap_or_default();

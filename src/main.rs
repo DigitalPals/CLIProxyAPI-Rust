@@ -10,6 +10,7 @@ mod media;
 mod mgmt;
 mod oauth;
 mod proxy;
+mod quota;
 mod schema;
 mod server;
 mod sse;
@@ -116,6 +117,7 @@ async fn serve(app: Arc<App>) -> Result<()> {
 
     tokio::spawn(oauth::refresher(app.clone()));
     tokio::spawn(antigravity::version_updater(app.clone()));
+    tokio::spawn(quota::poller(app.clone()));
     tokio::spawn(watch(app.clone()));
 
     let scheme = if cfg.tls.enable { "https" } else { "http" };
