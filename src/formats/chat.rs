@@ -45,10 +45,7 @@ pub fn parse_request(v: &Value) -> Result<Request, String> {
     for m in messages {
         match m["role"].as_str().unwrap_or("user") {
             "system" | "developer" => {
-                let t = text_of(&m["content"]);
-                if !t.is_empty() {
-                    req.system.push(t);
-                }
+                super::parse_openai_system(&m["content"], &mut req);
             }
             "assistant" => {
                 let mut parts = Vec::new();
@@ -58,9 +55,14 @@ pub fn parse_request(v: &Value) -> Result<Request, String> {
                         break;
                     }
                 }
-                let text = text_of(&m["content"]);
-                if !text.is_empty() {
-                    parts.push(Part::Text(text));
+                let content = content_parts(&m["content"]);
+                if super::has_openai_breakpoints(&content) {
+                    parts.extend(content);
+                } else {
+                    let text = text_of(&m["content"]);
+                    if !text.is_empty() {
+                        parts.push(Part::Text(text));
+                    }
                 }
                 for tc in m["tool_calls"].as_array().into_iter().flatten() {
                     let f = &tc["function"];
@@ -88,7 +90,11 @@ pub fn parse_request(v: &Value) -> Result<Request, String> {
             _ => req.messages.push(Message { role: Role::User, parts: content_parts(&m["content"]) }),
         }
     }
-    req.messages = merge_adjacent(req.messages);
+    if !req.messages.iter().any(|m| super::has_openai_breakpoints(&m.parts)) {
+        req.messages = merge_adjacent(req.messages);
+    } else {
+        req.messages = super::merge_openai_tool_calls(req.messages);
+    }
 
     for t in v["tools"].as_array().into_iter().flatten() {
         let f = if t["type"] == "function" { &t["function"] } else { t };
@@ -122,13 +128,20 @@ fn content_parts(v: &Value) -> Vec<Part> {
         Value::String(s) => vec![Part::Text(s.clone())],
         Value::Array(items) => items
             .iter()
-            .filter_map(|it| match it["type"].as_str() {
-                Some("text") | Some("input_text") => it["text"].as_str().map(|t| Part::Text(t.to_string())),
-                Some("image_url") => {
-                    let url = it["image_url"]["url"].as_str().or_else(|| it["image_url"].as_str())?;
-                    Some(Part::Image(Image::from_url(url)))
+            .flat_map(|it| {
+                let part = match it["type"].as_str() {
+                    Some("text") | Some("input_text") => it["text"].as_str().map(|t| Part::Text(t.to_string())),
+                    Some("image_url") => it["image_url"]["url"]
+                        .as_str()
+                        .or_else(|| it["image_url"].as_str())
+                        .map(|url| Part::Image(Image::from_url(url))),
+                    _ => it.as_str().map(|t| Part::Text(t.to_string())),
+                };
+                let mut parts: Vec<Part> = part.into_iter().collect();
+                if !parts.is_empty() && it["prompt_cache_breakpoint"]["mode"] == "explicit" {
+                    parts.push(Part::CacheBreakpoint);
                 }
-                _ => it.as_str().map(|t| Part::Text(t.to_string())),
+                parts
             })
             .collect(),
         Value::Null => vec![],
@@ -141,7 +154,13 @@ fn content_parts(v: &Value) -> Vec<Part> {
 pub fn build_request(req: &Request, model: &str) -> Value {
     let mut messages = Vec::new();
     if !req.system.is_empty() {
-        messages.push(json!({ "role": "system", "content": req.system.join("\n\n") }));
+        if req.system_cache_blocks.is_empty() {
+            messages.push(json!({ "role": "system", "content": req.system.join("\n\n") }));
+        } else {
+            for index in 0..req.system.len() {
+                messages.push(json!({ "role": "system", "content": super::openai_system_blocks(req, index, "text") }));
+            }
+        }
     }
     for m in &req.messages {
         match m.role {
@@ -163,6 +182,9 @@ pub fn build_request(req: &Request, model: &str) -> Value {
                     })
                     .collect();
                 let mut msg = json!({ "role": "assistant", "content": if text.is_empty() { Value::Null } else { Value::String(text) } });
+                if super::has_openai_breakpoints(&m.parts) {
+                    msg["content"] = cached_text_parts(&m.parts).into();
+                }
                 if !calls.is_empty() {
                     msg["tool_calls"] = Value::Array(calls);
                 }
@@ -173,7 +195,12 @@ pub fn build_request(req: &Request, model: &str) -> Value {
                 for p in &m.parts {
                     match p {
                         Part::ToolResult { id, content: c, .. } => {
-                            messages.push(json!({ "role": "tool", "tool_call_id": id, "content": parts_text(c) }));
+                            let result = if super::has_openai_breakpoints(c) {
+                                Value::Array(cached_text_parts(c))
+                            } else {
+                                Value::String(parts_text(c))
+                            };
+                            messages.push(json!({ "role": "tool", "tool_call_id": id, "content": result }));
                             for img in c.iter().filter_map(|p| if let Part::Image(i) = p { Some(i) } else { None }) {
                                 content.push(json!({ "type": "image_url", "image_url": { "url": img.to_url() } }));
                             }
@@ -182,13 +209,14 @@ pub fn build_request(req: &Request, model: &str) -> Value {
                         Part::Image(i) => {
                             content.push(json!({ "type": "image_url", "image_url": { "url": i.to_url() } }))
                         }
+                        Part::CacheBreakpoint => super::mark_openai_breakpoint(&mut content),
                         _ => {}
                     }
                 }
                 if content.is_empty() {
                     continue;
                 }
-                let all_text = content.iter().all(|c| c["type"] == "text");
+                let all_text = content.iter().all(|c| c["type"] == "text" && c["prompt_cache_breakpoint"].is_null());
                 let value = if all_text {
                     Value::String(content.iter().filter_map(|c| c["text"].as_str()).collect::<Vec<_>>().join("\n"))
                 } else {
@@ -255,6 +283,18 @@ pub fn build_request(req: &Request, model: &str) -> Value {
         None => {}
     }
     out
+}
+
+fn cached_text_parts(parts: &[Part]) -> Vec<Value> {
+    let mut content = Vec::new();
+    for part in parts {
+        match part {
+            Part::Text(text) => content.push(json!({"type": "text", "text": text})),
+            Part::CacheBreakpoint => super::mark_openai_breakpoint(&mut content),
+            _ => {}
+        }
+    }
+    content
 }
 
 // --------------------------------------------------------------- stream parser

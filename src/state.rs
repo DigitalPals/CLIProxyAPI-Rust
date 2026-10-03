@@ -18,6 +18,7 @@ pub struct App {
     cfg: ArcSwap<Config>,
     pub cfg_path: PathBuf,
     pub pool: Pool,
+    pub sessions: Arc<crate::affinity::Sessions>,
     pub http: Http,
     pub stats: Stats,
     pub logins: Mutex<HashMap<String, crate::mgmt::Login>>,
@@ -32,11 +33,13 @@ impl App {
         let pool = Pool::default();
         pool.reload(&cfg);
         let (live, _) = broadcast::channel(512);
+        let sessions = Arc::new(crate::affinity::Sessions::load(&cfg.auth_dir(), cfg.session_affinity_idle_seconds));
         Arc::new(Self {
             http: Http::new(&cfg.proxy_url),
             cfg: ArcSwap::from_pointee(cfg),
             cfg_path,
             pool,
+            sessions,
             stats: Stats::default(),
             logins: Mutex::new(HashMap::new()),
             started: Utc::now(),
@@ -144,6 +147,14 @@ impl Http {
 // ----------------------------------------------------------------------- stats
 
 #[derive(Debug, Clone, Serialize)]
+pub struct RoutingAttempt {
+    pub account_id: String,
+    pub account: String,
+    pub reason: &'static str,
+    pub previous_account: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
 pub struct RequestLog {
     pub id: u64,
     pub ts: DateTime<Utc>,
@@ -151,6 +162,13 @@ pub struct RequestLog {
     pub provider: String,
     pub model: String,
     pub account: String,
+    /// Client-scoped fingerprint; never the client's raw session ID or API key.
+    pub session_id: Option<String>,
+    pub session_source: Option<&'static str>,
+    pub routing_strategy: crate::config::Routing,
+    pub routing_reason: Option<&'static str>,
+    pub routing_warning: Option<&'static str>,
+    pub routing_attempts: Vec<RoutingAttempt>,
     pub status: u16,
     pub latency_ms: u64,
     pub ttft_ms: Option<u64>,

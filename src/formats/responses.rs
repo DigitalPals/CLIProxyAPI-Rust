@@ -4,7 +4,7 @@ use std::collections::{HashMap, HashSet};
 
 use serde_json::{Value, json};
 
-use super::{Frame, StreamParser, StreamRenderer, args_string, text_of};
+use super::{Frame, StreamParser, StreamRenderer, args_string};
 use crate::ir::*;
 use crate::sse::SseEvent;
 
@@ -106,7 +106,11 @@ pub fn parse_request(v: &Value) -> Result<Request, String> {
         Value::Array(items) => parse_items(items, &mut req),
         _ => {}
     }
-    req.messages = merge_adjacent(req.messages);
+    if !req.messages.iter().any(|m| super::has_openai_breakpoints(&m.parts)) {
+        req.messages = merge_adjacent(req.messages);
+    } else {
+        req.messages = super::merge_openai_tool_calls(req.messages);
+    }
     Ok(req)
 }
 
@@ -117,10 +121,7 @@ pub fn parse_items(items: &[Value], req: &mut Request) {
             "message" => {
                 let role = it["role"].as_str().unwrap_or("user");
                 if role == "system" || role == "developer" {
-                    let t = text_of(&it["content"]);
-                    if !t.is_empty() {
-                        req.system.push(t);
-                    }
+                    super::parse_openai_system(&it["content"], req);
                     continue;
                 }
                 let parts = content_parts(&it["content"]);
@@ -183,13 +184,20 @@ fn content_parts(v: &Value) -> Vec<Part> {
         Value::String(s) => vec![Part::Text(s.clone())],
         Value::Array(items) => items
             .iter()
-            .filter_map(|c| match c["type"].as_str() {
-                Some("input_text") | Some("output_text") | Some("text") => {
-                    c["text"].as_str().map(|t| Part::Text(t.to_string()))
+            .flat_map(|c| {
+                let part = match c["type"].as_str() {
+                    Some("input_text") | Some("output_text") | Some("text") => {
+                        c["text"].as_str().map(|t| Part::Text(t.to_string()))
+                    }
+                    Some("refusal") => c["refusal"].as_str().map(|t| Part::Text(t.to_string())),
+                    Some("input_image") => c["image_url"].as_str().map(|u| Part::Image(Image::from_url(u))),
+                    _ => None,
+                };
+                let mut parts: Vec<Part> = part.into_iter().collect();
+                if !parts.is_empty() && c["prompt_cache_breakpoint"]["mode"] == "explicit" {
+                    parts.push(Part::CacheBreakpoint);
                 }
-                Some("refusal") => c["refusal"].as_str().map(|t| Part::Text(t.to_string())),
-                Some("input_image") => c["image_url"].as_str().map(|u| Part::Image(Image::from_url(u))),
-                _ => None,
+                parts
             })
             .collect(),
         _ => vec![],
@@ -210,10 +218,19 @@ pub struct BuildOpts {
 pub fn build_request(req: &Request, model: &str, opts: &BuildOpts) -> Value {
     let mut input = Vec::new();
     if !req.system.is_empty() {
-        input.push(json!({
-            "type": "message", "role": "developer",
-            "content": [{ "type": "input_text", "text": req.system.join("\n\n") }]
-        }));
+        if req.system_cache_blocks.is_empty() {
+            input.push(json!({
+                "type": "message", "role": "developer",
+                "content": [{ "type": "input_text", "text": req.system.join("\n\n") }]
+            }));
+        } else {
+            for index in 0..req.system.len() {
+                input.push(json!({
+                    "type": "message", "role": "developer",
+                    "content": super::openai_system_blocks(req, index, "input_text")
+                }));
+            }
+        }
     }
     let custom: HashSet<&str> =
         if opts.custom_tools { req.custom_tools.iter().map(String::as_str).collect() } else { HashSet::new() };
@@ -235,6 +252,7 @@ pub fn build_request(req: &Request, model: &str, opts: &BuildOpts) -> Value {
                 Part::Image(i) if m.role == Role::User => {
                     content.push(json!({ "type": "input_image", "image_url": i.to_url() }));
                 }
+                Part::CacheBreakpoint => super::mark_openai_breakpoint(&mut content),
                 Part::Reasoning { text, sig: Some(sig @ Sig::Codex { .. }) } => {
                     flush(&mut content, &mut input);
                     let summary: Vec<Value> =
@@ -262,7 +280,20 @@ pub fn build_request(req: &Request, model: &str, opts: &BuildOpts) -> Value {
                     let ty = if custom_calls.contains(id) { "custom_tool_call_output" } else { "function_call_output" };
                     let images: Vec<&Image> =
                         c.iter().filter_map(|p| if let Part::Image(i) = p { Some(i) } else { None }).collect();
-                    let output = if images.is_empty() {
+                    let output = if super::has_openai_breakpoints(c) {
+                        let mut content = Vec::new();
+                        for part in c {
+                            match part {
+                                Part::Text(text) => content.push(json!({"type": "input_text", "text": text})),
+                                Part::Image(image) => {
+                                    content.push(json!({"type": "input_image", "image_url": image.to_url()}))
+                                }
+                                Part::CacheBreakpoint => super::mark_openai_breakpoint(&mut content),
+                                _ => {}
+                            }
+                        }
+                        Value::Array(content)
+                    } else if images.is_empty() {
                         Value::String(parts_text(c))
                     } else {
                         let mut arr = vec![json!({ "type": "input_text", "text": parts_text(c) })];
@@ -373,7 +404,7 @@ pub fn usage_of(u: &Value) -> Option<Usage> {
 
 fn status_of_code(code: &str) -> u16 {
     match code {
-        "rate_limit_exceeded" | "usage_limit_reached" | "insufficient_quota" => 429,
+        "rate_limit_exceeded" | "usage_limit_reached" | "insufficient_quota" | "quota_exhausted" => 429,
         "invalid_prompt" | "invalid_request_error" | "context_length_exceeded" => 400,
         "server_is_overloaded" | "slow_down" => 503,
         _ => 500,

@@ -5,7 +5,7 @@
 //! every other provider is served through the normal pipeline, with
 //! `previous_response_id` expanded from a small local history.
 
-use std::collections::VecDeque;
+use std::collections::HashSet;
 use std::sync::Arc;
 
 use axum::extract::ws::{Message, WebSocket};
@@ -14,7 +14,7 @@ use futures::{SinkExt, StreamExt};
 use serde_json::{Value, json};
 use tokio_tungstenite::tungstenite;
 
-use crate::accounts::{Account, Pick, Provider};
+use crate::accounts::{Account, Provider};
 use crate::formats::{StreamParser, responses};
 use crate::ir::{self, Event, Format, Usage};
 use crate::proxy::{self, Call, Reply, Tracker};
@@ -24,25 +24,25 @@ use crate::state::App;
 type Upstream = tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>;
 type ClientTx = futures::stream::SplitSink<WebSocket, Message>;
 
-const HISTORY: usize = 4;
-
-#[derive(Default)]
 struct Session {
-    /// response id -> full conversation input including that response's output.
-    history: VecDeque<(String, Vec<Value>)>,
     upstream: Option<(Arc<Account>, Upstream)>,
-    pinned: Option<String>,
+    /// Response ids known to the current upstream socket.
+    upstream_responses: HashSet<String>,
+    key: Option<String>,
+    source: Option<&'static str>,
+    pending_selection: Option<crate::affinity::Selected>,
+    connection_id: String,
 }
 
-impl Session {
-    fn lookup(&self, id: &str) -> Option<Vec<Value>> {
-        self.history.iter().find(|(k, _)| k == id).map(|(_, v)| v.clone())
-    }
-
-    fn remember(&mut self, id: String, items: Vec<Value>) {
-        self.history.push_back((id, items));
-        while self.history.len() > HISTORY {
-            self.history.pop_front();
+impl Default for Session {
+    fn default() -> Self {
+        Self {
+            upstream: None,
+            upstream_responses: HashSet::new(),
+            key: None,
+            source: None,
+            pending_selection: None,
+            connection_id: uuid::Uuid::new_v4().to_string(),
         }
     }
 }
@@ -63,13 +63,7 @@ fn error_event(status: u16, body: &Value) -> String {
 }
 
 fn input_items(body: &Value) -> Vec<Value> {
-    match &body["input"] {
-        Value::String(s) => {
-            vec![json!({ "type": "message", "role": "user", "content": [{ "type": "input_text", "text": s }] })]
-        }
-        Value::Array(a) => a.clone(),
-        _ => vec![],
-    }
+    crate::affinity::input_items(body)
 }
 
 pub async fn handle(app: Arc<App>, headers: HeaderMap, socket: WebSocket) {
@@ -117,29 +111,62 @@ async fn turn(
     mut body: Value,
     tx: &mut ClientTx,
 ) -> Result<(), ClientGone> {
+    sess.pending_selection = None;
     // Full conversation for local history (and for providers without server state).
     let prev = body["previous_response_id"].as_str().map(String::from);
-    let mut full = prev.as_deref().and_then(|id| sess.lookup(id)).unwrap_or_default();
-    full.extend(input_items(&body));
+    let requested = crate::affinity::session_identity(headers, &body);
+    let previous =
+        prev.as_deref().and_then(|id| app.sessions.previous(headers, id, requested.as_ref().map(|s| s.key.as_str())));
+    let (key, source) = if let Some(identity) = requested {
+        (identity.key, identity.source)
+    } else if let Some((key, _)) = &previous {
+        (key.clone(), "previous_response_id")
+    } else if let Some(key) = &sess.key {
+        (key.clone(), "websocket_connection")
+    } else {
+        (crate::affinity::connection_key(headers, &sess.connection_id), "websocket_connection")
+    };
+    if sess.key.as_ref().is_some_and(|old| old != &key) {
+        if let Some((_, mut up)) = sess.upstream.take() {
+            let _ = up.close(None).await;
+        }
+        sess.upstream_responses.clear();
+    }
+    sess.key = Some(key);
+    sess.source = Some(source);
+    let _lease = app.sessions.hold(sess.key.as_deref().unwrap(), app.cfg().session_affinity_idle_seconds);
+    let mut full = if prev.is_some() { previous.map(|(_, items)| items) } else { Some(vec![]) };
+    if let Some(items) = &mut full {
+        items.extend(input_items(&body));
+    }
 
     let cfg = app.cfg();
     if cfg.codex_websockets {
-        match native_turn(app, sess, &body, &full, tx).await {
-            Native::Done => return Ok(()),
-            Native::Gone => return Err(ClientGone),
+        match native_turn(app, headers, sess, &body, full.as_deref(), tx).await {
+            Native::Done => {
+                sess.pending_selection = None;
+                if headers.get("x-cliproxy-session-end").is_some_and(|v| v == "true") {
+                    app.sessions.end(sess.key.as_deref().unwrap());
+                }
+                return Ok(());
+            }
+            Native::Gone => {
+                sess.pending_selection = None;
+                return Err(ClientGone);
+            }
             Native::Fallback => {}
         }
     }
 
-    if let Some(id) = &prev {
-        if sess.lookup(id).is_none() {
+    if prev.is_some() {
+        if full.is_none() {
             let err = json!({ "error": {
                 "message": "Previous response is not available on this websocket; resend the full conversation input without previous_response_id",
                 "type": "invalid_request_error", "code": "previous_response_not_found", "param": "previous_response_id"
             }});
             return send(tx, error_event(400, &err)).await;
         }
-        body["input"] = Value::Array(full.clone());
+        body["input"] = Value::Array(full.clone().unwrap());
         body.as_object_mut().unwrap().remove("previous_response_id");
     }
 
@@ -150,33 +177,43 @@ async fn turn(
         stream: true,
         transport: "ws",
         path_model: None,
-        pinned: sess.pinned.clone(),
+        session: sess.key.clone(),
+        session_source: sess.source,
+        routing_selection: sess.pending_selection.take(),
     };
     match proxy::execute(app.clone(), call).await {
         Reply::Stream { mut frames, .. } => {
             while let Some(f) = frames.next().await {
-                if f.event.as_deref() == Some("response.completed") {
-                    capture(sess, &f.data, &full);
-                }
                 send(tx, f.data).await?;
             }
             Ok(())
         }
-        Reply::Json(v) => {
-            capture(sess, &json!({ "response": v }).to_string(), &full);
-            send(tx, json!({ "type": "response.completed", "response": v }).to_string()).await
-        }
+        Reply::Json(v) => send(tx, json!({ "type": "response.completed", "response": v }).to_string()).await,
         Reply::Error(status, body) => send(tx, error_event(status, &body)).await,
     }
 }
 
-fn capture(sess: &mut Session, data: &str, full: &[Value]) {
+fn capture(
+    app: &App,
+    headers: &HeaderMap,
+    sess: &mut Session,
+    data: &str,
+    full: Option<&[Value]>,
+    aggregate: &ir::Aggregate,
+) {
     let Ok(v) = serde_json::from_str::<Value>(data) else { return };
     let r = &v["response"];
     let Some(id) = r["id"].as_str() else { return };
-    let mut items = full.to_vec();
-    items.extend(r["output"].as_array().cloned().unwrap_or_default());
-    sess.remember(id.to_string(), items);
+    // Only the most recent responses need connection-local continuation state.
+    if sess.upstream_responses.len() >= 100 {
+        sess.upstream_responses.clear();
+    }
+    sess.upstream_responses.insert(id.to_string());
+    if let (Some(key), Some(full)) = (&sess.key, full) {
+        let mut response = r.clone();
+        crate::affinity::complete_output(&mut response, aggregate);
+        app.sessions.remember(headers, key, &response, full);
+    }
 }
 
 enum Native {
@@ -185,8 +222,8 @@ enum Native {
     Fallback,
 }
 
-async fn connect(acct: &Arc<Account>) -> Result<Upstream, String> {
-    let (url, headers) = crate::upstream::codex_ws_url(acct);
+async fn connect(acct: &Arc<Account>, client_headers: &HeaderMap) -> Result<Upstream, String> {
+    let (url, headers) = crate::upstream::codex_ws_url(acct, client_headers);
     let mut req =
         tungstenite::client::IntoClientRequest::into_client_request(url.as_str()).map_err(|e| e.to_string())?;
     for (k, v) in headers {
@@ -206,7 +243,14 @@ async fn connect(acct: &Arc<Account>) -> Result<Upstream, String> {
     Ok(ws)
 }
 
-async fn native_turn(app: &Arc<App>, sess: &mut Session, body: &Value, full: &[Value], tx: &mut ClientTx) -> Native {
+async fn native_turn(
+    app: &Arc<App>,
+    headers: &HeaderMap,
+    sess: &mut Session,
+    body: &Value,
+    full: Option<&[Value]>,
+    tx: &mut ClientTx,
+) -> Native {
     let cfg = app.cfg();
     // Native websockets don't go through HTTP proxies.
     if !cfg.proxy_url.is_empty() {
@@ -223,27 +267,40 @@ async fn native_turn(app: &Arc<App>, sess: &mut Session, body: &Value, full: &[V
         return Native::Fallback;
     }
 
-    // Reuse the session's upstream socket when it can serve this model.
-    let reuse = sess.upstream.as_ref().is_some_and(|(a, _)| {
-        a.resolve(&model).is_some() && a.cooling_until(&model).is_none() && !a.state.lock().disabled
-    });
+    // Refresh the shared assignment every turn, including on an existing socket.
+    let selected = match app.sessions.pick_with_reason(&app.pool, &cfg, &model, sess.key.as_deref(), &[], only.as_ref())
+    {
+        Ok(pair) => pair,
+        Err((status, message)) => {
+            let result = send(tx, error_event(status, &json!({"error":{"message":message}}))).await;
+            return if result.is_ok() { Native::Done } else { Native::Gone };
+        }
+    };
+    sess.pending_selection = Some(selected.clone());
+    let acct = selected.account.clone();
+    let upstream_model = selected.model.clone();
+    if acct.provider != Provider::Codex || !acct.is_oauth() || acct.proxy_url.is_some() {
+        return Native::Fallback;
+    }
+    let reuse = sess.upstream.as_ref().is_some_and(|(a, _)| a.id == acct.id);
     if !reuse {
         if let Some((_, mut up)) = sess.upstream.take() {
             let _ = up.close(None).await;
         }
-        let (acct, _) = match app.pool.pick(&model, &[], cfg.routing, sess.pinned.as_deref(), only.as_ref()) {
-            Pick::Ok(a, m) => (a, m),
-            _ => return Native::Fallback,
-        };
-        if acct.provider != Provider::Codex || !acct.is_oauth() || acct.proxy_url.is_some() {
-            return Native::Fallback;
-        }
+        sess.upstream_responses.clear();
         if crate::oauth::ensure_fresh(app, &acct, chrono::Duration::minutes(5), false).await.is_err() {
             return Native::Fallback;
         }
-        match connect(&acct).await {
+        let mut upstream_headers = headers.clone();
+        if !upstream_headers.contains_key("session_id")
+            && !upstream_headers.contains_key("session-id")
+            && let Some(key) = body["prompt_cache_key"].as_str()
+            && let Ok(value) = key.parse()
+        {
+            upstream_headers.insert("session_id", value);
+        }
+        match connect(&acct, &upstream_headers).await {
             Ok(ws) => {
-                sess.pinned = Some(acct.id.clone());
                 sess.upstream = Some((acct, ws));
             }
             Err(e) => {
@@ -253,9 +310,18 @@ async fn native_turn(app: &Arc<App>, sess: &mut Session, body: &Value, full: &[V
         }
     }
     let (acct, mut up) = sess.upstream.take().unwrap();
-    let upstream_model = acct.resolve(&model).unwrap_or(model.clone());
-
     let mut payload = body.clone();
+    if let Some(prev) = body["previous_response_id"].as_str()
+        && !sess.upstream_responses.contains(prev)
+    {
+        let Some(full) = full else {
+            sess.upstream = Some((acct, up));
+            let err = json!({"error":{"message":"Previous response is unavailable on this connection; resend full conversation input without previous_response_id", "code":"previous_response_not_found"}});
+            return if send(tx, error_event(400, &err)).await.is_ok() { Native::Done } else { Native::Gone };
+        };
+        payload["input"] = Value::Array(full.to_vec());
+        payload.as_object_mut().unwrap().remove("previous_response_id");
+    }
     crate::upstream::sanitize_codex_body(&mut payload, &upstream_model, true);
     if let Some(r) = &suffix
         && let Some(e) = r.effort_level()
@@ -265,13 +331,15 @@ async fn native_turn(app: &Arc<App>, sess: &mut Session, body: &Value, full: &[V
     payload["type"] = "response.create".into();
 
     let mut tracker = Tracker::new(app, Format::Responses, true, "ws", &model);
-    tracker.attempt(&acct);
+    tracker.session(sess.key.as_deref(), sess.source, &cfg);
+    tracker.selected(&selected);
     if up.send(tungstenite::Message::Text(payload.to_string().into())).await.is_err() {
         tracker.cancel();
         return Native::Fallback;
     }
 
     let mut parser = responses::Parser::default();
+    let mut aggregate = ir::Aggregate::default();
     let mut usage = Usage::default();
     let mut evs = Vec::new();
     let mut error: Option<(u16, String)> = None;
@@ -301,6 +369,7 @@ async fn native_turn(app: &Arc<App>, sess: &mut Session, body: &Value, full: &[V
         crate::quota::observe_codex_event(&acct, &v);
         parser.feed(&SseEvent { event: None, data: text.clone() }, &mut evs);
         for ev in evs.drain(..) {
+            aggregate.push(&ev);
             match ev {
                 Event::Usage(u) => usage.merge(&u),
                 Event::Error { status, message } => error = Some((status, message)),
@@ -308,23 +377,38 @@ async fn native_turn(app: &Arc<App>, sess: &mut Session, body: &Value, full: &[V
                 _ => {}
             }
         }
-        // Rate limits / auth failures before any output can be retried elsewhere.
-        if !forwarded
-            && matches!(kind.as_str(), "error" | "response.failed")
-            && let Some((status @ (429 | 401 | 403), msg)) = error.clone()
+        if matches!(kind.as_str(), "error" | "response.failed")
+            && let Some((status, msg)) = error.clone()
         {
-            if status == 429 {
-                acct.cool(Some(&model), chrono::Utc::now() + chrono::Duration::seconds(60), &format!("429: {msg}"));
-            } else {
-                acct.cool(None, chrono::Utc::now() + chrono::Duration::minutes(10), &format!("{status}: {msg}"));
+            if proxy::quota_exhausted(&acct, &model, status, &text) {
+                proxy::mark_quota_exhausted(&acct, &model, &reqwest::header::HeaderMap::new(), &text);
+                app.broadcast("accounts", Value::Null);
+                if !forwarded {
+                    let _ = up.close(None).await;
+                    sess.upstream_responses.clear();
+                    tracker.finish(status, &usage, Some(msg));
+                    return Native::Fallback;
+                }
+            } else if !forwarded && matches!(status, 401 | 403) {
+                // HTTP fallback refreshes credentials on the same assigned account.
+                let _ = up.close(None).await;
+                sess.upstream_responses.clear();
+                tracker.cancel();
+                return Native::Fallback;
+            } else if matches!(status, 401 | 403) {
+                // An error after response.created also invalidates this socket.
+                // Refresh the same subscription before the client's next turn.
+                if let Err(e) = crate::oauth::ensure_fresh(app, &acct, chrono::Duration::minutes(5), true).await {
+                    acct.cool(
+                        None,
+                        chrono::Utc::now() + chrono::Duration::seconds(60),
+                        &format!("token refresh failed: {e}"),
+                    );
+                }
             }
-            let _ = up.close(None).await;
-            sess.pinned = None;
-            tracker.finish(status, &usage, Some(msg));
-            return Native::Fallback;
         }
         if kind == "response.completed" || kind == "response.incomplete" {
-            capture(sess, &text, full);
+            capture(app, headers, sess, &text, full, &aggregate);
         }
         terminal = matches!(kind.as_str(), "response.completed" | "response.incomplete" | "response.failed" | "error");
         forwarded = true;
@@ -336,9 +420,9 @@ async fn native_turn(app: &Arc<App>, sess: &mut Session, body: &Value, full: &[V
             break;
         }
     }
-    if terminal {
+    if terminal && !error.as_ref().is_some_and(|(status, _)| matches!(status, 401 | 403)) {
         sess.upstream = Some((acct.clone(), up));
-    } else {
+    } else if !terminal {
         // The upstream socket died mid-turn: tell the client and reconnect next turn.
         let (status, msg) = error.clone().unwrap_or((502, "codex websocket closed".into()));
         let body = json!({ "error": { "message": msg, "type": "upstream_error" } });

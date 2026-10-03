@@ -49,11 +49,8 @@ pub fn router(app: Arc<App>) -> Router {
 
 // ------------------------------------------------------------------------ auth
 
-async fn client_auth(State(app): State<Arc<App>>, req: Request, next: Next) -> Response {
+async fn client_auth(State(app): State<Arc<App>>, mut req: Request, next: Next) -> Response {
     let cfg = app.cfg();
-    if cfg.api_keys.is_empty() {
-        return next.run(req).await;
-    }
     let h = req.headers();
     let get = |n: &str| h.get(n).and_then(|v| v.to_str().ok()).map(str::trim).map(String::from);
     let provided = get("authorization")
@@ -65,7 +62,13 @@ async fn client_auth(State(app): State<Arc<App>>, req: Request, next: Next) -> R
                 url::form_urlencoded::parse(q.as_bytes()).find(|(k, _)| k == "key").map(|(_, v)| v.into_owned())
             })
         });
-    if provided.is_some_and(|k| cfg.api_keys.iter().any(|a| crate::mgmt::constant_eq(a, &k))) {
+    if cfg.api_keys.is_empty()
+        || provided.as_ref().is_some_and(|k| cfg.api_keys.iter().any(|a| crate::mgmt::constant_eq(a, k)))
+    {
+        // Never trust an incoming internal scope header. Query-string credentials
+        // and header credentials get the same namespace without forwarding keys.
+        let scope = crate::affinity::scope_for_key(provided.as_deref());
+        req.headers_mut().insert("x-cliproxy-client-scope", HeaderValue::from_str(&scope).unwrap());
         return next.run(req).await;
     }
     let format = format_for_path(req.uri().path());
@@ -103,7 +106,17 @@ async fn run(app: Arc<App>, format: Format, headers: HeaderMap, body: Bytes) -> 
         Err(r) => return *r,
     };
     let stream = body["stream"].as_bool().unwrap_or(false);
-    let call = Call { format, body, headers, stream, transport: "http", path_model: None, pinned: None };
+    let call = Call {
+        format,
+        body,
+        headers,
+        stream,
+        transport: "http",
+        path_model: None,
+        session: None,
+        session_source: None,
+        routing_selection: None,
+    };
     reply(format, proxy::execute(app, call).await, false)
 }
 
@@ -205,14 +218,33 @@ async fn completions(State(app): State<Arc<App>>, headers: HeaderMap, body: Byte
         _ => String::new(),
     };
     let mut chat = json!({ "model": body["model"], "messages": [{ "role": "user", "content": prompt }] });
-    for k in ["max_tokens", "temperature", "top_p", "stop", "stream", "stream_options", "user"] {
+    for k in [
+        "max_tokens",
+        "temperature",
+        "top_p",
+        "stop",
+        "stream",
+        "stream_options",
+        "user",
+        "metadata",
+        "prompt_cache_key",
+    ] {
         if !body[k].is_null() {
             chat[k] = body[k].clone();
         }
     }
     let stream = body["stream"].as_bool().unwrap_or(false);
-    let call =
-        Call { format: Format::Chat, body: chat, headers, stream, transport: "http", path_model: None, pinned: None };
+    let call = Call {
+        format: Format::Chat,
+        body: chat,
+        headers,
+        stream,
+        transport: "http",
+        path_model: None,
+        session: None,
+        session_source: None,
+        routing_selection: None,
+    };
     match proxy::execute(app, call).await {
         Reply::Json(v) => {
             let choice = &v["choices"][0];
@@ -300,7 +332,9 @@ async fn gemini(
         stream,
         transport: "http",
         path_model: Some(model.trim_start_matches("models/").to_string()),
-        pinned: None,
+        session: None,
+        session_source: None,
+        routing_selection: None,
     };
     reply(Format::Gemini, proxy::execute(app, call).await, json_array)
 }

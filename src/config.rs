@@ -29,6 +29,10 @@ pub struct Config {
     pub request_retry: u32,
     /// least-used, round-robin or fill-first.
     pub routing: Routing,
+    /// Keep each coding session on its account until subscription quota is exhausted.
+    pub session_affinity: bool,
+    /// Forget inactive sessions after this many seconds (default one day).
+    pub session_affinity_idle_seconds: u64,
     /// Keep an upstream websocket open to Codex when clients connect over websocket.
     pub codex_websockets: bool,
     /// Rewrite non-Claude-Code requests on Claude OAuth accounts so they look like Claude Code.
@@ -190,6 +194,8 @@ impl Default for Config {
             proxy_url: String::new(),
             request_retry: 3,
             routing: Routing::LeastUsed,
+            session_affinity: true,
+            session_affinity_idle_seconds: 86_400,
             codex_websockets: true,
             claude_cloak: true,
             debug: false,
@@ -224,7 +230,9 @@ management-key: ""
 
 proxy-url: ""               # optional upstream proxy, e.g. socks5://127.0.0.1:1080
 request-retry: 3            # accounts to try before failing a request
-routing: least-used         # least-used (most quota left) | round-robin | fill-first
+routing: least-used         # chooses accounts for new sessions: least-used | round-robin | fill-first
+session-affinity: true      # keep a session on its subscription until quota is exhausted
+session-affinity-idle-seconds: 86400 # expire assignments after a day without requests
 codex-websockets: true      # native upstream websocket for Codex websocket clients
 claude-cloak: true          # make non-Claude-Code clients look like Claude Code on OAuth accounts
 debug: false

@@ -251,28 +251,63 @@ fn first_user_text(body: &Value) -> (Option<usize>, String) {
 /// prompt on top, caller instructions moved into the first user turn, and a
 /// Claude-Code-shaped metadata.user_id.
 fn cloak_body(body: &mut Value, acct: &Account, account_uuid: Option<&str>, count_tokens: bool) {
-    let caller: Vec<String> = match &body["system"] {
-        Value::String(s) => vec![s.clone()],
-        Value::Array(blocks) => blocks.iter().filter_map(|b| b["text"].as_str().map(String::from)).collect(),
+    let configured_cache = has_claude_cache_control(body);
+    let original: Vec<Value> = match &body["system"] {
+        Value::String(s) => vec![json!({"type": "text", "text": s})],
+        Value::Array(blocks) => blocks.clone(),
         _ => vec![],
-    }
-    .into_iter()
-    .filter(|t| !t.trim().is_empty() && t != CC_IDENTITY && !t.starts_with("x-anthropic-billing-header"))
-    .collect();
+    };
+    let caller: Vec<Value> = original
+        .iter()
+        .filter_map(|block| {
+            let text = block["text"].as_str()?;
+            if text.trim().is_empty() || text == CC_IDENTITY || text.starts_with("x-anthropic-billing-header") {
+                return None;
+            }
+            let mut reminder =
+                json!({"type": "text", "text": format!("<system-reminder>\n{}\n</system-reminder>", text.trim_end())});
+            if !block["cache_control"].is_null() {
+                reminder["cache_control"] = block["cache_control"].clone();
+            }
+            Some(reminder)
+        })
+        .collect();
 
     let (first_user, text) = first_user_text(body);
     let billing =
         format!("x-anthropic-billing-header: cc_version={CC_VERSION}.{}; cc_entrypoint=cli;", cc_fingerprint(&text));
     body["system"] = json!([
         { "type": "text", "text": billing },
-        { "type": "text", "text": CC_IDENTITY, "cache_control": { "type": "ephemeral" } }
+        { "type": "text", "text": CC_IDENTITY }
     ]);
+    for block in &original {
+        let text = block["text"].as_str().unwrap_or_default();
+        let index = if text == CC_IDENTITY {
+            Some(1)
+        } else if text.starts_with("x-anthropic-billing-header") {
+            Some(0)
+        } else {
+            None
+        };
+        if let Some(index) = index
+            && !block["cache_control"].is_null()
+        {
+            body["system"][index]["cache_control"] = block["cache_control"].clone();
+        }
+    }
+    // An extra 5m breakpoint could exceed Anthropic's four-breakpoint limit or
+    // precede the caller's 1h breakpoint. Respect explicit and automatic caching.
+    if !configured_cache {
+        body["system"][1]["cache_control"] = json!({"type": "ephemeral"});
+    }
 
-    if let (Some(idx), false) = (first_user, caller.is_empty()) {
-        let reminders: Vec<Value> = caller
-            .iter()
-            .map(|t| json!({ "type": "text", "text": format!("<system-reminder>\n{}\n</system-reminder>", t.trim_end()) }))
-            .collect();
+    if let Some(idx) = first_user.filter(|_| !caller.is_empty()) {
+        let has_long_cache = caller.iter().any(|b| b["cache_control"]["ttl"] == "1h");
+        let short_cache = |block: &Value| !block["cache_control"].is_null() && block["cache_control"]["ttl"] != "1h";
+        let earlier_short_cache = body["system"].as_array().unwrap().iter().any(short_cache)
+            || body["messages"].as_array().unwrap()[..idx]
+                .iter()
+                .any(|message| message["content"].as_array().into_iter().flatten().any(short_cache));
         let content = &mut body["messages"][idx]["content"];
         let mut blocks = match content.take() {
             Value::String(s) => vec![json!({ "type": "text", "text": s })],
@@ -280,8 +315,17 @@ fn cloak_body(body: &mut Value, acct: &Account, account_uuid: Option<&str>, coun
             _ => vec![],
         };
         let at = blocks.iter().take_while(|b| b["type"] == "tool_result").count();
-        blocks.splice(at..at, reminders);
-        *content = Value::Array(blocks);
+        let ttl_conflict = has_long_cache && (earlier_short_cache || blocks[..at].iter().any(short_cache));
+        if ttl_conflict {
+            // Keep the original system-cache order before any earlier assistant
+            // or leading tool-result block with a shorter cache lifetime.
+            body["system"] = cloaked_system_in_original_order(&original, &body["system"], caller);
+        } else {
+            blocks.splice(at..at, caller);
+        }
+        body["messages"][idx]["content"] = Value::Array(blocks);
+    } else if first_user.is_none() {
+        body["system"] = cloaked_system_in_original_order(&original, &body["system"], caller);
     }
 
     if count_tokens {
@@ -306,6 +350,43 @@ fn cloak_body(body: &mut Value, acct: &Account, account_uuid: Option<&str>, coun
         }
         body["metadata"]["user_id"] = user_id.into();
     }
+}
+
+fn cloaked_system_in_original_order(original: &[Value], identity: &Value, caller: Vec<Value>) -> Value {
+    let mut system = Vec::new();
+    for index in 0..2 {
+        let present = original.iter().any(|block| {
+            let text = block["text"].as_str().unwrap_or_default();
+            if index == 0 { text.starts_with("x-anthropic-billing-header") } else { text == CC_IDENTITY }
+        });
+        if !present {
+            system.push(identity[index].clone());
+        }
+    }
+    let mut reminders = caller.into_iter();
+    for block in original {
+        let text = block["text"].as_str().unwrap_or_default();
+        if text == CC_IDENTITY {
+            system.push(identity[1].clone());
+        } else if text.starts_with("x-anthropic-billing-header") {
+            system.push(identity[0].clone());
+        } else if !text.trim().is_empty()
+            && let Some(reminder) = reminders.next()
+        {
+            system.push(reminder);
+        }
+    }
+    Value::Array(system)
+}
+
+fn has_claude_cache_control(body: &Value) -> bool {
+    !body["cache_control"].is_null()
+        || ["tools", "system"]
+            .iter()
+            .any(|field| body[field].as_array().into_iter().flatten().any(|block| !block["cache_control"].is_null()))
+        || body["messages"].as_array().into_iter().flatten().any(|message| {
+            message["content"].as_array().into_iter().flatten().any(|block| !block["cache_control"].is_null())
+        })
 }
 
 // ----------------------------------------------------------------------- codex
@@ -413,11 +494,11 @@ fn codex(t: &Target, mut body: Value) -> Prepared {
     Prepared { url: format!("{base}/responses"), headers, body, raw: None }
 }
 
-pub fn codex_ws_url(acct: &Account) -> (String, Vec<(String, String)>) {
+pub fn codex_ws_url(acct: &Account, client_headers: &HeaderMap) -> (String, Vec<(String, String)>) {
     let (token, base, oauth, account_id) = creds(acct);
     let base = base.unwrap_or_else(|| if oauth { CODEX_BACKEND.into() } else { OPENAI_API.into() });
     let ws = base.replacen("https://", "wss://", 1).replacen("http://", "ws://", 1);
-    let mut h = codex_headers(&HeaderMap::new(), &token, account_id.as_deref(), oauth);
+    let mut h = codex_headers(client_headers, &token, account_id.as_deref(), oauth);
     h.push(("openai-beta".into(), CODEX_WS_BETA.into()));
     (format!("{ws}/responses"), h)
 }
@@ -649,6 +730,146 @@ fn compat(t: &Target, mut body: Value) -> Prepared {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn claude_account() -> std::sync::Arc<Account> {
+        let cfg = Config {
+            auth_dir: "/nonexistent".into(),
+            claude_api_key: vec![crate::config::KeyEntry { api_key: "test".into(), ..Default::default() }],
+            ..Default::default()
+        };
+        let pool = crate::accounts::Pool::default();
+        pool.reload(&cfg);
+        pool.all().remove(0)
+    }
+
+    #[test]
+    fn claude_cloak_preserves_four_caller_breakpoints_and_ttl_order() {
+        let acct = claude_account();
+        let mut body = json!({
+            "tools":[{"name":"lookup","input_schema":{"type":"object"},"cache_control":{"type":"ephemeral","ttl":"1h"}}],
+            "system":[
+                {"type":"text","text":"stable instructions","cache_control":{"type":"ephemeral","ttl":"1h"}},
+                {"type":"text","text":"brief instructions","cache_control":{"type":"ephemeral","ttl":"5m"}}
+            ],
+            "messages":[{"role":"user","content":[{"type":"text","text":"question","cache_control":{"type":"ephemeral"}}]}]
+        });
+        cloak_body(&mut body, &acct, None, false);
+        assert!(body["system"][1]["cache_control"].is_null());
+        let blocks = body["messages"][0]["content"].as_array().unwrap();
+        assert_eq!(blocks.len(), 3);
+        assert_eq!(blocks[0]["text"], "<system-reminder>\nstable instructions\n</system-reminder>");
+        assert_eq!(blocks[0]["cache_control"], json!({"type":"ephemeral","ttl":"1h"}));
+        assert_eq!(blocks[1]["cache_control"], json!({"type":"ephemeral","ttl":"5m"}));
+        assert_eq!(blocks[2]["cache_control"], json!({"type":"ephemeral"}));
+        assert_eq!(body["tools"][0]["cache_control"], json!({"type":"ephemeral","ttl":"1h"}));
+    }
+
+    #[test]
+    fn claude_cloak_respects_automatic_caching_and_retains_default_when_unconfigured() {
+        let acct = claude_account();
+        let request = json!({"system":"instructions","messages":[{"role":"user","content":"question"}]});
+        let mut automatic = request.clone();
+        automatic["cache_control"] = json!({"type":"ephemeral","ttl":"1h"});
+        cloak_body(&mut automatic, &acct, None, false);
+        assert!(automatic["system"][1]["cache_control"].is_null());
+        assert_eq!(automatic["cache_control"], json!({"type":"ephemeral","ttl":"1h"}));
+        let mut default = request;
+        cloak_body(&mut default, &acct, None, false);
+        assert_eq!(default["system"][1]["cache_control"], json!({"type":"ephemeral"}));
+    }
+
+    #[test]
+    fn claude_cloak_does_not_move_long_ttl_after_short_cached_tool_result() {
+        let acct = claude_account();
+        let mut body = json!({
+            "system":[{"type":"text","text":"instructions","cache_control":{"type":"ephemeral","ttl":"1h"}}],
+            "messages":[
+                {"role":"assistant","content":[{"type":"tool_use","id":"tool_1","name":"lookup","input":{}}]},
+                {"role":"user","content":[{"type":"tool_result","tool_use_id":"tool_1","content":"result","cache_control":{"type":"ephemeral"}}]}
+            ]
+        });
+        let messages = body["messages"].clone();
+        cloak_body(&mut body, &acct, None, false);
+        assert_eq!(body["messages"], messages);
+        assert_eq!(body["system"][2]["cache_control"], json!({"type":"ephemeral","ttl":"1h"}));
+        assert_eq!(body["system"][2]["text"], "<system-reminder>\ninstructions\n</system-reminder>");
+    }
+
+    #[test]
+    fn claude_cloak_preserves_ttl_order_before_assistant_and_identity_markers() {
+        let acct = claude_account();
+        let mut body = json!({
+            "system":[{"type":"text","text":"instructions","cache_control":{"type":"ephemeral","ttl":"1h"}}],
+            "messages":[
+                {"role":"assistant","content":[{"type":"tool_use","id":"tool_1","name":"lookup","input":{},"cache_control":{"type":"ephemeral"}}]},
+                {"role":"user","content":[{"type":"tool_result","tool_use_id":"tool_1","content":"result"}]}
+            ]
+        });
+        let messages = body["messages"].clone();
+        cloak_body(&mut body, &acct, None, false);
+        assert_eq!(body["messages"], messages);
+        assert_eq!(body["system"][2]["cache_control"]["ttl"], "1h");
+
+        let mut body = json!({
+            "system":[
+                {"type":"text","text":"instructions","cache_control":{"type":"ephemeral","ttl":"1h"}},
+                {"type":"text","text":CC_IDENTITY,"cache_control":{"type":"ephemeral"}}
+            ],
+            "messages":[{"role":"user","content":"question"}]
+        });
+        cloak_body(&mut body, &acct, None, false);
+        assert_eq!(body["system"][1]["cache_control"]["ttl"], "1h");
+        assert_eq!(body["system"][2]["text"], CC_IDENTITY);
+        assert_eq!(body["system"][2]["cache_control"], json!({"type":"ephemeral"}));
+        assert_eq!(body["messages"][0]["content"], json!([{"type":"text","text":"question"}]));
+    }
+
+    #[test]
+    fn claude_native_code_preserves_cache_controls_without_cloaking() {
+        let acct = claude_account();
+        *acct.cred.write() = Credential::OAuth(crate::accounts::OAuth {
+            access_token: "test".into(),
+            refresh_token: String::new(),
+            expires_at: None,
+            email: None,
+            account_id: None,
+            base_url: None,
+            project_id: None,
+            raw: Default::default(),
+        });
+        let mut headers = HeaderMap::new();
+        headers.insert("user-agent", CC_USER_AGENT.parse().unwrap());
+        let cfg = Config::default();
+        let body = json!({
+            "model":"claude-sonnet-4-6",
+            "cache_control":{"type":"ephemeral","ttl":"1h"},
+            "system":[{"type":"text","text":"instructions","cache_control":{"type":"ephemeral","ttl":"1h"}}],
+            "messages":[{"role":"user","content":"question"}]
+        });
+        let prepared = prepare(
+            &Target {
+                acct: &acct,
+                cfg: &cfg,
+                client_headers: &headers,
+                model: "claude-sonnet-4-6",
+                wire: Format::Claude,
+                passthrough: true,
+                stream: false,
+                count_tokens: false,
+            },
+            body.clone(),
+        );
+        assert_eq!(prepared.body, body);
+    }
+
+    #[test]
+    fn claude_cloak_keeps_instructions_without_a_user_turn() {
+        let acct = claude_account();
+        let mut body = json!({"system":[{"type":"text","text":"instructions","cache_control":{"type":"ephemeral","ttl":"1h"}}],"messages":[]});
+        cloak_body(&mut body, &acct, None, false);
+        assert_eq!(body["system"][2]["text"], "<system-reminder>\ninstructions\n</system-reminder>");
+        assert_eq!(body["system"][2]["cache_control"], json!({"type":"ephemeral","ttl":"1h"}));
+    }
 
     #[test]
     fn codex_input_strings_become_lists() {

@@ -381,14 +381,14 @@ function meterHTML(w, label) {
 }
 
 const ROUTING = {
-  'least-used': 'Requests go to the account with the most quota left',
-  'round-robin': 'Requests take turns across accounts',
-  'fill-first': 'Requests use the first available account',
+  'least-used': 'New sessions use the account with the most quota left',
+  'round-robin': 'New sessions take turns across accounts',
+  'fill-first': 'New sessions use the first available account',
 };
 
 function ovAccountsHTML() {
   const list = S.accounts || [];
-  const routing = ROUTING[S.overview.routing] || '';
+  const routing = (ROUTING[S.overview.routing] || '').replace('New sessions', S.overview.session_affinity === false ? 'Requests' : 'New sessions');
   const head = `<div class="section-head"><div class="head-l"><h2>Accounts</h2>${list.length ? `<span class="meta hide-sm">${routing}</span>` : ''}</div><a class="link" href="#/accounts">Manage</a></div>`;
   if (!list.length) {
     return `${head}<div class="empty list">
@@ -510,6 +510,60 @@ function codeClass(s) {
   return 'code-200';
 }
 
+const ROUTING_LABEL = { 'least-used': 'Least-used', 'round-robin': 'Round-robin', 'fill-first': 'Fill-first' };
+const ROUTING_REASON = {
+  new_session: 'New session',
+  session_reused: 'Same session',
+  quota_exhausted: 'Switched: quota exhausted',
+  missing_session: 'No session assignment',
+  affinity_disabled: 'Affinity disabled',
+  retry_same: 'Retried same account',
+};
+const ROUTING_WARNING = {
+  missing_session_id: ['No session ID', 'The client supplied no stable session identifier. Later requests may use another account and lose cache reuse.'],
+  connection_only: ['Connection only', 'This assignment lasts for the WebSocket connection. A reconnect without a stable session identifier may use another account.'],
+  response_id_only: ['Response ID only', 'This assignment relies on a previous response ID held in memory. A stable session identifier is needed to preserve it across server restarts.'],
+  affinity_disabled: ['Affinity off', 'Session affinity is disabled. Requests from this session may use different accounts.'],
+};
+const SESSION_SOURCE = {
+  previous_response_id: 'a previous response ID',
+  websocket_connection: 'this WebSocket connection',
+  generated_response: 'a generated response ID',
+  prompt_cache_key: 'the prompt cache key',
+};
+
+function routingReason(reason) {
+  return ROUTING_REASON[reason] || (reason || '').replaceAll('_', ' ');
+}
+
+function requestAccountHTML(r) {
+  const reason = routingReason(r.routing_reason);
+  const strategy = ROUTING_LABEL[r.routing_strategy] || r.routing_strategy;
+  const attempts = (r.routing_attempts || []).map((a) => {
+    const from = a.previous_account ? `${a.previous_account} → ` : '';
+    return `${from}${a.account || 'Unknown account'}: ${routingReason(a.reason)}`;
+  });
+  const detail = [strategy && `Routing: ${strategy}`, ...attempts].filter(Boolean).join('\n');
+  return `<span class="request-account">${esc(r.account || '—')}</span>${reason ? `<span class="request-detail${r.routing_reason === 'quota_exhausted' ? ' warn' : ''}" title="${esc(detail)}">${esc(reason)}</span>` : ''}`;
+}
+
+function requestSessionHTML(r) {
+  const warning = ROUTING_WARNING[r.routing_warning];
+  const source = SESSION_SOURCE[r.session_source] || (r.session_source ? `the client’s ${r.session_source}` : 'the client');
+  const title = `Session fingerprint: ${r.session_id}\nIdentified by ${source}. Click to show this session’s requests.`;
+  const session = r.session_id
+    ? `<button class="linkbtn mono session-link" data-act="filter-session" data-id="${esc(r.session_id)}" title="${esc(title)}" aria-label="Show requests for session ${esc(r.session_id.slice(0, 10))}">${esc(r.session_id.slice(0, 10))}</button>`
+    : '<span class="dim" title="No session identity recorded">—</span>';
+  return `${session}${warning ? `<span class="request-detail warn" title="${esc(warning[1])}">${esc(warning[0])}</span>` : ''}`;
+}
+
+function requestTokensHTML(r, field) {
+  if (r.status === 499 && !r.input_tokens && !r.output_tokens && !r.cache_tokens) {
+    return '<span class="dim" title="No token usage was reported before this request closed. Usage is unknown.">—</span>';
+  }
+  return `<span title="${Number(r[field] || 0).toLocaleString('en-US')} tokens">${fmt(r[field])}</span>`;
+}
+
 function requestRowHTML(r, lit = false, full = true) {
   const status = r.status === 499 ? 'closed' : r.status;
   const err = r.error && r.status >= 400 && r.status !== 499 ? `<span class="errline" title="${esc(r.error)}">${esc(r.error)}</span>` : '';
@@ -517,13 +571,14 @@ function requestRowHTML(r, lit = false, full = true) {
     <td class="mono" title="${esc(r.ts)}">${clock(r.ts)}</td>
     <td>${routeHTML(r, full)}</td>
     <td><span class="model mono">${esc(r.model)}</span>${err}</td>
-    <td class="hide-sm">${esc(r.account || '—')}</td>
+    <td>${requestAccountHTML(r)}</td>
+    <td>${requestSessionHTML(r)}</td>
     <td class="mono ${codeClass(r.status)}">${status}</td>
     ${full ? `<td class="r mono hide-sm">${ms(r.ttft_ms)}</td>` : ''}
     <td class="r mono">${ms(r.latency_ms)}</td>
-    <td class="r mono">${fmt(r.input_tokens)}</td>
-    <td class="r mono">${fmt(r.output_tokens)}</td>
-    ${full ? `<td class="r mono hide-sm">${fmt(r.cache_tokens)}</td>` : ''}
+    <td class="r mono">${requestTokensHTML(r, 'input_tokens')}</td>
+    <td class="r mono">${requestTokensHTML(r, 'output_tokens')}</td>
+    <td class="r mono">${requestTokensHTML(r, 'cache_tokens')}</td>
   </tr>`;
 }
 
@@ -533,7 +588,7 @@ function recentHTML(lit = false) {
     return `<div class="empty"><h3>No requests yet</h3><p>Point a client at the endpoint above and requests will show up here as they happen.</p></div>`;
   }
   return `<div class="table-wrap"><table>
-    <thead><tr><th>Time</th><th>Route</th><th>Model</th><th class="hide-sm">Account</th><th>Status</th><th class="r">Latency</th><th class="r">In</th><th class="r">Out</th></tr></thead>
+    <thead><tr><th>Time</th><th>Route</th><th>Model</th><th>Account</th><th>Session</th><th>Status</th><th class="r">Latency</th><th class="r">In</th><th class="r">Out</th><th class="r">Cached</th></tr></thead>
     <tbody>${rows.map((r, i) => requestRowHTML(r, lit && i === 0, false)).join('')}</tbody></table></div>`;
 }
 
@@ -709,7 +764,11 @@ function accountListHTML() {
 function matches(r) {
   const q = S.filter.trim().toLowerCase();
   if (!q) return true;
-  return [r.model, r.account, r.provider, r.client, String(r.status), r.error || ''].some((s) => String(s).toLowerCase().includes(q));
+  const attempts = (r.routing_attempts || []).flatMap((a) => [a.account, a.previous_account, a.reason, routingReason(a.reason)]);
+  return [r.model, r.account, r.provider, r.client, String(r.status), r.status === 499 ? 'closed' : '', r.error,
+    r.session_id, r.session_source, r.routing_strategy, r.routing_reason, routingReason(r.routing_reason),
+    r.routing_warning, ...(ROUTING_WARNING[r.routing_warning] || []), ...attempts,
+  ].some((s) => s != null && String(s).toLowerCase().includes(q));
 }
 
 function reqCountHTML() {
@@ -724,16 +783,20 @@ function requestsHTML() {
       <div><h1>Requests</h1><p>The last 300 requests since the server started.</p></div>
       <div class="toolbar">
         <label class="sr-only" for="req-filter">Filter requests</label>
-        <input id="req-filter" type="text" placeholder="Filter by model, account, status…" value="${esc(S.filter)}" autocomplete="off" spellcheck="false">
+        <input id="req-filter" type="text" placeholder="Filter by session, account, model…" value="${esc(S.filter)}" autocomplete="off" spellcheck="false">
         <button class="btn" data-act="pause" aria-pressed="${S.paused}">${S.paused ? 'Resume' : 'Pause'}</button>
       </div>
     </div>
     <p class="note" style="margin:-8px 0 12px" id="req-count">${reqCountHTML()}</p>
     <div class="table-wrap"><table>
-      <thead><tr><th>Time</th><th>Route</th><th>Model</th><th class="hide-sm">Account</th><th>Status</th><th class="r hide-sm">First token</th><th class="r">Total</th><th class="r">In</th><th class="r">Out</th><th class="r hide-sm">Cached</th></tr></thead>
+      <thead><tr><th>Time</th><th>Route</th><th>Model</th><th>Account</th><th>Session</th><th>Status</th><th class="r hide-sm">First token</th><th class="r">Total</th><th class="r">In</th><th class="r">Out</th><th class="r">Cached</th></tr></thead>
       <tbody id="req-body">${rows.map((r) => requestRowHTML(r)).join('')}</tbody>
     </table></div>
-    ${rows.length ? '' : `<div class="empty" id="req-empty"><h3>${S.filter ? 'Nothing matches that filter' : 'No requests yet'}</h3><p>${S.filter ? 'Try a model name, an account or a status code.' : 'Requests appear here the moment a client sends one.'}</p></div>`}`;
+    ${rows.length ? '' : requestEmptyHTML()}`;
+}
+
+function requestEmptyHTML() {
+  return `<div class="empty" id="req-empty"><h3>${S.filter ? 'Nothing matches that filter' : 'No requests yet'}</h3><p>${S.filter ? 'Try a session ID, an account, a model or a routing reason.' : 'Requests appear here the moment a client sends one.'}</p></div>`;
 }
 
 function bindRequests() {
@@ -742,6 +805,8 @@ function bindRequests() {
     S.filter = input.value;
     const rows = S.requests.filter(matches);
     $('#req-body').innerHTML = rows.map((r) => requestRowHTML(r)).join('');
+    $('#req-empty')?.remove();
+    if (!rows.length) $('#req-body').closest('.table-wrap').insertAdjacentHTML('afterend', requestEmptyHTML());
     patch('req-count', reqCountHTML);
   });
 }
@@ -757,6 +822,7 @@ function configHTML() {
   const dirty = c.text !== c.saved;
   return `
     <div class="page-head"><div><h1>Configuration</h1><p class="mono">${esc(c.path)}</p></div></div>
+    <p class="note">With session affinity enabled, routing chooses an account for each new session. That session stays on its subscription until its quota runs out.</p>
     <label class="sr-only" for="cfg">config.yaml</label>
     <textarea id="cfg" class="editor" spellcheck="false" autocapitalize="off" autocomplete="off">${esc(c.text)}</textarea>
     <div class="editor-foot">
@@ -995,6 +1061,11 @@ document.addEventListener('click', (e) => {
   const { act, id } = el.dataset;
   switch (act) {
     case 'copy': return copy(el);
+    case 'filter-session':
+      S.filter = id;
+      if (S.route !== 'requests') { location.hash = '#/requests'; return; }
+      render();
+      return $('#req-filter')?.focus();
     case 'snippet':
       S.snippet = id;
       localStorage.setItem('cliproxyapi-rust.snippet', id);

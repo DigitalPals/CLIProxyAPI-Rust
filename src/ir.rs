@@ -31,6 +31,8 @@ impl Format {
 #[derive(Debug, Clone, Default)]
 pub struct Request {
     pub system: Vec<String>,
+    /// Original text-block boundaries for OpenAI system messages with cache markers.
+    pub system_cache_blocks: std::collections::BTreeMap<usize, Vec<CacheTextBlock>>,
     pub messages: Vec<Message>,
     pub tools: Vec<Tool>,
     pub tool_choice: ToolChoice,
@@ -76,10 +78,31 @@ pub enum Sig {
 pub enum Part {
     Text(String),
     Image(Image),
-    Reasoning { text: String, sig: Option<Sig> },
+    /// OpenAI explicit cache boundary immediately after the preceding content part.
+    CacheBreakpoint,
+    Reasoning {
+        text: String,
+        sig: Option<Sig>,
+    },
     RedactedReasoning(String),
-    ToolCall { id: String, name: String, args: String, sig: Option<Sig> },
-    ToolResult { id: String, name: Option<String>, content: Vec<Part>, is_error: bool },
+    ToolCall {
+        id: String,
+        name: String,
+        args: String,
+        sig: Option<Sig>,
+    },
+    ToolResult {
+        id: String,
+        name: Option<String>,
+        content: Vec<Part>,
+        is_error: bool,
+    },
+}
+
+#[derive(Debug, Clone)]
+pub struct CacheTextBlock {
+    pub text: String,
+    pub breakpoint: bool,
 }
 
 #[derive(Debug, Clone)]

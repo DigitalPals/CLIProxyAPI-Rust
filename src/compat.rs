@@ -85,6 +85,7 @@ pub fn normalize(doc: &mut Yaml) -> Vec<String> {
     lift(doc, &["remote-management", "allow-remote"], "management-allow-remote", false);
     lift(doc, &["routing", "retry", "request-retry"], "request-retry", true);
     lift(doc, &["routing", "force-model-prefix"], "force-model-prefix", true);
+    lift(doc, &["routing", "session-affinity"], "session-affinity", true);
     lift(doc, &["requests", "proxy-url"], "proxy-url", true);
     lift(doc, &["oauth", "auth-dir"], "auth-dir", true);
     lift(doc, &["oauth", "model-alias"], "oauth-model-alias", true);
@@ -157,7 +158,6 @@ pub fn normalize(doc: &mut Yaml) -> Vec<String> {
     note(path(doc, &["plugins", "enabled"]).and_then(Yaml::as_bool) == Some(true), "plugins");
     let strategy = path(doc, &["routing", "strategy"]).and_then(Yaml::as_str).unwrap_or_default();
     note(strategy == "weighted-round-robin", "weighted routing (round-robin is used)");
-    note(path(doc, &["routing", "session-affinity"]).and_then(Yaml::as_bool) == Some(true), "session affinity");
     note(path(doc, &["interactions-api-key"]).is_some(), "interactions-api-key");
     ignored
 }
