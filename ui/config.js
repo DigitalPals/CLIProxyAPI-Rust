@@ -136,12 +136,17 @@ function configAccessHTML() {
 
 function configRoutingHTML() {
   const strategy = configGet(['routing']);
-  const help = { 'least-used': 'Prefer the account with the most subscription quota remaining. Falls back to round robin when quota is unavailable.',
-    'round-robin': 'Rotate requests across available accounts.', 'fill-first': 'Use the first available account until it cannot serve the request, then try the next.' }[strategy];
+  const what = configGet(['session-affinity']) ? 'new sessions' : 'requests';
+  const help = { 'least-used': `Send ${what} to the account with the most subscription quota remaining. Falls back to round robin when quota is unavailable.`,
+    'round-robin': `Rotate ${what} across available accounts.`, 'fill-first': `Send ${what} to the first available account until it cannot serve them, then the next.` }[strategy];
   return `<h2>Routing</h2><div class="cfg-grid">
     ${configSelect(['routing'], 'Account selection', [['least-used', 'Most quota remaining'], ['round-robin', 'Round robin'], ['fill-first', 'Fill first']], { help })}
     ${configField(['request-retry'], 'Account attempts', { type: 'number', min: 0, max: 4294967295, required: true,
       help: 'Maximum accounts to try before a request fails. Zero still tries one account.' })}</div>
+    <div class="cfg-divider"></div>${configSwitch(['session-affinity'], 'Keep sessions on one account', 'A coding session stays on the account it started on, so its prompt cache keeps working. It moves when that subscription runs out or the account is disabled; while an account is busy, its requests briefly use another.')}
+    <div class="cfg-grid cfg-dependent ${configGet(['session-affinity']) ? '' : 'is-disabled'}">
+      ${configField(['session-affinity-idle-seconds'], 'Forget idle sessions after (seconds)', { type: 'number', min: 60, required: true, help: '86400 is one day.' })}
+    </div>
     <div class="cfg-divider"></div>${configSwitch(['force-model-prefix'], 'Require model prefixes', 'Unprefixed requests only use accounts without a prefix. Use prefix/model to select a prefixed account.')}`;
 }
 
@@ -341,6 +346,7 @@ function configValidate() {
   }
   if ('auth-dir' in changed && !v['auth-dir']?.trim()) invalid(['auth-dir'], 'Enter a credentials directory.');
   if ('request-retry' in changed && (!Number.isInteger(v['request-retry']) || v['request-retry'] < 0 || v['request-retry'] > 4294967295)) invalid(['request-retry'], 'Enter a nonnegative whole number.');
+  if ('session-affinity-idle-seconds' in changed && (!Number.isInteger(v['session-affinity-idle-seconds']) || v['session-affinity-idle-seconds'] < 60)) invalid(['session-affinity-idle-seconds'], 'Enter at least 60 seconds.');
   const checkURL = (path, proxy = false, required = false) => {
     const value = configGet(path);
     if (!value) { if (required) invalid(path, 'Enter a base URL.'); return; }
@@ -385,7 +391,7 @@ function configValidate() {
       if (provider) { c.section = 'providers'; c.provider = provider[0];
         for (let i = 0; i < v[provider[2]].length; i++) { c.opens[`${provider[2]}:${i}`] = true; c.opens[`${provider[2]}:${i}:advanced`] = true; }
       } else if (path[0] === 'api-keys') c.section = 'access';
-      else if (path[0] === 'request-retry') c.section = 'routing';
+      else if (['request-retry', 'session-affinity-idle-seconds'].includes(path[0])) c.section = 'routing';
       else if (path[0] === 'proxy-url') c.section = 'connections';
       else c.section = 'server';
     }

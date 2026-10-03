@@ -151,6 +151,7 @@ fn setting_path(doc: &Yaml, field: &str) -> (Vec<Value>, bool) {
         "management-allow-remote" => &["management", "allow-remote"],
         "request-retry" => &["routing", "retry", "request-retry"],
         "force-model-prefix" => &["routing", "force-model-prefix"],
+        "session-affinity" => &["routing", "session-affinity"],
         "proxy-url" => &["requests", "proxy-url"],
         "oauth-model-alias" => &["oauth", "model-alias"],
         "oauth-excluded-models" => &["oauth", "excluded-models"],
@@ -462,7 +463,11 @@ fn validate(values: &Value, changes: &Map<String, Value>) -> Result<()> {
             "management-allow-remote" => {
                 ensure!(value.is_null() || value.is_boolean(), "Remote access must be enabled or disabled")
             }
-            "codex-websockets" | "claude-cloak" | "banked-resets" | "force-model-prefix" | "debug" => {
+            "session-affinity-idle-seconds" => {
+                ensure!(value.as_u64().is_some_and(|n| n >= 60), "Forget idle sessions after at least 60 seconds")
+            }
+            "codex-websockets" | "claude-cloak" | "banked-resets" | "session-affinity" | "force-model-prefix"
+            | "debug" => {
                 ensure!(value.is_boolean(), "{field}: use a boolean")
             }
             _ => {}
@@ -739,6 +744,20 @@ mod tests {
             assert_eq!(cfg.claude_api_key.len(), 2);
             assert_eq!(Config::parse(&out).unwrap().claude_api_key[1].api_key, "second");
         }
+    }
+
+    #[test]
+    fn session_affinity_settings_land_where_each_layout_keeps_them() {
+        let (out, cfg) =
+            edit("port: 8317\n", json!({"session-affinity": false, "session-affinity-idle-seconds": 3600}));
+        assert!(!cfg.session_affinity);
+        assert_eq!(cfg.session_affinity_idle_seconds, 3600);
+        assert_eq!(yaml(&out).unwrap()["session-affinity"].as_bool(), Some(false));
+        let (out, cfg) =
+            edit("config-version: 8\nrouting:\n  strategy: fill-first\n", json!({"session-affinity": false}));
+        assert!(!cfg.session_affinity);
+        assert_eq!(yaml(&out).unwrap()["routing"]["session-affinity"].as_bool(), Some(false));
+        assert!(apply("", json!({"session-affinity-idle-seconds": 5}).as_object().unwrap()).is_err());
     }
 
     #[test]

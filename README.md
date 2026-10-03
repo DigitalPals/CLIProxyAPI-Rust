@@ -33,7 +33,7 @@ Point Claude Code, Codex, your editor or any SDK at one URL and stop caring whic
 - **Ten providers.** Subscription sign-in for Claude, ChatGPT (Codex), Antigravity, Grok, Kimi, Meta and Devin; service accounts for Vertex AI; API keys for Anthropic, OpenAI, Gemini, Vertex, Kimi, xAI, Meta and anything OpenAI-compatible.
 - **Images and video too.** `/v1/images/generations` and `/v1/images/edits` work with ChatGPT accounts, OpenAI and xAI keys, Vertex Imagen and Gemini image models. xAI video generation is behind `/v1/videos`.
 - **WebSockets.** Codex WebSocket sessions are relayed to ChatGPT's own WebSocket upstream, so `previous_response_id` works on the server side. Switch to a Claude or Gemini model mid-session and CLIProxyAPI-Rust carries the conversation over.
-- **Many accounts, no babysitting.** Each request goes to the account with the most quota left, using the 5-hour and weekly usage Claude and ChatGPT report. An account whose limit is used up sits out until it resets, a rate limit cools down only that model on that account, failed requests move to the next account, and OAuth tokens refresh themselves.
+- **Many accounts, no babysitting.** Each new coding session goes to the account with the most quota left, using the 5-hour and weekly usage Claude and ChatGPT report, and stays there so its prompt cache keeps paying off. An account whose limit is used up sits out until it resets, a rate limit cools down only that model on that account, failed requests move to the next account, and OAuth tokens refresh themselves.
 - **A dashboard you'll actually open.** Pure black, live over WebSocket: every subscription's 5-hour and weekly limits side by side, traffic, cooldown timers, sign-in flows, a request log and a config editor.
 - **Drop-in for CLIProxyAPI users.** Same credential files, same `config.yaml` (both of its layouts), same Docker paths and flags. Swap the image and keep everything else.
 
@@ -105,7 +105,7 @@ cliproxyapi-rust --config config.yaml check
 | Client keys, management key (plain or bcrypt-hashed), `allow-remote`, TLS, proxy, routing strategy, retries | Used as is |
 | API keys for Claude, Codex, Gemini, Vertex, xAI, Meta and OpenAI-compatible providers | Used with their `base-url`, `proxy-url` (including `direct`), `headers`, model aliases, `prefix` and `excluded-models` |
 | `oauth-model-alias`, `oauth-excluded-models`, per-file `prefix` and `model_aliases` | Used as is |
-| Session affinity (`routing.session-affinity` or `session-affinity`) | Supported; enabled by default for all three routing strategies. |
+| Session affinity (`routing.session-affinity` or `session-affinity`) | Supported and on by default, with any routing strategy. See [coding sessions](#coding-sessions-and-prompt-caching). |
 | Payload rules, plugins, Redis usage queue, weighted routing, the `/v0/management` API | Not supported. The built-in dashboard replaces the separate management panel. |
 
 Changes made from the dashboard keep your file's layout, YAML comments, and settings this binary doesn't use, so you can switch back at any time. The rare layout that can't be edited in place, such as lists written without indentation, is rewritten instead, and the original is kept as `config.yaml.bak`.
@@ -256,7 +256,7 @@ management-key: ""            # empty = dashboard only from localhost
 proxy-url: ""                 # optional http://, https:// or socks5:// upstream proxy
 request-retry: 3              # accounts to try before giving up
 routing: least-used           # new sessions: most quota left; or round-robin, fill-first
-session-affinity: true        # keep each session on its subscription until quota is exhausted
+session-affinity: true        # keep each coding session on one account, for prompt caching
 session-affinity-idle-seconds: 86400 # forget assignments after a day without requests
 codex-websockets: true        # native WebSocket relay to ChatGPT
 claude-cloak: true            # present non-Claude-Code clients as Claude Code on OAuth accounts
@@ -291,72 +291,15 @@ openai-compatibility:
 
 ### Coding sessions and prompt caching
 
-Session affinity is enabled by default. `least-used`, `round-robin` and `fill-first`
-choose an account for a new session; subsequent requests stay on that account.
-Quota changes, routing changes and the recovery of another account do not move an
-active session. Confirmed subscription exhaustion moves the session to an available
-account using the selected strategy, and that replacement stays assigned.
+Requests from one coding session stay on the account the session started on, so the provider's prompt cache keeps working. `routing` picks the account for each new session. A session moves only when its subscription runs out of quota, or its account is disabled, removed or can't serve the model, and the replacement then keeps it. When its account is only busy (a rate limit, an overload, a failed attempt), that request is answered by another account and the session goes back afterwards. Turn this off with `session-affinity: false` (`routing.session-affinity` in a CLIProxyAPI v8 file).
 
-The proxy reads session identifiers from the original request, before translating
-it: `x-cliproxy-session-id`, Codex `thread-id`/`session_id`/`session-id`, Claude
-`x-claude-code-session-id` or `metadata.user_id` session metadata (JSON and the older
-`user_…_account_…_session_…` form), `metadata.session_id`/`metadata.thread_id`, a
-Responses `conversation` id, or `prompt_cache_key`. Different client API keys have
-separate session namespaces. For another client, send a unique, stable
-`x-cliproxy-session-id` for the entire task. Do not use a per-request id or reuse one
-id for unrelated tasks. HTTP requests without session metadata retain per-request
-routing; Responses continuations can also recover the assignment through a known
-`previous_response_id`. WebSockets without metadata remain pinned for that connection.
+Sessions are recognised from what clients already send: Claude Code's session metadata, Codex's `session_id` and `thread-id` headers, a Responses `conversation` id or `prompt_cache_key`. Writing your own client? Send one stable `x-cliproxy-session-id` per task. Each client API key has its own sessions. Requests without any of these are routed one by one, and a WebSocket without one keeps its account for the connection.
 
-HTTP, WebSocket fallback, native Codex WebSockets and `/v1/responses/compact` share
-the assignments. Changes between models of the same provider retain the account
-when it supports the requested model. An explicit provider or account prefix creates
-a separate routing scope. A removed, disabled or incompatible assigned account
-returns an error instead of silently changing subscriptions.
+Assignments are saved to `.routing-sessions.state` in the auth directory (hashed ids, owner-only permissions), so they survive restarts, and forgotten after `session-affinity-idle-seconds` without requests (a day by default). Send `x-cliproxy-session-end: true` with a task's last request to release it early. Responses history for `previous_response_id` is kept in memory only, up to 64 MiB. Run one proxy per auth directory.
 
-Burst rate limits, network failures and server errors preserve the subscription;
-failed retries return an error so the client can retry later. Expired OAuth access
-tokens refresh on the same subscription. A bare 429 is not proof of exhausted quota:
-migration requires an exhausted usage window or an explicit provider quota error.
-Quota errors reported inside a response stream affect the next call; the proxy does
-not restart an answer that has already begun streaming.
+The Requests page shows each request's session fingerprint (click it to see the whole session), why its account was chosen, and its cached tokens.
 
-Assignments are atomically saved to `.routing-sessions.state` in `auth-dir`, so they
-survive proxy restarts and normal config reloads. The file contains hashed session
-identifiers and account ids, with owner-only permissions on Unix. Mount `auth-dir`
-persistently when using Docker. Run one proxy process per auth directory; the file
-is not a distributed registry. Assignments expire after the configured idle interval;
-in-flight requests and streams keep their assignments alive. Send
-`x-cliproxy-session-end: true` on a final HTTP generation request to release its
-assignment after the response finishes.
-
-Responses conversation history is kept in a bounded memory cache (64 MiB total,
-8 MiB per conversation, up to 1,000 recent responses). On reconnect or quota
-migration, the proxy replays full available input instead of forwarding a response
-id from another upstream connection. Conversation history is not saved to disk:
-after a proxy restart or history eviction, Codex continuations must resend full input
-without `previous_response_id`. Public API backends can still resolve their own
-stored response ids. Affinity avoids subscription churn; provider cache expiry and
-cache routing still determine whether individual requests get a cache hit.
-
-The request dashboard shows a client-scoped session fingerprint, the account's
-assignment reason, and cached input tokens. Click a fingerprint to see that
-session's requests. Separate agent threads have separate fingerprints. The API
-and structured request logs also expose the identifier source, routing strategy,
-and attempted accounts, including the previous account after quota exhaustion;
-raw session identifiers and client keys are not logged.
-
-Requests without a stable identifier are marked **No session ID**. Connection-only
-WebSocket assignments and in-memory response-id continuations are labelled as
-such, and disabled affinity is visible per request. These notices do not reject
-requests or change account selection. A closed request with no reported usage
-shows a dash instead of implying that it consumed zero tokens.
-
-Compatible OpenAI cache controls and supported content breakpoints are preserved
-between Chat Completions and Responses. Cache settings that cannot be represented
-in the destination format produce a clear error instead of silently losing their
-meaning. Claude compatibility rewriting preserves the caller's cache markers and
-their TTL ordering.
+Cache hints carry across formats: OpenAI cache settings and breakpoints between Chat Completions and Responses, and Claude's cache markers, in their TTL order, when a request is made to look like Claude Code. A hint that can't be carried over is dropped rather than failing the request.
 
 ### Running it on a server
 

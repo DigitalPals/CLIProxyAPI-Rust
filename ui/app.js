@@ -626,10 +626,10 @@ const ROUTING_LABEL = { 'least-used': 'Least-used', 'round-robin': 'Round-robin'
 const ROUTING_REASON = {
   new_session: 'New session',
   session_reused: 'Same session',
-  quota_exhausted: 'Switched: quota exhausted',
-  account_disabled: 'Switched: account disabled',
-  account_removed: 'Switched: account removed',
-  model_unavailable: 'Switched: model not served',
+  quota_exhausted: 'Moved: quota used up',
+  account_disabled: 'Moved: account disabled',
+  account_removed: 'Moved: account removed',
+  model_unavailable: 'Moved: model not served',
   temporary_detour: 'Detour: account busy',
   missing_session: 'No session assignment',
   affinity_disabled: 'Affinity disabled',
@@ -662,7 +662,12 @@ function requestAccountHTML(r) {
     return `${from}${named(a.account_id) || 'Unknown account'}: ${routingReason(a.reason)}`;
   });
   const detail = [strategy && `Routing: ${strategy}`, ...attempts].filter(Boolean).join('\n');
-  return `<span class="request-account">${esc((accountOf(r) ? acctLabel(accountOf(r)) : who(r.account)) || '—')}</span>${reason ? `<span class="request-detail${/^(quota_exhausted|account_|model_unavailable|temporary_detour)/.test(r.routing_reason) ? ' warn' : ''}" title="${esc(detail)}">${esc(reason)}</span>` : ''}`;
+  // One line under the account: why it was chosen, then the session it belongs to.
+  const moved = /^(quota_exhausted|account_|model_unavailable|temporary_detour)/.test(r.routing_reason);
+  const why = reason ? `<span class="${moved ? 'warn' : ''}" title="${esc(detail)}">${esc(reason)}</span>` : '';
+  const session = requestSessionHTML(r);
+  const label = (accountOf(r) ? acctLabel(accountOf(r)) : who(r.account)) || '—';
+  return `<span class="request-account" title="${esc(label)}">${esc(label)}</span>${why || session ? `<span class="request-detail">${[why, session].filter(Boolean).join(' · ')}</span>` : ''}`;
 }
 
 function requestSessionHTML(r) {
@@ -670,9 +675,9 @@ function requestSessionHTML(r) {
   const source = SESSION_SOURCE[r.session_source] || (r.session_source ? `the client’s ${r.session_source}` : 'the client');
   const title = `Session fingerprint: ${r.session_id}\nIdentified by ${source}. Click to show this session’s requests.`;
   const session = r.session_id
-    ? `<button class="linkbtn mono session-link" data-act="filter-session" data-id="${esc(r.session_id)}" title="${esc(title)}" aria-label="Show requests for session ${esc(r.session_id.slice(0, 10))}">${esc(r.session_id.slice(0, 10))}</button>`
-    : '<span class="dim" title="No session identity recorded">—</span>';
-  return `${session}${warning ? `<span class="request-detail warn" title="${esc(warning[1])}">${esc(warning[0])}</span>` : ''}`;
+    ? `<button class="linkbtn mono session-link" data-act="filter-session" data-id="${esc(r.session_id)}" title="${esc(title)}" aria-label="Show requests for session ${esc(r.session_id.slice(0, 8))}">${esc(r.session_id.slice(0, 8))}</button>`
+    : '';
+  return [session, warning ? `<span class="warn" title="${esc(warning[1])}">${esc(warning[0])}</span>` : ''].filter(Boolean).join(' · ');
 }
 
 function requestTokensHTML(r, field) {
@@ -691,7 +696,6 @@ function requestRowHTML(r, lit = false, full = true) {
     <td>${routeHTML(r, full)}</td>
     <td><span class="model mono">${esc(r.model)}</span>${err}</td>
     <td>${requestAccountHTML(r)}</td>
-    <td>${requestSessionHTML(r)}</td>
     <td class="mono ${codeClass(r.status)}">${status}</td>
     ${full ? `<td class="r mono hide-sm">${ms(r.ttft_ms)}</td>` : ''}
     <td class="r mono">${ms(r.latency_ms)}</td>
@@ -707,7 +711,7 @@ function recentHTML(lit = false) {
     return `<div class="empty"><h3>No requests yet</h3><p>Point a client at the endpoint above and requests will show up here as they happen.</p></div>`;
   }
   return `<div class="table-wrap"><table>
-    <thead><tr><th>Time</th><th>Route</th><th>Model</th><th>Account</th><th>Session</th><th>Status</th><th class="r">Latency</th><th class="r">In</th><th class="r">Out</th><th class="r">Cached</th></tr></thead>
+    <thead><tr><th>Time</th><th>Route</th><th>Model</th><th>Account</th><th>Status</th><th class="r">Latency</th><th class="r">In</th><th class="r">Out</th><th class="r">Cached</th></tr></thead>
     <tbody>${rows.map((r, i) => requestRowHTML(r, lit && i === 0, false)).join('')}</tbody></table></div>`;
 }
 
@@ -1076,7 +1080,7 @@ function requestsHTML() {
     </div>
     <p class="note" style="margin:-8px 0 12px" id="req-count">${reqCountHTML()}</p>
     <div class="table-wrap"><table>
-      <thead><tr><th>Time</th><th>Route</th><th>Model</th><th>Account</th><th>Session</th><th>Status</th><th class="r hide-sm">First token</th><th class="r">Total</th><th class="r">In</th><th class="r">Out</th><th class="r">Cached</th></tr></thead>
+      <thead><tr><th>Time</th><th>Route</th><th>Model</th><th>Account</th><th>Status</th><th class="r hide-sm">First token</th><th class="r">Total</th><th class="r">In</th><th class="r">Out</th><th class="r">Cached</th></tr></thead>
       <tbody id="req-body">${rows.map((r) => requestRowHTML(r)).join('')}</tbody>
     </table></div>
     ${rows.length ? '' : requestEmptyHTML()}`;

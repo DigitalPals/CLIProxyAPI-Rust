@@ -201,8 +201,8 @@ td .route .logo, .btn .logo, .seg .logo { width: 14px; height: 14px; }
 
 .table-wrap { overflow-x: auto; border-top: 1px solid var(--line); }
 table { width: 100%; border-collapse: collapse; }
-th { position: sticky; top: 0; background: var(--bg); text-align: left; color: var(--fg-3); font-size: 12px; font-weight: 500; padding: 10px 12px; border-bottom: 1px solid var(--line); white-space: nowrap; }
-td { padding: 10px 12px; border-bottom: 1px solid var(--line); white-space: nowrap; color: var(--fg-2); font-size: 13px; vertical-align: baseline; }
+th { position: sticky; top: 0; background: var(--bg); text-align: left; color: var(--fg-3); font-size: 12px; font-weight: 500; padding: 10px; border-bottom: 1px solid var(--line); white-space: nowrap; }
+td { padding: 10px; border-bottom: 1px solid var(--line); white-space: nowrap; color: var(--fg-2); font-size: 13px; vertical-align: baseline; }
 th:first-child, td:first-child { padding-left: 4px; }
 th.r, td.r { text-align: right; }
 tbody tr { transition: background .15s; }
@@ -210,10 +210,11 @@ tbody tr:hover { background: var(--row-hover); }
 td .route { display: inline-flex; align-items: center; gap: 6px; color: var(--fg-2); }
 td .route .arrow { color: var(--fg-3); }
 td .model { color: var(--fg); }
-td .request-account { display: block; }
+td .request-account { display: block; max-width: 210px; overflow: hidden; text-overflow: ellipsis; }
 td .request-detail { display: block; margin-top: 2px; color: var(--fg-3); font-size: 11.5px; }
-td .request-detail.warn { color: var(--warn); }
-td .session-link { font-size: 12px; }
+td .request-detail .warn { color: var(--warn); }
+td .session-link { font-size: 11.5px; color: var(--fg-3); }
+td .session-link:hover { color: var(--fg); }
 td .errline { display: -webkit-box; -webkit-box-orient: vertical; -webkit-line-clamp: 2; line-clamp: 2; overflow: hidden; white-space: normal; max-width: 420px; margin-top: 3px; color: var(--err); font-size: 12px; }
 td .route .tag { margin-left: 4px; }
 td .tag { display: inline-block; padding: 0 6px; border: 1px solid var(--line-strong); border-radius: 5px; color: var(--fg-3); font-size: 11.5px; line-height: 18px; }
