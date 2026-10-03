@@ -316,7 +316,7 @@ textarea.mono { resize: vertical; min-height: 120px; }
 .cfg-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 20px 24px; }
 .cfg-grid .wide { grid-column: 1 / -1; }
 .cfg-content .field > label { display: flex; align-items: center; gap: 8px; color: var(--fg-2); font-size: 12.5px; font-weight: 500; }
-.cfg-badge { color: var(--fg-3); font-size: 11px; font-weight: 400; white-space: nowrap; }
+.cfg-badge { color: var(--fg-3); font-size: 12px; font-weight: 400; white-space: nowrap; }
 .cfg-divider { border-top: 1px solid var(--line); margin: 28px 0; }
 .cfg-toggle { display: flex; justify-content: space-between; align-items: center; gap: 24px; padding: 12px 0; }
 .cfg-toggle > div { display: flex; flex-direction: column; gap: 4px; }
@@ -381,7 +381,7 @@ details[open] > summary > .cfg-chevron { transform: rotate(90deg); }
   .cfg-fork { grid-column: 1 / -1; grid-row: auto; }
   .cfg-foot { flex-wrap: wrap; gap: 8px; }
   .cfg-foot .msg { width: 100%; }
-  .cfg-content h2 { font-size: 16px; }
+  .cfg-content h2 { font-size: 15px; }
 }
 
 /* lock */
@@ -456,17 +456,17 @@ details[open] > summary > .cfg-chevron { transform: rotate(90deg); }
 }
 
 /* Banked subscription resets */
-.reset-badge { display: inline-flex; align-items: center; gap: 5px; flex: none; min-height: 24px; padding: 1px 7px; border: 1px solid #60a5fa40; border-radius: 20px; background: #60a5fa0d; color: #93c5fd; font: 500 11.5px/1.5 var(--font); white-space: nowrap; cursor: pointer; transition: color .15s, border-color .15s, background .15s; }
+.reset-badge { display: inline-flex; align-items: center; gap: 5px; flex: none; min-height: 22px; padding: 0 7px; border: 1px solid var(--line-strong); border-radius: 6px; background: transparent; color: var(--fg-2); font: 500 11.5px/1.5 var(--font); white-space: nowrap; cursor: pointer; transition: color .15s, border-color .15s, background .15s; }
 .reset-badge svg { width: 12px; height: 12px; flex: none; }
-.reset-badge:hover { color: #bfdbfe; border-color: #60a5fa80; background: #60a5fa1a; }
-.reset-badge:focus-visible { outline: 2px solid #93c5fd; outline-offset: 3px; border-radius: 20px; }
-.reset-badge.warn { color: var(--warn); border-color: #fbbf2440; background: #fbbf240d; }
-.reset-badge.warn:hover { border-color: #fbbf2480; background: #fbbf241a; }
+.reset-badge:hover { color: var(--fg); border-color: #3a3a3f; background: var(--raise-hover); }
+.reset-badge:focus-visible { outline-offset: 2px; border-radius: 6px; }
+.reset-badge.warn { color: var(--warn); border-color: #fbbf2459; }
+.reset-badge.warn:hover { border-color: #fbbf2499; background: var(--raise-hover); }
 .reset-expiry-dot { width: 5px; height: 5px; border-radius: 50%; background: var(--warn); flex: none; }
 .reset-modal { width: min(480px, calc(100vw - 32px)); max-height: calc(100dvh - 32px); margin: auto; padding: 0; border: 1px solid var(--line-strong); border-radius: 12px; background: var(--raise); color: var(--fg-2); overflow: auto; font-size: 13px; box-shadow: 0 24px 80px #0009; }
 .reset-modal::backdrop { background: #000b; }
 .reset-modal-head { display: flex; justify-content: space-between; align-items: flex-start; gap: 16px; padding: 20px 20px 0; }
-.reset-modal h2 { margin: 0; color: var(--fg); font-size: 18px; font-weight: 600; }
+.reset-modal h2 { margin: 0; color: var(--fg); font-size: 17px; font-weight: 600; }
 .reset-modal-head p { margin: 4px 0 0; color: var(--fg-3); font-size: 12px; overflow-wrap: anywhere; }
 .reset-close { font-size: 22px; line-height: 1; }
 .reset-modal-body { padding: 18px 20px; overflow-wrap: anywhere; }
