@@ -22,7 +22,9 @@ const S = {
   snippet: localStorage.getItem('cliproxyapi-rust.snippet') || 'claude',
   setup: localStorage.getItem('cliproxyapi-rust.setup'), // 'open' | 'closed' | null (auto)
   confirm: null,
-  config: { text: null, saved: null, path: '', msg: null, busy: false },
+  config: { values: null, saved: null, defaults: {}, revision: '', path: '', ignored: [], restart_fields: [],
+    msg: null, busy: false, loading: false, section: 'server', provider: 'claude', oauthProvider: 'claude',
+    errors: {}, opens: {}, secrets: {}, reloadConfirm: false },
 };
 
 const PROVIDER = {
@@ -746,79 +748,6 @@ function bindRequests() {
   });
 }
 
-// config ----------------------------------------------------------------
-
-function configHTML() {
-  const c = S.config;
-  if (c.text == null) {
-    loadConfig();
-    return skeletonHTML();
-  }
-  const dirty = c.text !== c.saved;
-  return `
-    <div class="page-head"><div><h1>Configuration</h1><p class="mono">${esc(c.path)}</p></div></div>
-    <label class="sr-only" for="cfg">config.yaml</label>
-    <textarea id="cfg" class="editor" spellcheck="false" autocapitalize="off" autocomplete="off">${esc(c.text)}</textarea>
-    <div class="editor-foot">
-      <button class="btn primary" data-act="save-config" ${dirty && !c.busy ? '' : 'disabled'}>${c.busy ? 'Saving…' : 'Save changes'}</button>
-      <button class="btn ghost" data-act="revert-config" ${dirty ? '' : 'disabled'}>Revert</button>
-      <p class="msg ${c.msg ? c.msg.kind : ''}" id="cfg-msg" aria-live="polite">${c.msg ? esc(c.msg.text) : '<span class="dim">Saved changes apply immediately. Changing host or port needs a restart.</span>'}</p>
-    </div>`;
-}
-
-async function loadConfig() {
-  try {
-    const r = await api('/config');
-    Object.assign(S.config, { text: r.text, saved: r.text, path: r.path, msg: null });
-    if (S.route === 'config') render();
-  } catch {}
-}
-
-function bindConfig() {
-  const ta = $('#cfg');
-  if (!ta) return;
-  const sync = () => {
-    S.config.text = ta.value;
-    const dirty = S.config.text !== S.config.saved;
-    $('[data-act="save-config"]').disabled = !dirty || S.config.busy;
-    $('[data-act="revert-config"]').disabled = !dirty;
-  };
-  ta.addEventListener('input', sync);
-  ta.addEventListener('keydown', (e) => {
-    if (e.key === 'Tab' && !e.shiftKey) {
-      e.preventDefault();
-      const { selectionStart: s, selectionEnd: en } = ta;
-      ta.setRangeText('  ', s, en, 'end');
-      sync();
-    }
-    if ((e.metaKey || e.ctrlKey) && e.key === 's') {
-      e.preventDefault();
-      saveConfig();
-    }
-  });
-}
-
-async function saveConfig() {
-  const c = S.config;
-  if (c.busy || c.text === c.saved) return;
-  c.busy = true;
-  const ta = $('#cfg');
-  const pos = ta ? [ta.selectionStart, ta.scrollTop] : null;
-  render();
-  try {
-    const r = await api('/config', { method: 'PUT', body: JSON.stringify({ text: c.text }) });
-    c.saved = c.text;
-    c.msg = { kind: 'ok', text: r.restart_required ? 'Saved. Restart CLIProxyAPI-Rust to apply the new host or port.' : 'Saved and applied.' };
-    refreshAccounts();
-  } catch (e) {
-    c.msg = { kind: 'err', text: e.message };
-  }
-  c.busy = false;
-  render();
-  const ta2 = $('#cfg');
-  if (ta2 && pos) { ta2.focus(); ta2.selectionStart = ta2.selectionEnd = pos[0]; ta2.scrollTop = pos[1]; }
-}
-
 // lock ------------------------------------------------------------------
 
 function lockHTML() {
@@ -1036,10 +965,7 @@ document.addEventListener('click', (e) => {
       S.paused = !S.paused;
       return render();
     case 'save-config': return saveConfig();
-    case 'revert-config':
-      S.config.text = S.config.saved;
-      S.config.msg = null;
-      return render();
+    case 'revert-config': return discardConfig();
   }
 });
 
@@ -1099,7 +1025,7 @@ setInterval(async () => {
 }, 60000);
 
 window.addEventListener('beforeunload', (e) => {
-  if (S.config.text != null && S.config.text !== S.config.saved) e.preventDefault();
+  if (configDirty()) e.preventDefault();
 });
 
 async function boot() {

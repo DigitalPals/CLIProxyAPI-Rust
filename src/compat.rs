@@ -32,7 +32,7 @@ const GROUPS: &[(&str, &str)] = &[
     ("meta", "meta-api-key"),
 ];
 
-const SHARED: &[&str] = &["base-url", "proxy-url", "headers", "models", "excluded-models", "prefix"];
+const SHARED: &[&str] = &["base-url", "proxy-url", "headers", "models", "excluded-models", "prefix", "label"];
 
 /// A v8 group (`{name, base-url, ..., keys: [{api-key, ...}]}`) as flat key entries.
 fn flatten_group(group: &Mapping) -> Vec<Yaml> {

@@ -291,6 +291,7 @@ pub fn router(app: Arc<App>) -> Router<Arc<App>> {
         .route("/requests", get(requests))
         .route("/models", get(models))
         .route("/config", get(get_config).put(put_config))
+        .route("/config/settings", get(get_settings).patch(patch_settings))
         .route("/login/{target}", post(login_start).get(login_status))
         .route("/login/{target}/code", post(login_code))
         .route("/live", get(live))
@@ -553,7 +554,11 @@ async fn import_vertex(State(app): State<Arc<App>>, Json(b): Json<VertexBody>) -
 /// Applies an edit to the config file's YAML tree, keeping every setting this
 /// binary doesn't know about (so the file still works with CLIProxyAPI).
 fn edit_config(app: &Arc<App>, edit: impl FnOnce(&mut serde_yaml::Value)) -> Response {
-    let text = std::fs::read_to_string(&app.cfg_path).unwrap_or_default();
+    let _guard = app.config_write.lock();
+    let text = match std::fs::read_to_string(&app.cfg_path) {
+        Ok(text) => text,
+        Err(e) => return err(StatusCode::INTERNAL_SERVER_ERROR, format!("Could not read config: {e}")),
+    };
     let mut doc: serde_yaml::Value = match serde_yaml::from_str(&text) {
         Ok(serde_yaml::Value::Null) | Err(_) if text.trim().is_empty() => {
             serde_yaml::Value::Mapping(Default::default())
@@ -561,20 +566,16 @@ fn edit_config(app: &Arc<App>, edit: impl FnOnce(&mut serde_yaml::Value)) -> Res
         Ok(v) => v,
         Err(e) => return err(StatusCode::BAD_REQUEST, format!("config.yaml doesn't parse: {e}")),
     };
+    let original = doc.clone();
     edit(&mut doc);
-    let out = match serde_yaml::to_string(&doc) {
+    let out = match crate::config_editor::preserve(&text, &original, &doc) {
         Ok(t) => t,
-        Err(e) => return err(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
+        Err(e) => return err(StatusCode::BAD_REQUEST, e.to_string()),
     };
     let cfg = match Config::parse(&out) {
         Ok(c) => c,
         Err(e) => return err(StatusCode::INTERNAL_SERVER_ERROR, format!("{e:#}")),
     };
-    // Rewriting drops YAML comments; keep the original once.
-    let backup = app.cfg_path.with_extension("yaml.bak");
-    if text.contains('#') && !backup.exists() {
-        let _ = std::fs::write(&backup, &text);
-    }
     if let Err(e) = std::fs::write(&app.cfg_path, out) {
         return err(StatusCode::INTERNAL_SERVER_ERROR, e.to_string());
     }
@@ -593,17 +594,82 @@ struct ConfigBody {
 }
 
 async fn put_config(State(app): State<Arc<App>>, Json(b): Json<ConfigBody>) -> Response {
+    let _guard = app.config_write.lock();
     let cfg = match Config::parse(&b.text) {
         Ok(c) => c,
         Err(e) => return err(StatusCode::BAD_REQUEST, format!("{e:#}")),
     };
-    let old = app.cfg();
     if let Err(e) = std::fs::write(&app.cfg_path, &b.text) {
         return err(StatusCode::INTERNAL_SERVER_ERROR, e.to_string());
     }
-    let restart = cfg.host != old.host || cfg.port != old.port;
+    let restart = !crate::config_editor::restart_fields(&app.startup_config, &cfg).is_empty();
     app.set_config(cfg);
     Json(json!({ "ok": true, "restart_required": restart })).into_response()
+}
+
+fn settings_response(app: &Arc<App>, text: &str) -> anyhow::Result<Value> {
+    let cfg = Config::parse(text)?;
+    let restart = crate::config_editor::restart_fields(&app.startup_config, &cfg);
+    Ok(json!({
+        "values": crate::config_editor::values(text)?,
+        "defaults": crate::config_editor::values("")?,
+        "revision": crate::config_editor::revision(text),
+        "path": app.cfg_path.display().to_string(),
+        "ignored": cfg.ignored,
+        "restart_fields": restart,
+        "restart_required": !restart.is_empty(),
+    }))
+}
+
+async fn get_settings(State(app): State<Arc<App>>) -> Response {
+    let _guard = app.config_write.lock();
+    let text = match std::fs::read_to_string(&app.cfg_path) {
+        Ok(text) => text,
+        Err(e) => return err(StatusCode::INTERNAL_SERVER_ERROR, format!("Could not read config: {e}")),
+    };
+    match settings_response(&app, &text) {
+        Ok(body) => Json(body).into_response(),
+        Err(e) => err(StatusCode::BAD_REQUEST, format!("{e:#}")),
+    }
+}
+
+#[derive(Deserialize)]
+struct SettingsBody {
+    revision: String,
+    changes: serde_json::Map<String, Value>,
+}
+
+async fn patch_settings(State(app): State<Arc<App>>, Json(body): Json<SettingsBody>) -> Response {
+    let _guard = app.config_write.lock();
+    let text = match std::fs::read_to_string(&app.cfg_path) {
+        Ok(text) => text,
+        Err(e) => return err(StatusCode::INTERNAL_SERVER_ERROR, format!("Could not read config: {e}")),
+    };
+    if body.revision != crate::config_editor::revision(&text) {
+        return err(
+            StatusCode::CONFLICT,
+            "The config changed since you opened it. Reload the latest settings before saving.",
+        );
+    }
+    let (out, cfg) = match crate::config_editor::apply(&text, &body.changes) {
+        Ok(result) => result,
+        Err(e) => return err(StatusCode::BAD_REQUEST, format!("{e:#}")),
+    };
+    let response = match settings_response(&app, &out) {
+        Ok(body) => body,
+        Err(e) => return err(StatusCode::BAD_REQUEST, format!("{e:#}")),
+    };
+    // Also catch external file changes made while validation was running.
+    if std::fs::read_to_string(&app.cfg_path).ok().as_deref() != Some(&text) {
+        return err(StatusCode::CONFLICT, "The config changed while saving. Reload the latest settings before saving.");
+    }
+    if out != text {
+        if let Err(e) = std::fs::write(&app.cfg_path, &out) {
+            return err(StatusCode::INTERNAL_SERVER_ERROR, format!("Could not save config: {e}"));
+        }
+        app.set_config(cfg);
+    }
+    Json(response).into_response()
 }
 
 async fn login_start(State(app): State<Arc<App>>, Path(target): Path<String>) -> Response {
@@ -673,6 +739,60 @@ async fn live(State(app): State<Arc<App>>, ws: WebSocketUpgrade) -> Response {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn structured_saves_validate_and_reject_stale_edits() {
+        let dir = std::env::temp_dir().join(format!("cliproxyapi-settings-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("config.yaml");
+        let original = format!("# Keep this comment\nport: 8317 # port note\nauth-dir: {}\n", dir.display());
+        std::fs::write(&path, &original).unwrap();
+        let app = App::new(Config::parse(&original).unwrap(), path.clone());
+        let version = crate::config_editor::revision(&original);
+        let response = patch_settings(
+            State(app.clone()),
+            Json(SettingsBody {
+                revision: version.clone(),
+                changes: json!({"port": 70000}).as_object().unwrap().clone(),
+            }),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), original);
+        let response = patch_settings(
+            State(app.clone()),
+            Json(SettingsBody {
+                revision: version.clone(),
+                changes: json!({"port": 9000}).as_object().unwrap().clone(),
+            }),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let saved = std::fs::read_to_string(&path).unwrap();
+        assert!(saved.contains("# Keep this comment"));
+        assert!(saved.contains("# port note"));
+        let response = patch_settings(
+            State(app.clone()),
+            Json(SettingsBody { revision: version, changes: json!({"request-retry": 4}).as_object().unwrap().clone() }),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::CONFLICT);
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), saved);
+        let response = patch_settings(
+            State(app.clone()),
+            Json(SettingsBody {
+                revision: crate::config_editor::revision(&saved),
+                changes: json!({"request-retry": 4}).as_object().unwrap().clone(),
+            }),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let response: Value =
+            serde_json::from_slice(&axum::body::to_bytes(response.into_body(), 1 << 20).await.unwrap()).unwrap();
+        assert_eq!(response["restart_fields"], json!(["port"]));
+        assert_eq!(response["values"]["request-retry"], json!(4));
+        std::fs::remove_dir_all(dir).unwrap();
+    }
 
     #[test]
     fn bcrypt_management_keys() {

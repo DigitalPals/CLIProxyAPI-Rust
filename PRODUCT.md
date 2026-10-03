@@ -23,7 +23,7 @@ A lean rewrite of CLIProxyAPI (Go): one binary, no runtime, an embedded dashboar
 - Clients: Claude Code (`ANTHROPIC_BASE_URL`), Codex (`config.toml` provider, websocket transport), OpenAI SDKs, Gemini clients.
 - Accounts are added with `cliproxyapi-rust login claude|codex`, from the dashboard, or as API keys in `config.yaml`.
 - OAuth redirects go to fixed localhost ports (54545 Claude, 1455 Codex, 51121 Antigravity; Devin uses any free port). On a remote server the user pastes the redirect URL back into the dashboard. Grok, Kimi and Meta use device codes, which need no redirect. Vertex takes a pasted service account key.
-- Config hot-reloads; the dashboard edits the same `config.yaml`.
+- Config hot-reloads; the dashboard's GUI settings editor updates the same `config.yaml`, retaining its layout, comments, and compatibility fields. Bind address, port, HTTPS, and debug logging changes need a restart.
 
 ## Capabilities and Constraints
 
