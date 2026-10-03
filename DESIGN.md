@@ -127,11 +127,13 @@ One system sans family for all UI; monospace only for real code and data (endpoi
 
 Single column, max width 1180px, 32px side padding (16px on mobile). Sticky 56px top bar with tabs and the privacy toggle; a red "Reconnecting" appears beside it only while the live connection is down (the brand mark gives way to the tabs under 480px). More space above a section title (32–40px) than below it (12px).
 
-Overview, top to bottom: a one-line endpoint strip (endpoint, key, model count, and a "Set up a client" disclosure that expands the client snippets; open until the first request, then remembered), traffic, accounts at full width, latest requests. The accounts table gives subscription limits their own columns (5-hour, weekly) so several subscriptions compare at a glance; accounts that report limits come first. On phones each row stacks: name and status, then the two meters side by side with inline labels.
+Overview, top to bottom: a one-line endpoint strip (endpoint, key, model count, and a "Set up a client" disclosure that expands the client snippets; open until the first request, then remembered), traffic, accounts at full width, latest requests. The accounts table gives subscription limits their own columns (5-hour, weekly) so several subscriptions compare at a glance; accounts that report limits come first. A Used / Remaining switch beside the section title flips every meter between the share used and the share left (remembered per browser, synced across tabs). On phones each row stacks: name and status, then the two meters side by side with inline labels ("5h used", "Week left").
+
+Config: a section list on the left (Server, Access, Routing, Connections, Providers, Models, Diagnostics, YAML file) beside one form at a time, with Save and Discard in a footer shared by every section. Fields sit in a two-column grid that collapses to one on phones; settings that need a restart carry a "Needs restart" note. YAML file is the whole config.yaml in the monospace editor, for anything the forms don't cover; form drafts and file drafts never stack.
 
 ## Elevation & Depth
 
-Flat. Depth comes only from `raise` surfaces and 1px `line` hairlines. No shadows on the page; the one floating element (copy feedback) uses a soft offset shadow.
+Flat. Depth comes only from `raise` surfaces and 1px `line` hairlines. No shadows on the page; the floating elements (copy feedback, the reset panel dialog over a dimmed `#000b` backdrop) use a soft offset shadow.
 
 ## Shapes
 
@@ -143,8 +145,9 @@ Flat. Depth comes only from `raise` surfaces and 1px `line` hairlines. No shadow
 - Tables: 12px fg-3 headers, 40px rows, 1px line separators, row hover `#070707`.
 - Status: dot + word ("Ready", "Cooling 4:12", "Disabled", "Error").
 - Provider logos: an inline SVG sprite (`ui/logos.svg`, from LobeHub Icons, MIT) used through `<use>`; 18px beside account names, 14px in routes, buttons and the segmented control, 20px in the sign-in picker. OpenAI-compatible groups get their vendor's logo when the group name gives it away (OpenRouter, Ollama, LM Studio, DeepSeek, Groq, Mistral, Qwen, Kimi), otherwise the generic mark. xAI API keys show the xAI mark; Grok sign-ins show Grok.
-- Privacy toggle: a 30px ghost icon button (eye / eye-off) at the right end of the bar, pressed state on `#18181b`, remembered per browser. When on, emails read `••••••@••••••`, key ends `••••…••••`, the client key `••••••••`, sign-ins without an email are hidden whole, home folders read `~`, and the config editor waits behind "Show config". Copy buttons still copy the real value.
-- Usage meters: 6px track (`meter-track`, 3px radius) with the used share in `fg-2`, `warn` from 75% and `err` from 95%; the percentage in `fg` with tabular numbers to the right, and "Resets in 2h 14m" in `fg-3` underneath. Meters for one window share a column.
+- Privacy toggle: a 30px ghost icon button (eye / eye-off) at the right end of the bar, pressed state on `#18181b`, remembered per browser. When on, emails read `••••••@••••••`, key ends `••••…••••`, the client key `••••••••`, sign-ins without an email are hidden whole, home folders read `~`, and the YAML file section waits behind "Show file"; secret fields in the settings forms stay masked. Copy buttons still copy the real value.
+- Usage meters: 6px track (`meter-track`, 3px radius) with the shown share (used or left) in `fg-2`; `warn` once a window is 75% used and `err` from 95%, in either mode, and a used-up window keeps a 1px `err` outline. Whole percentages in `fg` with tabular numbers to the right ("<1%" and ">99%" at the ends), "used" or "left" in the column heading, and "Resets in 2h 14m" in `fg-3` underneath. Meters for one window share a column; accounts without subscription limits leave the columns empty, and subscriptions that haven't reported yet show a dash.
+- Banked reset badge (only with `banked-resets` on): a 22px outline tag beside the account name (`line-strong` border, 6px radius, `fg-2`, refresh icon, "2 resets"), amber when an earlier request needs review, with a 5px amber dot when a reset expires within a day. It opens a native dialog panel (`raise`, 12px radius) listing grants, with Refresh and a single primary "Use 1 reset" that leads to a separate confirmation.
 - Live rows: a new request row lights up at full white and settles to its resting luminance over 1.8s (the one authored motion; disabled for reduced motion).
 
 ## Do's and Don'ts
