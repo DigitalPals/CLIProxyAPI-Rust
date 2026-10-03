@@ -105,7 +105,8 @@ cliproxyapi-rust --config config.yaml check
 | Client keys, management key (plain or bcrypt-hashed), `allow-remote`, TLS, proxy, routing strategy, retries | Used as is |
 | API keys for Claude, Codex, Gemini, Vertex, xAI, Meta and OpenAI-compatible providers | Used with their `base-url`, `proxy-url` (including `direct`), `headers`, model aliases, `prefix` and `excluded-models` |
 | `oauth-model-alias`, `oauth-excluded-models`, per-file `prefix` and `model_aliases` | Used as is |
-| Payload rules, plugins, Redis usage queue, weighted routing, session affinity, the `/v0/management` API | Not supported. The built-in dashboard replaces the separate management panel. |
+| Session affinity (`routing.session-affinity` or `session-affinity`) | Supported; enabled by default for all three routing strategies. |
+| Payload rules, plugins, Redis usage queue, weighted routing, the `/v0/management` API | Not supported. The built-in dashboard replaces the separate management panel. |
 
 Changes made from the dashboard keep your file's layout, YAML comments, and settings this binary doesn't use, so you can switch back at any time. The rare layout that can't be edited in place, such as lists written without indentation, is rewritten instead, and the original is kept as `config.yaml.bak`.
 
@@ -254,7 +255,9 @@ api-keys: ["sk-pick-anything"] # keys your clients must send; empty = open
 management-key: ""            # empty = dashboard only from localhost
 proxy-url: ""                 # optional http://, https:// or socks5:// upstream proxy
 request-retry: 3              # accounts to try before giving up
-routing: least-used           # most quota left first; or round-robin, fill-first
+routing: least-used           # new sessions: most quota left; or round-robin, fill-first
+session-affinity: true        # keep each session on its subscription until quota is exhausted
+session-affinity-idle-seconds: 86400 # forget assignments after a day without requests
 codex-websockets: true        # native WebSocket relay to ChatGPT
 claude-cloak: true            # present non-Claude-Code clients as Claude Code on OAuth accounts
 banked-resets: false          # show and spend banked Claude/ChatGPT limit resets (unofficial endpoints)
@@ -285,6 +288,75 @@ openai-compatibility:
     models:
       - name: "qwen3-coder:30b"
 ```
+
+### Coding sessions and prompt caching
+
+Session affinity is enabled by default. `least-used`, `round-robin` and `fill-first`
+choose an account for a new session; subsequent requests stay on that account.
+Quota changes, routing changes and the recovery of another account do not move an
+active session. Confirmed subscription exhaustion moves the session to an available
+account using the selected strategy, and that replacement stays assigned.
+
+The proxy reads session identifiers from the original request, before translating
+it: `x-cliproxy-session-id`, Codex `thread-id`/`session_id`/`session-id`, Claude
+`x-claude-code-session-id` or `metadata.user_id` session metadata (JSON and the older
+`user_…_account_…_session_…` form), `metadata.session_id`/`metadata.thread_id`, a
+Responses `conversation` id, or `prompt_cache_key`. Different client API keys have
+separate session namespaces. For another client, send a unique, stable
+`x-cliproxy-session-id` for the entire task. Do not use a per-request id or reuse one
+id for unrelated tasks. HTTP requests without session metadata retain per-request
+routing; Responses continuations can also recover the assignment through a known
+`previous_response_id`. WebSockets without metadata remain pinned for that connection.
+
+HTTP, WebSocket fallback, native Codex WebSockets and `/v1/responses/compact` share
+the assignments. Changes between models of the same provider retain the account
+when it supports the requested model. An explicit provider or account prefix creates
+a separate routing scope. A removed, disabled or incompatible assigned account
+returns an error instead of silently changing subscriptions.
+
+Burst rate limits, network failures and server errors preserve the subscription;
+failed retries return an error so the client can retry later. Expired OAuth access
+tokens refresh on the same subscription. A bare 429 is not proof of exhausted quota:
+migration requires an exhausted usage window or an explicit provider quota error.
+Quota errors reported inside a response stream affect the next call; the proxy does
+not restart an answer that has already begun streaming.
+
+Assignments are atomically saved to `.routing-sessions.state` in `auth-dir`, so they
+survive proxy restarts and normal config reloads. The file contains hashed session
+identifiers and account ids, with owner-only permissions on Unix. Mount `auth-dir`
+persistently when using Docker. Run one proxy process per auth directory; the file
+is not a distributed registry. Assignments expire after the configured idle interval;
+in-flight requests and streams keep their assignments alive. Send
+`x-cliproxy-session-end: true` on a final HTTP generation request to release its
+assignment after the response finishes.
+
+Responses conversation history is kept in a bounded memory cache (64 MiB total,
+8 MiB per conversation, up to 1,000 recent responses). On reconnect or quota
+migration, the proxy replays full available input instead of forwarding a response
+id from another upstream connection. Conversation history is not saved to disk:
+after a proxy restart or history eviction, Codex continuations must resend full input
+without `previous_response_id`. Public API backends can still resolve their own
+stored response ids. Affinity avoids subscription churn; provider cache expiry and
+cache routing still determine whether individual requests get a cache hit.
+
+The request dashboard shows a client-scoped session fingerprint, the account's
+assignment reason, and cached input tokens. Click a fingerprint to see that
+session's requests. Separate agent threads have separate fingerprints. The API
+and structured request logs also expose the identifier source, routing strategy,
+and attempted accounts, including the previous account after quota exhaustion;
+raw session identifiers and client keys are not logged.
+
+Requests without a stable identifier are marked **No session ID**. Connection-only
+WebSocket assignments and in-memory response-id continuations are labelled as
+such, and disabled affinity is visible per request. These notices do not reject
+requests or change account selection. A closed request with no reported usage
+shows a dash instead of implying that it consumed zero tokens.
+
+Compatible OpenAI cache controls and supported content breakpoints are preserved
+between Chat Completions and Responses. Cache settings that cannot be represented
+in the destination format produce a clear error instead of silently losing their
+meaning. Claude compatibility rewriting preserves the caller's cache markers and
+their TTL ordering.
 
 ### Running it on a server
 

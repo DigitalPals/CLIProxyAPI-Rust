@@ -396,6 +396,7 @@ async fn overview(State(app): State<Arc<App>>) -> Json<Value> {
         "client_keys": cfg.api_keys,
         "routing": cfg.routing,
         "banked_resets": cfg.banked_resets,
+        "session_affinity": cfg.session_affinity,
         "management_key": !cfg.management_key.is_empty(),
         "totals": *app.stats.totals.lock(),
         "active": app.stats.active.load(Ordering::Relaxed),
@@ -458,6 +459,7 @@ async fn reset_account(State(app): State<Arc<App>>, Path(id): Path<String>) -> R
     let mut st = acct.state.lock();
     st.cooldowns.clear();
     st.quota_cooldowns.clear();
+    st.exhausted.clear();
     st.strikes = 0;
     st.last_error = None;
     drop(st);

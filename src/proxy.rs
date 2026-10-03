@@ -14,7 +14,7 @@ use crate::accounts::{Account, Pick, Provider};
 use crate::formats::{self, Frame};
 use crate::ir::{self, Aggregate, Event, Format, Reasoning, Request, Usage};
 use crate::sse::SseDecoder;
-use crate::state::{App, RequestLog};
+use crate::state::{App, RequestLog, RoutingAttempt};
 use crate::upstream::{self, Target};
 
 pub type FrameStream = Pin<Box<dyn Stream<Item = Frame> + Send>>;
@@ -27,8 +27,11 @@ pub struct Call {
     pub transport: &'static str,
     /// Model from the URL (Gemini routes).
     pub path_model: Option<String>,
-    /// Prefer this account (websocket session affinity).
-    pub pinned: Option<String>,
+    /// Shared coding-session identity (inferred from the original request for HTTP).
+    pub session: Option<String>,
+    pub session_source: Option<&'static str>,
+    /// A native WebSocket selection made before falling back to this pipeline.
+    pub routing_selection: Option<crate::affinity::Selected>,
 }
 
 pub enum Reply {
@@ -63,6 +66,12 @@ impl Tracker {
                 provider: String::new(),
                 model: model.to_string(),
                 account: String::new(),
+                session_id: None,
+                session_source: None,
+                routing_strategy: app.cfg().routing,
+                routing_reason: None,
+                routing_warning: None,
+                routing_attempts: Vec::new(),
                 status: 0,
                 latency_ms: 0,
                 ttft_ms: None,
@@ -84,6 +93,44 @@ impl Tracker {
         self.acct = Some(acct.clone());
     }
 
+    pub fn session(&mut self, key: Option<&str>, source: Option<&'static str>, cfg: &crate::config::Config) {
+        self.log.session_id = key.map(String::from);
+        self.log.session_source = source;
+        self.log.routing_strategy = cfg.routing;
+        self.log.routing_warning = if !cfg.session_affinity {
+            Some("affinity_disabled")
+        } else {
+            match source {
+                None | Some("generated_response") => Some("missing_session_id"),
+                Some("websocket_connection") => Some("connection_only"),
+                Some("previous_response_id") => Some("response_id_only"),
+                _ => None,
+            }
+        };
+        if self.log.routing_warning == Some("missing_session_id") {
+            tracing::warn!(
+                request_id = self.log.id,
+                transport = self.log.transport,
+                "request has no stable session identifier; send x-cliproxy-session-id to preserve its subscription across requests"
+            );
+        }
+    }
+
+    pub fn selected(&mut self, selected: &crate::affinity::Selected) {
+        // Preserve the initial allocation and any migration even if later retries reuse it.
+        if self.log.routing_reason.is_none() || selected.reason == "quota_exhausted" {
+            self.log.routing_reason = Some(selected.reason);
+        }
+        self.log.routing_strategy = selected.strategy;
+        self.log.routing_attempts.push(RoutingAttempt {
+            account_id: selected.account.id.clone(),
+            account: selected.account.label.clone(),
+            reason: selected.reason,
+            previous_account: selected.previous_account.clone(),
+        });
+        self.attempt(&selected.account);
+    }
+
     /// Drops the tracker without recording a request.
     pub fn cancel(&mut self) {
         if !self.done {
@@ -95,6 +142,12 @@ impl Tracker {
     pub fn first_token(&mut self) {
         if self.log.ttft_ms.is_none() {
             self.log.ttft_ms = Some(self.started.elapsed().as_millis() as u64);
+        }
+    }
+
+    fn observe_quota_event(&self, data: &str) {
+        if let Some(acct) = &self.acct {
+            observe_quota_event(acct, &self.log.model, data);
         }
     }
 
@@ -112,6 +165,11 @@ impl Tracker {
         self.log.cache_tokens = cache;
         self.log.error = error.map(|e| e.chars().take(400).collect());
         if let Some(a) = &self.acct {
+            if let Some(message) = &self.log.error
+                && quota_exhausted(a, &self.log.model, status, message)
+            {
+                mark_quota_exhausted(a, &self.log.model, &reqwest::header::HeaderMap::new(), message);
+            }
             let mut st = a.state.lock();
             st.counters.requests += 1;
             if status >= 400 {
@@ -126,6 +184,13 @@ impl Tracker {
         self.app.broadcast("request", &self.log);
         tracing::info!(
             target: "cliproxyapi_rust::request",
+            request_id = self.log.id,
+            session = self.log.session_id.as_deref().unwrap_or("none"),
+            session_source = self.log.session_source.unwrap_or("none"),
+            routing_strategy = ?self.log.routing_strategy,
+            routing_reason = self.log.routing_reason.unwrap_or("unassigned"),
+            routing_warning = self.log.routing_warning.unwrap_or("none"),
+            cached_tokens = cache,
             "{} {} → {} [{}] {} {}ms in={} out={}",
             self.log.client, self.log.model, self.log.provider, self.log.account, status,
             self.log.latency_ms, input, output
@@ -227,6 +292,55 @@ fn soft_failure(
     }
 }
 
+/// A 429 is also used for burst limits. Move a pinned task only when quota
+/// headers or an explicit provider error confirm subscription exhaustion.
+pub fn quota_exhausted(acct: &Account, model: &str, status: u16, body: &str) -> bool {
+    if acct.exhausted_until(model).is_some() {
+        return true;
+    }
+    if status != 429 && status != 402 {
+        return false;
+    }
+    let b = body.to_ascii_lowercase();
+    [
+        "quota_exhausted",
+        "insufficient_quota",
+        "usage_limit_reached",
+        "usage limit reached",
+        "hit your usage limit",
+        "hit your chatgpt usage limit",
+        "reached your usage limit",
+        "weekly limit",
+        "weekly usage",
+        "credit balance is too low",
+        "credits exhausted",
+        "quota has been exhausted",
+    ]
+    .iter()
+    .any(|s| b.contains(s))
+}
+
+pub fn mark_quota_exhausted(acct: &Account, model: &str, headers: &reqwest::header::HeaderMap, body: &str) {
+    let until = acct
+        .exhausted_until(model)
+        .or_else(|| reset_after(headers, body))
+        .unwrap_or_else(|| Utc::now() + Duration::minutes(5));
+    acct.exhaust(model, until, &format!("subscription quota exhausted: {}", error_message(body)));
+}
+
+fn observe_quota_event(acct: &Account, model: &str, data: &str) {
+    let Ok(v) = serde_json::from_str::<Value>(data) else {
+        return;
+    };
+    let error = if v["response"]["error"].is_object() { &v["response"]["error"] } else { &v["error"] };
+    if error.is_object() {
+        let status = v["status"].as_u64().unwrap_or(429) as u16;
+        if quota_exhausted(acct, model, status, &error.to_string()) {
+            mark_quota_exhausted(acct, model, &reqwest::header::HeaderMap::new(), &error.to_string());
+        }
+    }
+}
+
 /// Responses backends that understand freeform `custom` tools.
 fn native_custom_tools(p: Provider) -> bool {
     matches!(p, Provider::Codex | Provider::Compat)
@@ -325,7 +439,79 @@ fn shorten_tool_names(req: &mut Request) -> HashMap<String, String> {
     map
 }
 
-pub async fn execute(app: Arc<App>, call: Call) -> Reply {
+pub async fn execute(app: Arc<App>, mut call: Call) -> Reply {
+    if let Some(identity) = crate::affinity::session_identity(&call.headers, &call.body) {
+        call.session = Some(identity.key);
+        call.session_source = Some(identity.source);
+    }
+    if call.format == Format::Responses
+        && let Some(id) = call.body["previous_response_id"].as_str()
+        && let Some((session, mut previous)) = app.sessions.previous(&call.headers, id, call.session.as_deref())
+    {
+        previous.extend(crate::affinity::input_items(&call.body));
+        call.body["input"] = Value::Array(previous);
+        call.body.as_object_mut().unwrap().remove("previous_response_id");
+        if call.session.is_none() {
+            call.session_source = Some("previous_response_id");
+        }
+        call.session = Some(session);
+    }
+    if call.format == Format::Responses && call.session.is_none() {
+        // A response id can identify subsequent turns even without client session metadata.
+        call.session = Some(crate::affinity::connection_key(&call.headers, &uuid::Uuid::new_v4().to_string()));
+        call.session_source = Some("generated_response");
+    }
+    // Public API backends may resolve ids outside our local history. Do not
+    // record an unknown continuation as though its input were complete.
+    let capture = (call.format == Format::Responses && !call.body["previous_response_id"].is_string())
+        .then(|| call.session.clone())
+        .flatten();
+    let headers = call.headers.clone();
+    let session = call.session.clone();
+    let lease = session.as_deref().map(|s| app.sessions.hold(s, app.cfg().session_affinity_idle_seconds));
+    let end_session = headers.get("x-cliproxy-session-end").is_some_and(|v| v == "true");
+    let full = capture.as_ref().map(|_| crate::affinity::input_items(&call.body)).unwrap_or_default();
+    match execute_inner(app.clone(), call).await {
+        Reply::Stream { mut frames, account } if lease.is_some() => {
+            let frames = Box::pin(async_stream::stream! {
+                use crate::formats::StreamParser;
+                let mut parser = formats::responses::Parser::default();
+                let mut aggregate = Aggregate::default();
+                let mut events = Vec::new();
+                let _lease = lease;
+                while let Some(frame) = frames.next().await {
+                    if capture.is_some() {
+                        parser.feed(&crate::sse::SseEvent { event: frame.event.as_ref().map(|e| e.to_string()), data: frame.data.clone() }, &mut events);
+                        for event in events.drain(..) { aggregate.push(&event); }
+                    }
+                    if let Some(session) = &capture
+                        && let Ok(v) = serde_json::from_str::<Value>(&frame.data)
+                        && matches!(v["type"].as_str(), Some("response.completed" | "response.incomplete"))
+                    {
+                        let mut response = v["response"].clone();
+                        crate::affinity::complete_output(&mut response, &aggregate);
+                        app.sessions.remember(&headers, session, &response, &full);
+                    }
+                    yield frame;
+                }
+                if end_session && let Some(session) = &session { app.sessions.end(session); }
+            });
+            Reply::Stream { frames, account }
+        }
+        Reply::Json(v) => {
+            if let Some(session) = capture {
+                app.sessions.remember(&headers, &session, &v, &full);
+            }
+            if end_session && let Some(session) = &session {
+                app.sessions.end(session);
+            }
+            Reply::Json(v)
+        }
+        other => other,
+    }
+}
+
+async fn execute_inner(app: Arc<App>, call: Call) -> Reply {
     let cfg = app.cfg();
     let raw_model =
         call.path_model.clone().or_else(|| call.body["model"].as_str().map(String::from)).unwrap_or_default();
@@ -336,35 +522,71 @@ pub async fn execute(app: Arc<App>, call: Call) -> Reply {
     let (only, model) = app.pool.route(&model);
     let model = app.pool.canonical(&model, only.as_ref());
     let mut tracker = Tracker::new(&app, call.format, call.stream, call.transport, &model);
+    tracker.session(call.session.as_deref(), call.session_source, &cfg);
 
     let mut parsed: Option<Request> = None;
     let mut tried: Vec<String> = Vec::new();
     let mut refreshed: Vec<String> = Vec::new();
     let mut last_error: Option<(u16, Value)> = None;
     let mut retry_same: Option<String> = None;
+    let mut pending_selection = call.routing_selection;
     // Same-account retries for blips (capacity errors, soft rate limits).
     let mut soft_tries: HashMap<String, u32> = HashMap::new();
     let attempts = cfg.request_retry.max(1) as usize;
 
     while tried.len() < attempts {
-        let pin = retry_same.take().or_else(|| call.pinned.clone());
-        let (acct, upstream_model) = match app.pool.pick(&model, &tried, cfg.routing, pin.as_deref(), only.as_ref()) {
-            Pick::Ok(a, m) => (a, m),
-            Pick::Cooling(until) => {
+        let pin = retry_same.take();
+        let picked = if cfg.session_affinity && call.session.is_some() {
+            app.sessions.pick_with_reason(&app.pool, &cfg, &model, call.session.as_deref(), &tried, only.as_ref())
+        } else {
+            match app.pool.pick(&model, &tried, cfg.routing, pin.as_deref(), only.as_ref()) {
+                Pick::Ok(a, m) => Ok(crate::affinity::Selected {
+                    reason: if pin.as_deref() == Some(a.id.as_str()) {
+                        "retry_same"
+                    } else if !cfg.session_affinity {
+                        "affinity_disabled"
+                    } else {
+                        "missing_session"
+                    },
+                    account: a,
+                    model: m,
+                    strategy: cfg.routing,
+                    previous_account: None,
+                }),
+                Pick::Cooling(until) => Err((
+                    429,
+                    format!(
+                        "all accounts for {model} are rate limited; next available in {}s",
+                        (until - Utc::now()).num_seconds().max(1)
+                    ),
+                )),
+                Pick::None => Err((404, format!("no available account serves model `{model}`"))),
+            }
+        };
+        let mut selected = match picked {
+            Ok(pair) => pair,
+            Err((status, msg)) => {
                 if let Some((s, b)) = last_error {
                     tracker.finish(s, &Usage::default(), Some(error_message(&b.to_string())));
                     return Reply::Error(s, b);
                 }
-                let msg = format!(
-                    "all accounts for {model} are rate limited; next available in {}s",
-                    (until - Utc::now()).num_seconds().max(1)
-                );
-                tracker.finish(429, &Usage::default(), Some(msg.clone()));
-                return error_reply(call.format, 429, &msg);
+                tracker.finish(status, &Usage::default(), Some(msg.clone()));
+                return error_reply(call.format, status, &msg);
             }
-            Pick::None => break,
         };
-        tracker.attempt(&acct);
+        // Native eligibility checks can assign a session before HTTP sends anything.
+        // Keep that decision when this selection merely reuses the same assignment.
+        if let Some(pending) = pending_selection.take()
+            && selected.reason == "session_reused"
+            && selected.account.id == pending.account.id
+            && matches!(pending.reason, "new_session" | "quota_exhausted")
+        {
+            selected.reason = pending.reason;
+            selected.strategy = pending.strategy;
+            selected.previous_account = pending.previous_account;
+        }
+        tracker.selected(&selected);
+        let (acct, upstream_model) = (selected.account, selected.model);
 
         if let Err(e) = crate::oauth::ensure_ready(&app, &acct).await {
             tracing::warn!(account = %acct.label, "refresh failed: {e:#}");
@@ -376,6 +598,17 @@ pub async fn execute(app: Arc<App>, call: Call) -> Reply {
 
         let quota_epoch = acct.quota_epoch();
         let provider = acct.provider;
+        if call.body["previous_response_id"].is_string()
+            && ((provider == Provider::Codex && acct.is_oauth()) || !provider.wires().contains(&Format::Responses))
+        {
+            let msg =
+                "Previous response is unavailable; resend the full conversation input without previous_response_id";
+            tracker.finish(400, &Usage::default(), Some(msg.into()));
+            return Reply::Error(
+                400,
+                json!({"error":{"message":msg,"type":"invalid_request_error","code":"previous_response_not_found","param":"previous_response_id"}}),
+            );
+        }
         let devin = provider == Provider::Devin;
         // Freeform (custom) tools only exist on OpenAI's own Responses backends.
         let custom_tools = call.format == Format::Responses
@@ -383,7 +616,7 @@ pub async fn execute(app: Arc<App>, call: Call) -> Reply {
         let passthrough = provider.wires().contains(&call.format) && (!custom_tools || native_custom_tools(provider));
         let native = if passthrough { call.format } else { provider.wires().first().copied().unwrap_or(Format::Chat) };
         let mut names = HashMap::new();
-        let body = if passthrough {
+        let mut body = if passthrough {
             let mut b = call.body.clone();
             if let Some(r) = &suffix {
                 apply_native_reasoning(native, &mut b, r, &upstream_model);
@@ -428,6 +661,11 @@ pub async fn execute(app: Arc<App>, call: Call) -> Reply {
                 Format::Chat => formats::chat::build_request(&req, &upstream_model),
             }
         };
+        if !passthrough && let Err(message) = formats::preserve_cache_hints(call.format, native, &call.body, &mut body)
+        {
+            tracker.finish(400, &Usage::default(), Some(message.clone()));
+            return error_reply(call.format, 400, &message);
+        }
 
         // Upstream streaming: always when translating (we re-render), and for Codex OAuth.
         let upstream_stream = !passthrough || call.stream || (provider == Provider::Codex && acct.is_oauth());
@@ -487,6 +725,13 @@ pub async fn execute(app: Arc<App>, call: Call) -> Reply {
             } else {
                 formats::error_body(call.format, status, &msg)
             };
+            if quota_exhausted(&acct, &model, status, &text) {
+                mark_quota_exhausted(&acct, &model, &headers, &text);
+                app.broadcast("accounts", Value::Null);
+                tried.push(acct.id.clone());
+                last_error = Some((status, client_body));
+                continue;
+            }
             if let Some(delay) = soft_failure(provider, status, &headers, &text) {
                 let n = soft_tries.entry(acct.id.clone()).or_default();
                 if *n < 2 {
@@ -580,8 +825,11 @@ pub async fn execute(app: Arc<App>, call: Call) -> Reply {
             return Reply::Json(v);
         }
 
-        let events =
-            if devin { crate::devin::event_stream(resp, names) } else { event_stream(resp, native, is_sse, names) };
+        let events = if devin {
+            crate::devin::event_stream(resp, names)
+        } else {
+            event_stream(resp, native, is_sse, names, acct.clone(), model.clone())
+        };
         let client_model = model.clone();
         if call.stream {
             let frames = render_stream(events, call.format, client_model, req, tracker);
@@ -602,7 +850,14 @@ pub async fn execute(app: Arc<App>, call: Call) -> Reply {
 type EventStream = Pin<Box<dyn Stream<Item = Event> + Send>>;
 
 /// Decodes the upstream body into IR events.
-fn event_stream(resp: reqwest::Response, native: Format, is_sse: bool, names: HashMap<String, String>) -> EventStream {
+fn event_stream(
+    resp: reqwest::Response,
+    native: Format,
+    is_sse: bool,
+    names: HashMap<String, String>,
+    acct: Arc<Account>,
+    model: String,
+) -> EventStream {
     let rename = move |ev: Event| match ev {
         Event::ToolStart { key, id, name } => {
             let name = names.get(&name).cloned().unwrap_or(name);
@@ -613,6 +868,7 @@ fn event_stream(resp: reqwest::Response, native: Format, is_sse: bool, names: Ha
     if !is_sse {
         return Box::pin(async_stream::stream! {
             let text = resp.text().await.unwrap_or_default();
+            observe_quota_event(&acct, &model, &text);
             let evs = match serde_json::from_str::<Value>(&text) {
                 Ok(v) => formats::full_to_events(native, &v),
                 // Mislabelled stream: decode it as SSE after all.
@@ -621,6 +877,7 @@ fn event_stream(resp: reqwest::Response, native: Format, is_sse: bool, names: Ha
                     let mut parser = formats::parser(native);
                     let mut out = Vec::new();
                     for sse in dec.push(text.as_bytes()).into_iter().chain(dec.finish()) {
+                        observe_quota_event(&acct, &model, &sse.data);
                         parser.feed(&sse, &mut out);
                     }
                     out
@@ -640,6 +897,7 @@ fn event_stream(resp: reqwest::Response, native: Format, is_sse: bool, names: Ha
             match body.next().await {
                 Some(Ok(chunk)) => {
                     for sse in dec.push(&chunk) {
+                        observe_quota_event(&acct, &model, &sse.data);
                         parser.feed(&sse, &mut out);
                     }
                 }
@@ -650,6 +908,7 @@ fn event_stream(resp: reqwest::Response, native: Format, is_sse: bool, names: Ha
                 }
                 None => {
                     for sse in dec.finish() {
+                        observe_quota_event(&acct, &model, &sse.data);
                         parser.feed(&sse, &mut out);
                     }
                     for ev in out.drain(..) { yield rename(ev); }
@@ -731,6 +990,7 @@ fn passthrough_stream(resp: reqwest::Response, native: Format, mut tracker: Trac
                 None => (dec.finish(), true),
             };
             for sse in batch {
+                tracker.observe_quota_event(&sse.data);
                 parser.feed(&sse, &mut evs);
                 for ev in evs.drain(..) {
                     match ev {
@@ -770,6 +1030,7 @@ async fn collect_passthrough(mut body: ByteStream, native: Format, mut tracker: 
     let mut final_obj: Option<Value> = None;
     let mut evs = Vec::new();
     let mut handle = |sse: crate::sse::SseEvent, agg: &mut Aggregate, final_obj: &mut Option<Value>| {
+        tracker.observe_quota_event(&sse.data);
         parser.feed(&sse, &mut evs);
         evs.drain(..).for_each(|e| agg.push(&e));
         if let Ok(v) = serde_json::from_str::<Value>(&sse.data)
@@ -813,7 +1074,11 @@ async fn collect_passthrough(mut body: ByteStream, native: Format, mut tracker: 
 pub async fn count_tokens(app: Arc<App>, headers: HeaderMap, body: Value) -> Value {
     let cfg = app.cfg();
     let (model, _) = ir::split_model_suffix(body["model"].as_str().unwrap_or_default());
-    if let Pick::Ok(acct, upstream_model) = app.pool.pick(&model, &[], cfg.routing, None, None)
+    let (only, model) = app.pool.route(&model);
+    let model = app.pool.canonical(&model, only.as_ref());
+    let session = crate::affinity::session_key(&headers, &body);
+    if let Ok((acct, upstream_model)) =
+        app.sessions.pick(&app.pool, &cfg, &model, session.as_deref(), &[], only.as_ref())
         && acct.provider == Provider::Claude
         && crate::oauth::ensure_fresh(&app, &acct, Duration::minutes(5), false).await.is_ok()
     {
@@ -874,5 +1139,24 @@ mod tests {
         soon.insert("retry-after", "2".parse().unwrap());
         assert!(soft_failure(Provider::Codex, 429, &soon, "{}").is_some());
         assert!(soft_failure(Provider::Codex, 400, &h, "{}").is_none());
+    }
+
+    #[test]
+    fn only_confirmed_subscription_exhaustion_triggers_migration() {
+        let cfg = crate::config::Config {
+            auth_dir: "/nonexistent".into(),
+            codex_api_key: vec![crate::config::KeyEntry { api_key: "test".into(), ..Default::default() }],
+            ..Default::default()
+        };
+        let pool = crate::accounts::Pool::default();
+        pool.reload(&cfg);
+        let account = pool.all().remove(0);
+        for code in ["rate_limit_exceeded", "RESOURCE_EXHAUSTED", "context_length_exceeded", "invalid_api_key"] {
+            assert!(!quota_exhausted(&account, "gpt-6.1-sol", 429, &json!({"error":{"code":code}}).to_string()));
+        }
+        for code in ["usage_limit_reached", "insufficient_quota", "QUOTA_EXHAUSTED"] {
+            assert!(quota_exhausted(&account, "gpt-6.1-sol", 429, &json!({"error":{"code":code}}).to_string()));
+        }
+        assert!(!quota_exhausted(&account, "gpt-6.1-sol", 400, "context length exceeded"));
     }
 }

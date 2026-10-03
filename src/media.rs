@@ -14,7 +14,7 @@ use futures::StreamExt;
 use parking_lot::Mutex;
 use serde_json::{Value, json};
 
-use crate::accounts::{Account, Credential, Pick, Provider};
+use crate::accounts::{Account, Credential, Provider};
 use crate::formats;
 use crate::ir::{Format, Usage};
 use crate::proxy::{Tracker, error_message};
@@ -128,7 +128,28 @@ async fn send(
     for (k, v) in headers {
         rb = rb.header(k.as_str(), v.as_str());
     }
-    rb.json(body).send().await.map_err(|e| fail(502, format!("upstream connection failed: {e}")))
+    let epoch = acct.quota_epoch();
+    let resp = rb.json(body).send().await.map_err(|e| fail(502, format!("upstream connection failed: {e}")))?;
+    crate::quota::observe(acct, resp.headers(), epoch);
+    if !resp.status().is_success() {
+        let status = resp.status().as_u16();
+        let response_headers = resp.headers().clone();
+        let text = resp.text().await.unwrap_or_default();
+        if crate::proxy::quota_exhausted(acct, body["model"].as_str().unwrap_or_default(), status, &text) {
+            crate::proxy::mark_quota_exhausted(
+                acct,
+                body["model"].as_str().unwrap_or_default(),
+                &response_headers,
+                &text,
+            );
+        }
+        let error = serde_json::from_str::<Value>(&text)
+            .ok()
+            .filter(|v| v["error"].is_object())
+            .unwrap_or_else(|| formats::error_body(Format::Chat, status, &error_message(&text)));
+        return Err((status, error));
+    }
+    Ok(resp)
 }
 
 async fn read_json(resp: reqwest::Response) -> Outcome {
@@ -356,29 +377,39 @@ async fn image_once(app: &App, acct: &Account, headers: &HeaderMap, model: &str,
     }
 }
 
-/// Runs `op` against accounts serving `model`, rotating on rate limits and auth errors.
-async fn with_accounts<F, Fut>(app: &Arc<App>, model: &str, kind: &'static str, mut op: F) -> Outcome
+/// Shares coding-session assignments with generation and compaction calls.
+async fn with_accounts<F, Fut>(
+    app: &Arc<App>,
+    model: &str,
+    kind: &'static str,
+    session: Option<crate::affinity::SessionIdentity>,
+    mut op: F,
+) -> Outcome
 where
     F: FnMut(Arc<Account>, String) -> Fut,
     Fut: std::future::Future<Output = Outcome>,
 {
     let cfg = app.cfg();
+    let session_key = session.as_ref().map(|s| s.key.as_str());
+    let _lease = session_key.map(|s| app.sessions.hold(s, cfg.session_affinity_idle_seconds));
     let (only, model) = app.pool.route(model);
     let model = app.pool.canonical(&model, only.as_ref());
     let mut tracker = Tracker::new(app, Format::Chat, false, kind, &model);
+    tracker.session(session_key, session.as_ref().map(|s| s.source), &cfg);
     let mut tried: Vec<String> = Vec::new();
     let mut last: Option<(u16, Value)> = None;
     while tried.len() < cfg.request_retry.max(1) as usize {
-        let (acct, upstream_model) = match app.pool.pick(&model, &tried, cfg.routing, None, only.as_ref()) {
-            Pick::Ok(a, m) => (a, m),
-            Pick::Cooling(_) => {
-                let (s, b) = last.unwrap_or_else(|| fail(429, format!("all accounts for {model} are rate limited")));
+        let selected = match app.sessions.pick_with_reason(&app.pool, &cfg, &model, session_key, &tried, only.as_ref())
+        {
+            Ok(pair) => pair,
+            Err((status, msg)) => {
+                let (s, b) = last.unwrap_or_else(|| fail(status, msg));
                 tracker.finish(s, &Usage::default(), Some(error_message(&b.to_string())));
                 return Err((s, b));
             }
-            Pick::None => break,
         };
-        tracker.attempt(&acct);
+        tracker.selected(&selected);
+        let (acct, upstream_model) = (selected.account, selected.model);
         tried.push(acct.id.clone());
         if let Err(e) = crate::oauth::ensure_ready(app, &acct).await {
             last = Some(fail(401, format!("token refresh failed: {e}")));
@@ -397,6 +428,16 @@ where
             }
             Err((status, body)) => {
                 let msg = error_message(&body.to_string());
+                if crate::proxy::quota_exhausted(&acct, &model, status, &body.to_string()) {
+                    crate::proxy::mark_quota_exhausted(
+                        &acct,
+                        &model,
+                        &reqwest::header::HeaderMap::new(),
+                        &body.to_string(),
+                    );
+                    last = Some((status, body));
+                    continue;
+                }
                 match status {
                     429 => acct.cool(Some(&model), Utc::now() + Duration::seconds(60), &format!("429: {msg}")),
                     401 | 403 => acct.cool(None, Utc::now() + Duration::minutes(10), &format!("{status}: {msg}")),
@@ -424,7 +465,8 @@ pub async fn images(app: Arc<App>, headers: HeaderMap, body: Value, edit: bool) 
     }
     let model = body["model"].as_str().filter(|m| !m.is_empty()).unwrap_or(DEFAULT_IMAGE_MODEL).to_string();
     let app2 = app.clone();
-    with_accounts(&app, &model, "images", move |acct, upstream_model| {
+    let session = crate::affinity::session_identity(&headers, &body);
+    with_accounts(&app, &model, "images", session, move |acct, upstream_model| {
         let (app, headers, body) = (app2.clone(), headers.clone(), body.clone());
         async move { image_once(&app, &acct, &headers, &upstream_model, &body, edit).await }
     })
@@ -472,7 +514,8 @@ pub async fn video_create(app: Arc<App>, headers: HeaderMap, body: Value, kind: 
     let model = body["model"].as_str().filter(|m| !m.is_empty()).unwrap_or(DEFAULT_VIDEO_MODEL).to_string();
     let app2 = app.clone();
     let kind = kind.to_string();
-    with_accounts(&app, &model, "video", move |acct, upstream_model| {
+    let session = crate::affinity::session_identity(&headers, &body);
+    with_accounts(&app, &model, "video", session, move |acct, upstream_model| {
         let (app, headers, body, kind) = (app2.clone(), headers.clone(), body.clone(), kind.clone());
         async move {
             if acct.provider != Provider::Xai {
@@ -533,7 +576,8 @@ pub async fn compact(app: Arc<App>, headers: HeaderMap, body: Value) -> Outcome 
     let Some(model) = body["model"].as_str().map(String::from) else { return Err(fail(400, "`model` is required")) };
     let (model, _) = crate::ir::split_model_suffix(&model);
     let app2 = app.clone();
-    with_accounts(&app, &model, "http", move |acct, upstream_model| {
+    let session = crate::affinity::session_identity(&headers, &body);
+    with_accounts(&app, &model, "http", session, move |acct, upstream_model| {
         let (app, headers, body) = (app2.clone(), headers.clone(), body.clone());
         async move {
             if !matches!(acct.provider, Provider::Codex | Provider::Xai) {

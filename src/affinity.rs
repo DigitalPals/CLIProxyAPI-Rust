@@ -1,0 +1,776 @@
+//! Shared coding-session assignments. Only identifiers and account ids are persisted;
+//! conversation input stays in a bounded, process-local continuation cache.
+
+use std::collections::HashMap;
+use std::path::{Path, PathBuf};
+use std::sync::Arc;
+
+use axum::http::HeaderMap;
+use chrono::Utc;
+use parking_lot::Mutex;
+use serde::{Deserialize, Serialize};
+use serde_json::Value;
+use sha2::{Digest, Sha256};
+
+use crate::accounts::{Account, Only, PROVIDERS, Pick, Pool, Provider};
+use crate::config::{Config, Routing};
+
+const MAX_SESSIONS: usize = 10_000;
+const MAX_HISTORY_BYTES: usize = 64 * 1024 * 1024;
+const MAX_RESPONSE_BYTES: usize = 8 * 1024 * 1024;
+const MAX_RESPONSES: usize = 1_000;
+
+fn digest(parts: &[&str]) -> String {
+    let mut h = Sha256::new();
+    for p in parts {
+        h.update((p.len() as u64).to_le_bytes());
+        h.update(p.as_bytes());
+    }
+    hex::encode(h.finalize())
+}
+
+fn header<'a>(headers: &'a HeaderMap, name: &str) -> Option<&'a str> {
+    headers.get(name)?.to_str().ok().map(str::trim).filter(|s| !s.is_empty())
+}
+
+fn identifier(v: &Value) -> Option<&str> {
+    v.as_str().map(str::trim).filter(|s| !s.is_empty() && s.len() <= 1024)
+}
+
+/// Authentication middleware overwrites this scope, including for query-string keys.
+pub fn client_scope(headers: &HeaderMap) -> String {
+    if let Some(scope) = header(headers, "x-cliproxy-client-scope") {
+        return scope.to_string();
+    }
+    let key = header(headers, "authorization")
+        .and_then(|v| v.strip_prefix("Bearer "))
+        .map(str::trim)
+        .or_else(|| header(headers, "x-api-key"))
+        .or_else(|| header(headers, "x-goog-api-key"))
+        .unwrap_or("anonymous");
+    digest(&["client", key])
+}
+
+pub fn scope_for_key(key: Option<&str>) -> String {
+    digest(&["client", key.unwrap_or("anonymous")])
+}
+
+pub struct SessionIdentity {
+    pub key: String,
+    pub source: &'static str,
+}
+
+/// Read the original client request before provider translation or Claude cloaking.
+/// The source identifies a field; the raw client identifier is never returned.
+pub fn session_identity(headers: &HeaderMap, body: &Value) -> Option<SessionIdentity> {
+    let claude_user = body["metadata"]["user_id"].as_str().unwrap_or_default();
+    let claude_json: Value = serde_json::from_str(claude_user).unwrap_or(Value::Null);
+    let (id, source) = [
+        "x-cliproxy-session-id",
+        "thread-id",
+        "x-codex-thread-id",
+        "session_id",
+        "session-id",
+        "x-claude-code-session-id",
+    ]
+    .into_iter()
+    .find_map(|name| header(headers, name).filter(|s| s.len() <= 1024).map(|id| (id, name)))
+    .or_else(|| identifier(&claude_json["session_id"]).map(|id| (id, "metadata.user_id.session_id")))
+    .or_else(|| {
+        claude_user
+            .strip_prefix("user_")
+            .filter(|s| s.contains("_account_"))?
+            .rsplit_once("_session_")
+            .map(|(_, s)| s)
+            .filter(|s| !s.is_empty() && s.len() <= 1024)
+            .map(|id| (id, "metadata.user_id"))
+    })
+    .or_else(|| identifier(&body["metadata"]["session_id"]).map(|id| (id, "metadata.session_id")))
+    .or_else(|| identifier(&body["metadata"]["thread_id"]).map(|id| (id, "metadata.thread_id")))
+    .or_else(|| identifier(&body["conversation"]["id"]).map(|id| (id, "conversation.id")))
+    .or_else(|| identifier(&body["conversation"]).map(|id| (id, "conversation")))
+    .or_else(|| identifier(&body["prompt_cache_key"]).map(|id| (id, "prompt_cache_key")))?;
+    Some(SessionIdentity { key: digest(&[&client_scope(headers), "session", id]), source })
+}
+
+pub fn session_key(headers: &HeaderMap, body: &Value) -> Option<String> {
+    session_identity(headers, body).map(|identity| identity.key)
+}
+
+pub fn connection_key(headers: &HeaderMap, id: &str) -> String {
+    digest(&[&client_scope(headers), "connection", id])
+}
+
+// Keep a subscription across model changes within a provider, while respecting
+// explicit account prefixes and intentional switches to another provider.
+fn route_scope(pool: &Pool, model: &str, only: Option<&Only>) -> String {
+    match only {
+        Some(Only::Prefix(p)) => format!("prefix:{}", p.to_ascii_lowercase()),
+        Some(Only::Provider(p)) => format!("provider:{}", p.as_str()),
+        None => {
+            let vendor = |name: &str| {
+                PROVIDERS
+                    .iter()
+                    .find(|p| {
+                        !matches!(p, Provider::Antigravity | Provider::Devin | Provider::Compat) && p.family(name)
+                    })
+                    .copied()
+            };
+            vendor(model)
+                .or_else(|| {
+                    pool.all().iter().find_map(|a| pool.resolve_account(a, model, None).and_then(|m| vendor(&m)))
+                })
+                .map(|p| format!("provider:{}", p.as_str()))
+                .unwrap_or_else(|| format!("model:{}", model.to_ascii_lowercase()))
+        }
+    }
+}
+
+#[derive(Clone, Serialize, Deserialize)]
+struct Binding {
+    #[serde(default)]
+    session: String,
+    account: String,
+    last_seen: i64,
+}
+
+struct Conversation {
+    session: String,
+    input: Vec<Value>,
+    bytes: usize,
+    last_seen: i64,
+}
+
+#[derive(Default)]
+struct Registry {
+    bindings: HashMap<String, Binding>,
+    responses: HashMap<String, Conversation>,
+    history_bytes: usize,
+    dirty: bool,
+    last_flush: i64,
+    active: HashMap<String, usize>,
+}
+
+pub struct Sessions {
+    registry: Mutex<Registry>,
+    path: Option<PathBuf>,
+}
+
+/// Keep an assignment alive until a call (including its response stream) ends.
+pub struct Lease {
+    sessions: Arc<Sessions>,
+    session: String,
+}
+
+impl Drop for Lease {
+    fn drop(&mut self) {
+        let mut registry = self.sessions.registry.lock();
+        if let Some(count) = registry.active.get_mut(&self.session) {
+            *count -= 1;
+            if *count == 0 {
+                registry.active.remove(&self.session);
+            }
+        }
+        for binding in registry.bindings.values_mut().filter(|b| b.session == self.session) {
+            binding.last_seen = Utc::now().timestamp();
+        }
+        registry.dirty = true;
+    }
+}
+
+pub type Selection = Result<(Arc<Account>, String), (u16, String)>;
+
+#[derive(Clone)]
+pub struct Selected {
+    pub account: Arc<Account>,
+    pub model: String,
+    pub strategy: Routing,
+    pub reason: &'static str,
+    pub previous_account: Option<String>,
+}
+
+fn selection(pick: Pick, model: &str) -> Selection {
+    match pick {
+        Pick::Ok(a, m) => Ok((a, m)),
+        Pick::Cooling(t) => Err((
+            429,
+            format!(
+                "all accounts for {model} are rate limited; next available in {}s",
+                (t - Utc::now()).num_seconds().max(1)
+            ),
+        )),
+        Pick::None => Err((404, format!("no available account serves model `{model}`"))),
+    }
+}
+
+impl Sessions {
+    pub fn hold(self: &Arc<Self>, session: &str, idle: u64) -> Lease {
+        let session = digest(&["owner", session]);
+        let mut registry = self.registry.lock();
+        Self::prune_locked(&mut registry, idle);
+        *registry.active.entry(session.clone()).or_default() += 1;
+        Lease { sessions: self.clone(), session }
+    }
+
+    pub fn end(&self, session: &str) {
+        let owner = digest(&["owner", session]);
+        let mut registry = self.registry.lock();
+        registry.bindings.retain(|_, b| b.session != owner);
+        registry.responses.retain(|_, c| c.session != session);
+        registry.history_bytes = registry.responses.values().map(|c| c.bytes).sum();
+        registry.dirty = true;
+        self.flush_locked(&mut registry);
+    }
+    pub fn load(auth_dir: &Path, idle: u64) -> Self {
+        let path = auth_dir.join(".routing-sessions.state");
+        let mut registry = Registry::default();
+        match std::fs::read(&path) {
+            Ok(data) => match serde_json::from_slice(&data) {
+                Ok(bindings) => registry.bindings = bindings,
+                Err(e) => tracing::warn!(path = %path.display(), "session assignments could not be read: {e}"),
+            },
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => tracing::warn!(path = %path.display(), "session assignments could not be read: {e}"),
+        }
+        let sessions = Self { registry: Mutex::new(registry), path: Some(path) };
+        sessions.prune(idle);
+        sessions
+    }
+
+    #[cfg(test)]
+    pub fn memory() -> Self {
+        Self { registry: Mutex::new(Registry::default()), path: None }
+    }
+
+    pub fn pick(
+        &self,
+        pool: &Pool,
+        cfg: &Config,
+        model: &str,
+        session: Option<&str>,
+        exclude: &[String],
+        only: Option<&Only>,
+    ) -> Selection {
+        self.pick_with_reason(pool, cfg, model, session, exclude, only)
+            .map(|selected| (selected.account, selected.model))
+    }
+
+    /// Capture the routing reason while selecting under one lock. Concurrent calls
+    /// cannot create competing assignments or report a stale migration decision.
+    pub fn pick_with_reason(
+        &self,
+        pool: &Pool,
+        cfg: &Config,
+        model: &str,
+        session: Option<&str>,
+        exclude: &[String],
+        only: Option<&Only>,
+    ) -> Result<Selected, (u16, String)> {
+        let Some(session) = session.filter(|_| cfg.session_affinity) else {
+            let (account, model) = selection(pool.pick(model, exclude, cfg.routing, None, only), model)?;
+            return Ok(Selected {
+                account,
+                model,
+                strategy: cfg.routing,
+                reason: if cfg.session_affinity { "missing_session" } else { "affinity_disabled" },
+                previous_account: None,
+            });
+        };
+        let key = digest(&[session, &route_scope(pool, model, only)]);
+        let mut registry = self.registry.lock();
+        Self::prune_locked(&mut registry, cfg.session_affinity_idle_seconds);
+        let mut excluded = exclude.to_vec();
+        if let Some(binding) = registry.bindings.get_mut(&key) {
+            binding.last_seen = Utc::now().timestamp();
+            let Some(acct) = pool.get(&binding.account) else {
+                return Err((
+                    409,
+                    "the session's assigned account was removed; start a new session to choose another subscription"
+                        .into(),
+                ));
+            };
+            if acct.state.lock().disabled {
+                return Err((
+                    409,
+                    "the session's assigned account is disabled; re-enable it or start a new session".into(),
+                ));
+            }
+            let Some(upstream) = pool.resolve_account(&acct, model, only) else {
+                return Err((
+                    409,
+                    format!(
+                        "the session's assigned account cannot serve `{model}`; use another provider or start a new session"
+                    ),
+                ));
+            };
+            if acct.exhausted_until(model).is_none() {
+                if let Some(until) = acct.cooling_until(model) {
+                    return Err((
+                        429,
+                        format!(
+                            "the session's assigned account is temporarily unavailable; retry in {}s (subscription preserved)",
+                            (until - Utc::now()).num_seconds().max(1)
+                        ),
+                    ));
+                }
+                if excluded.contains(&acct.id) {
+                    return Err((
+                        503,
+                        "the session's assigned account is temporarily unavailable; subscription preserved".into(),
+                    ));
+                }
+                registry.dirty = true;
+                return Ok(Selected {
+                    account: acct,
+                    model: upstream,
+                    strategy: cfg.routing,
+                    reason: "session_reused",
+                    previous_account: None,
+                });
+            }
+            if !excluded.contains(&acct.id) {
+                excluded.push(acct.id.clone());
+            }
+        } else if registry.bindings.len() >= MAX_SESSIONS {
+            return Err((503, "session assignment capacity reached; retry after inactive sessions expire".into()));
+        }
+        let (acct, upstream) = selection(pool.pick(model, &excluded, cfg.routing, None, only), model)?;
+        let previous = registry.bindings.insert(
+            key,
+            Binding {
+                session: digest(&["owner", session]),
+                account: acct.id.clone(),
+                last_seen: Utc::now().timestamp(),
+            },
+        );
+        if let Some(old) = &previous {
+            tracing::info!(from = %old.account, to = %acct.id, "session moved after subscription quota exhaustion");
+        }
+        registry.dirty = true;
+        self.flush_locked(&mut registry);
+        Ok(Selected {
+            account: acct,
+            model: upstream,
+            strategy: cfg.routing,
+            reason: if previous.is_some() { "quota_exhausted" } else { "new_session" },
+            previous_account: previous.map(|binding| binding.account),
+        })
+    }
+
+    pub fn prune(&self, idle: u64) {
+        let mut registry = self.registry.lock();
+        Self::prune_locked(&mut registry, idle);
+    }
+
+    fn prune_locked(registry: &mut Registry, idle: u64) {
+        let cutoff = Utc::now().timestamp().saturating_sub(idle.clamp(1, i64::MAX as u64) as i64);
+        let count = registry.bindings.len();
+        registry.bindings.retain(|_, b| b.last_seen > cutoff || registry.active.contains_key(&b.session));
+        registry.dirty |= count != registry.bindings.len();
+        registry.responses.retain(|_, c| c.last_seen > cutoff);
+        registry.history_bytes = registry.responses.values().map(|c| c.bytes).sum();
+    }
+
+    pub fn flush(&self, idle: u64) {
+        let mut registry = self.registry.lock();
+        Self::prune_locked(&mut registry, idle);
+        if Utc::now().timestamp() - registry.last_flush >= 30 {
+            self.flush_locked(&mut registry);
+        }
+    }
+
+    pub fn save(&self) {
+        self.flush_locked(&mut self.registry.lock());
+    }
+
+    fn flush_locked(&self, registry: &mut Registry) {
+        if !registry.dirty {
+            return;
+        }
+        let Some(path) = &self.path else {
+            return;
+        };
+        let write = || -> anyhow::Result<()> {
+            use std::io::Write;
+            if let Some(parent) = path.parent() {
+                std::fs::create_dir_all(parent)?;
+            }
+            let temporary = path.with_extension(format!("{}.tmp", uuid::Uuid::new_v4()));
+            let mut opts = std::fs::OpenOptions::new();
+            opts.write(true).create_new(true);
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::OpenOptionsExt;
+                opts.mode(0o600);
+            }
+            let result = (|| -> anyhow::Result<()> {
+                let mut file = opts.open(&temporary)?;
+                file.write_all(&serde_json::to_vec(&registry.bindings)?)?;
+                file.sync_all()?;
+                std::fs::rename(&temporary, path)?;
+                Ok(())
+            })();
+            if result.is_err() {
+                let _ = std::fs::remove_file(&temporary);
+            }
+            result
+        };
+        match write() {
+            Ok(()) => registry.dirty = false,
+            Err(e) => tracing::warn!(path = %path.display(), "session assignments could not be persisted: {e}"),
+        }
+        registry.last_flush = Utc::now().timestamp();
+    }
+
+    pub fn previous(&self, headers: &HeaderMap, id: &str, session: Option<&str>) -> Option<(String, Vec<Value>)> {
+        let key = digest(&[&client_scope(headers), "response", id]);
+        let mut registry = self.registry.lock();
+        let previous = registry.responses.get_mut(&key)?;
+        if session.is_some_and(|s| s != previous.session) {
+            return None;
+        }
+        previous.last_seen = Utc::now().timestamp();
+        Some((previous.session.clone(), previous.input.clone()))
+    }
+
+    pub fn remember(&self, headers: &HeaderMap, session: &str, response: &Value, full_input: &[Value]) {
+        let Some(id) = response["id"].as_str() else {
+            return;
+        };
+        let Some(output) = response["output"].as_array() else {
+            return;
+        };
+        let mut input = full_input.to_vec();
+        input.extend(output.iter().cloned());
+        let bytes = serde_json::to_vec(&input).map(|v| v.len()).unwrap_or(MAX_RESPONSE_BYTES + 1);
+        if bytes > MAX_RESPONSE_BYTES {
+            return;
+        }
+        let key = digest(&[&client_scope(headers), "response", id]);
+        let mut registry = self.registry.lock();
+        if let Some(old) = registry.responses.remove(&key) {
+            registry.history_bytes -= old.bytes;
+        }
+        while registry.responses.len() >= MAX_RESPONSES || registry.history_bytes + bytes > MAX_HISTORY_BYTES {
+            let Some(oldest) = registry.responses.iter().min_by_key(|(_, c)| c.last_seen).map(|(k, _)| k.clone())
+            else {
+                break;
+            };
+            if let Some(old) = registry.responses.remove(&oldest) {
+                registry.history_bytes -= old.bytes;
+            }
+        }
+        registry.history_bytes += bytes;
+        registry
+            .responses
+            .insert(key, Conversation { session: session.into(), input, bytes, last_seen: Utc::now().timestamp() });
+    }
+}
+
+/// Some Codex backends omit output from the final event after streaming it.
+pub fn complete_output(response: &mut Value, aggregate: &crate::ir::Aggregate) {
+    if response["output"].as_array().is_none_or(|items| items.is_empty()) {
+        let rebuilt = crate::formats::responses::render_full(
+            aggregate,
+            response["model"].as_str().unwrap_or_default(),
+            &crate::ir::Request::default(),
+        );
+        response["output"] = rebuilt["output"].clone();
+    }
+}
+
+pub fn input_items(body: &Value) -> Vec<Value> {
+    match &body["input"] {
+        Value::String(s) => vec![
+            serde_json::json!({ "type": "message", "role": "user", "content": [{ "type": "input_text", "text": s }] }),
+        ],
+        Value::Array(items) => items.clone(),
+        _ => vec![],
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::{KeyEntry, Routing};
+    use chrono::Duration;
+    use serde_json::json;
+
+    fn config(routing: Routing) -> Config {
+        Config {
+            auth_dir: "/nonexistent".into(),
+            routing,
+            codex_api_key: ["a", "b"].map(|key| KeyEntry { api_key: key.into(), ..Default::default() }).to_vec(),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn all_strategies_pin_and_keep_the_replacement_after_recovery() {
+        for routing in [Routing::LeastUsed, Routing::RoundRobin, Routing::FillFirst] {
+            let cfg = config(routing);
+            let pool = Pool::default();
+            pool.reload(&cfg);
+            let sessions = Sessions::memory();
+            let pick = || sessions.pick(&pool, &cfg, "gpt-6.1-sol", Some("task"), &[], None).unwrap().0;
+            let a = pick();
+            for _ in 0..5 {
+                assert_eq!(pick().id, a.id);
+            }
+            // A model change inside the same provider also preserves the subscription.
+            assert_eq!(sessions.pick(&pool, &cfg, "gpt-6-astra", Some("task"), &[], None).unwrap().0.id, a.id);
+            a.exhaust("gpt-6.1-sol", Utc::now() + Duration::minutes(5), "quota exhausted");
+            let b = pick();
+            assert_ne!(a.id, b.id);
+            a.state.lock().exhausted.clear();
+            a.state.lock().cooldowns.clear();
+            assert_eq!(pick().id, b.id);
+        }
+    }
+
+    #[test]
+    fn routing_metadata_distinguishes_assignment_reuse_and_quota_migration() {
+        for routing in [Routing::LeastUsed, Routing::RoundRobin, Routing::FillFirst] {
+            let cfg = config(routing);
+            let pool = Pool::default();
+            pool.reload(&cfg);
+            let sessions = Sessions::memory();
+            let pick = || sessions.pick_with_reason(&pool, &cfg, "gpt-6.1-sol", Some("task"), &[], None).unwrap();
+            let first = pick();
+            assert_eq!(first.reason, "new_session");
+            assert_eq!(first.strategy, routing);
+            assert_eq!(first.model, "gpt-6.1-sol");
+            assert!(first.previous_account.is_none());
+
+            let reused = pick();
+            assert_eq!(reused.reason, "session_reused");
+            assert_eq!(reused.account.id, first.account.id);
+            assert!(reused.previous_account.is_none());
+
+            first.account.exhaust("gpt-6.1-sol", Utc::now() + Duration::minutes(5), "quota exhausted");
+            let migrated = pick();
+            assert_eq!(migrated.reason, "quota_exhausted");
+            assert_eq!(migrated.strategy, routing);
+            assert_eq!(migrated.previous_account.as_deref(), Some(first.account.id.as_str()));
+            assert_ne!(migrated.account.id, first.account.id);
+
+            let next = pick();
+            assert_eq!(next.reason, "session_reused");
+            assert_eq!(next.account.id, migrated.account.id);
+            assert!(next.previous_account.is_none());
+        }
+    }
+
+    #[test]
+    fn routing_metadata_explains_why_per_request_selection_is_used() {
+        for (enabled, session, reason) in [
+            (true, None, "missing_session"),
+            (false, None, "affinity_disabled"),
+            (false, Some("task"), "affinity_disabled"),
+        ] {
+            let cfg = Config { session_affinity: enabled, ..config(Routing::RoundRobin) };
+            let pool = Pool::default();
+            pool.reload(&cfg);
+            let sessions = Sessions::memory();
+            let pick = || sessions.pick_with_reason(&pool, &cfg, "gpt-6.1-sol", session, &[], None).unwrap();
+            let first = pick();
+            let second = pick();
+            assert_eq!(first.reason, reason);
+            assert_eq!(second.reason, reason);
+            assert_eq!(first.strategy, Routing::RoundRobin);
+            assert_ne!(first.account.id, second.account.id);
+            assert!(first.previous_account.is_none());
+            assert!(second.previous_account.is_none());
+            assert!(sessions.registry.lock().bindings.is_empty());
+        }
+    }
+
+    #[test]
+    fn temporary_cooldowns_and_removed_accounts_do_not_migrate() {
+        let cfg = config(Routing::RoundRobin);
+        let pool = Pool::default();
+        pool.reload(&cfg);
+        let sessions = Sessions::memory();
+        let a = sessions.pick(&pool, &cfg, "gpt-6.1-sol", Some("task"), &[], None).unwrap().0;
+        a.cool(None, Utc::now() + Duration::seconds(60), "temporary");
+        assert_eq!(sessions.pick(&pool, &cfg, "gpt-6.1-sol", Some("task"), &[], None).err().unwrap().0, 429);
+        a.state.lock().cooldowns.clear();
+        a.state.lock().disabled = true;
+        assert_eq!(sessions.pick(&pool, &cfg, "gpt-6.1-sol", Some("task"), &[], None).err().unwrap().0, 409);
+    }
+
+    #[test]
+    fn identifiers_are_client_scoped_and_claude_metadata_is_read() {
+        let mut headers = HeaderMap::new();
+        headers.insert("authorization", "Bearer first".parse().unwrap());
+        let body = json!({"metadata":{"user_id":json!({"session_id":"coding-task"}).to_string()}});
+        let a = session_key(&headers, &body).unwrap();
+        headers.insert("thread-id", "coding-task".parse().unwrap());
+        assert_eq!(session_key(&headers, &json!({})).unwrap(), a);
+        headers.insert("authorization", "Bearer second".parse().unwrap());
+        assert_ne!(session_key(&headers, &body).unwrap(), a);
+        assert!(session_key(&HeaderMap::new(), &json!({"metadata":{"user_id":"ordinary-user"}})).is_none());
+        assert_eq!(
+            session_key(&HeaderMap::new(), &json!({"metadata":{"user_id":"user_x_account_y_session_coding-task"}})),
+            session_key(&HeaderMap::new(), &json!({"prompt_cache_key":"coding-task"}))
+        );
+    }
+
+    #[test]
+    fn identity_sources_preserve_existing_hashes_and_precedence() {
+        let headers = HeaderMap::new();
+        let expected = digest(&[&client_scope(&headers), "session", "task"]);
+        for (source, body) in [
+            ("metadata.user_id.session_id", json!({"metadata":{"user_id":r#"{"session_id":"task"}"#}})),
+            ("metadata.user_id", json!({"metadata":{"user_id":"user_u_account_a_session_task"}})),
+            ("metadata.session_id", json!({"metadata":{"session_id":"task"}})),
+            ("metadata.thread_id", json!({"metadata":{"thread_id":"task"}})),
+            ("conversation.id", json!({"conversation":{"id":"task"}})),
+            ("conversation", json!({"conversation":"task"})),
+            ("prompt_cache_key", json!({"prompt_cache_key":"task"})),
+        ] {
+            let identity = session_identity(&headers, &body).unwrap();
+            assert_eq!(identity.source, source);
+            assert_eq!(identity.key, expected);
+            assert_eq!(session_key(&headers, &body).as_deref(), Some(expected.as_str()));
+        }
+        let mut headers = HeaderMap::new();
+        for name in [
+            "x-claude-code-session-id",
+            "session-id",
+            "session_id",
+            "x-codex-thread-id",
+            "thread-id",
+            "x-cliproxy-session-id",
+        ] {
+            headers.insert(name, "task".parse().unwrap());
+            let identity = session_identity(&headers, &json!({"prompt_cache_key":"lower-priority"})).unwrap();
+            assert_eq!(identity.source, name);
+            assert_eq!(identity.key, expected);
+        }
+        let invalid = "x".repeat(1025);
+        let mut headers = HeaderMap::new();
+        headers.insert("thread-id", invalid.parse().unwrap());
+        let body = json!({"metadata":{"session_id":invalid},"prompt_cache_key":"task"});
+        let identity = session_identity(&headers, &body).unwrap();
+        assert_eq!(identity.source, "prompt_cache_key");
+        assert_eq!(identity.key, expected);
+        assert!(session_identity(&HeaderMap::new(), &json!({})).is_none());
+    }
+
+    #[test]
+    fn round_robin_distributes_sessions_and_concurrent_calls_share_assignment() {
+        let cfg = config(Routing::RoundRobin);
+        let pool = Pool::default();
+        pool.reload(&cfg);
+        let sessions = Sessions::memory();
+        let a = sessions.pick(&pool, &cfg, "gpt-6.1-sol", Some("one"), &[], None).unwrap().0;
+        let b = sessions.pick(&pool, &cfg, "gpt-6.1-sol", Some("two"), &[], None).unwrap().0;
+        assert_ne!(a.id, b.id);
+        std::thread::scope(|scope| {
+            let handles: Vec<_> = (0..12)
+                .map(|_| {
+                    scope.spawn(|| {
+                        sessions.pick_with_reason(&pool, &cfg, "gpt-6.1-sol", Some("parallel"), &[], None).unwrap()
+                    })
+                })
+                .collect();
+            let selected: Vec<_> = handles.into_iter().map(|h| h.join().unwrap()).collect();
+            assert!(selected.iter().all(|s| s.account.id == selected[0].account.id));
+            assert_eq!(selected.iter().filter(|s| s.reason == "new_session").count(), 1);
+            assert_eq!(selected.iter().filter(|s| s.reason == "session_reused").count(), selected.len() - 1);
+        });
+    }
+
+    #[test]
+    fn history_cannot_cross_client_or_session_boundaries() {
+        let sessions = Sessions::memory();
+        let mut headers = HeaderMap::new();
+        headers.insert("authorization", "Bearer first".parse().unwrap());
+        sessions.remember(
+            &headers,
+            "task",
+            &json!({"id":"r1", "output":[{"text":"answer"}]}),
+            &[json!({"text":"question"})],
+        );
+        assert_eq!(sessions.previous(&headers, "r1", Some("task")).unwrap().1.len(), 2);
+        assert!(sessions.previous(&headers, "r1", Some("another-task")).is_none());
+        headers.insert("authorization", "Bearer second".parse().unwrap());
+        assert!(sessions.previous(&headers, "r1", None).is_none());
+    }
+
+    #[test]
+    fn assignments_survive_restart_and_idle_sessions_expire() {
+        let dir = std::env::temp_dir().join(format!("cliproxy-affinity-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let cfg = config(Routing::RoundRobin);
+        let pool = Pool::default();
+        pool.reload(&cfg);
+        let sessions = Sessions::load(&dir, 86_400);
+        let a = sessions.pick(&pool, &cfg, "gpt-6.1-sol", Some("sensitive-task-id"), &[], None).unwrap().0;
+        let loaded = Sessions::load(&dir, 86_400);
+        assert_eq!(loaded.pick(&pool, &cfg, "gpt-6.1-sol", Some("sensitive-task-id"), &[], None).unwrap().0.id, a.id);
+        let data = std::fs::read_to_string(dir.join(".routing-sessions.state")).unwrap();
+        assert!(!data.contains("sensitive-task-id"));
+        loaded.registry.lock().bindings.values_mut().for_each(|b| b.last_seen -= 90_000);
+        loaded.prune(86_400);
+        assert!(loaded.registry.lock().bindings.is_empty());
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn active_calls_prevent_idle_expiry_and_explicit_completion_releases_assignments() {
+        let cfg = config(Routing::RoundRobin);
+        let pool = Pool::default();
+        pool.reload(&cfg);
+        let sessions = Arc::new(Sessions::memory());
+        let lease = sessions.hold("task", 86_400);
+        let first = sessions.pick(&pool, &cfg, "gpt-6.1-sol", Some("task"), &[], None).unwrap().0;
+        sessions.registry.lock().bindings.values_mut().for_each(|b| b.last_seen -= 90_000);
+        sessions.prune(86_400);
+        assert_eq!(sessions.pick(&pool, &cfg, "gpt-6.1-sol", Some("task"), &[], None).unwrap().0.id, first.id);
+        drop(lease);
+        sessions.end("task");
+        assert!(sessions.registry.lock().bindings.is_empty());
+        assert_ne!(sessions.pick(&pool, &cfg, "gpt-6.1-sol", Some("task"), &[], None).unwrap().0.id, first.id);
+    }
+
+    #[test]
+    fn disabling_affinity_restores_per_request_routing_and_nested_config_works() {
+        let cfg = Config::parse("routing:\n  strategy: round-robin\n  session-affinity: false\n").unwrap();
+        assert!(!cfg.session_affinity);
+        assert!(!cfg.ignored.iter().any(|s| s.contains("session affinity")));
+        let cfg = Config { session_affinity: false, ..config(Routing::RoundRobin) };
+        let pool = Pool::default();
+        pool.reload(&cfg);
+        let sessions = Sessions::memory();
+        let first = sessions.pick(&pool, &cfg, "gpt-6.1-sol", Some("task"), &[], None).unwrap().0;
+        let second = sessions.pick(&pool, &cfg, "gpt-6.1-sol", Some("task"), &[], None).unwrap().0;
+        assert_ne!(first.id, second.id);
+    }
+
+    #[test]
+    fn exhaustion_from_usage_windows_and_provider_aliases_preserves_the_new_account() {
+        let mut cfg = config(Routing::LeastUsed);
+        for entry in &mut cfg.codex_api_key {
+            entry.models = vec![
+                crate::config::ModelAlias { name: "gpt-6.1-sol".into(), alias: Some("coding".into()) },
+                crate::config::ModelAlias { name: "gpt-6-astra".into(), alias: None },
+            ];
+        }
+        let pool = Pool::default();
+        pool.reload(&cfg);
+        let sessions = Sessions::memory();
+        let a = sessions.pick(&pool, &cfg, "coding", Some("task"), &[], None).unwrap().0;
+        assert_eq!(sessions.pick(&pool, &cfg, "gpt-6-astra", Some("task"), &[], None).unwrap().0.id, a.id);
+        a.state.lock().quota = crate::quota::Quota {
+            updated_at: Some(Utc::now()),
+            windows: vec![crate::quota::Window { name: "5h".into(), used: 100.0, resets_at: None, model: None }],
+            ..Default::default()
+        };
+        let b = sessions.pick(&pool, &cfg, "coding", Some("task"), &[], None).unwrap().0;
+        assert_ne!(a.id, b.id);
+        a.state.lock().quota = Default::default();
+        assert_eq!(sessions.pick(&pool, &cfg, "coding", Some("task"), &[], None).unwrap().0.id, b.id);
+    }
+}

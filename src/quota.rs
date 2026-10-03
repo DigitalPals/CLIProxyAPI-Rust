@@ -57,6 +57,10 @@ impl Quota {
         Some(self.live(model).map(|w| w.used).fold(0.0, f64::max))
     }
 
+    pub fn exhausted(&self, model: &str) -> bool {
+        self.live(model).any(|w| w.used >= 100.0)
+    }
+
     /// A window that is used up, and when it resets.
     pub fn exhausted_until(&self, model: &str) -> Option<DateTime<Utc>> {
         self.live(model).filter(|w| w.used >= 100.0).filter_map(|w| w.resets_at).max()

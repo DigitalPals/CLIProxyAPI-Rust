@@ -300,6 +300,8 @@ pub struct AccountState {
     pub quota_epoch: u64,
     pub quota_refreshing: bool,
     pub banked_resets: Option<crate::banked_resets::View>,
+    /// Confirmed subscription exhaustion, distinct from temporary rate limits.
+    pub exhausted: HashMap<String, DateTime<Utc>>,
     pub strikes: u32,
     pub last_error: Option<String>,
     pub last_used: Option<DateTime<Utc>>,
@@ -466,12 +468,17 @@ impl Account {
             return Some(now + chrono::Duration::seconds(30));
         }
         // A used-up quota window counts as a cooldown, so we don't wait for the 429.
-        let spent = st.quota.exhausted_until(model);
+        let spent = st
+            .quota
+            .exhausted_until(model)
+            .or_else(|| st.quota.exhausted(model).then(|| Utc::now() + chrono::Duration::minutes(5)));
         [
             st.cooldowns.get("*"),
             st.cooldowns.get(model),
             st.quota_cooldowns.get("*"),
             st.quota_cooldowns.get(model),
+            st.exhausted.get("*"),
+            st.exhausted.get(model),
             spent.as_ref(),
         ]
         .into_iter()
@@ -479,6 +486,25 @@ impl Account {
         .filter(|t| **t > now)
         .max()
         .copied()
+    }
+
+    pub fn exhausted_until(&self, model: &str) -> Option<DateTime<Utc>> {
+        let st = self.state.lock();
+        let spent = st
+            .quota
+            .exhausted_until(model)
+            .or_else(|| st.quota.exhausted(model).then(|| Utc::now() + chrono::Duration::minutes(5)));
+        [st.exhausted.get("*"), st.exhausted.get(model), spent.as_ref()]
+            .into_iter()
+            .flatten()
+            .filter(|t| **t > Utc::now())
+            .max()
+            .copied()
+    }
+
+    pub fn exhaust(&self, model: &str, until: DateTime<Utc>, reason: &str) {
+        self.state.lock().exhausted.insert(model.to_string(), until);
+        self.cool(Some(model), until, reason);
     }
 
     pub fn cool(&self, model: Option<&str>, until: DateTime<Utc>, reason: &str) {
@@ -869,6 +895,15 @@ pub enum Pick {
 }
 
 impl Pool {
+    /// Resolve a pinned account without replacing it with a different provider.
+    pub fn resolve_account(&self, a: &Account, model: &str, only: Option<&Only>) -> Option<String> {
+        let allowed = match only {
+            Some(Only::Provider(p)) => *p == a.provider,
+            Some(Only::Prefix(x)) => a.prefix.as_deref().is_some_and(|p| p.eq_ignore_ascii_case(x)),
+            None => !(self.force_prefix.load(std::sync::atomic::Ordering::Relaxed) && a.prefix.is_some()),
+        };
+        allowed.then(|| a.resolve_with(model, matches!(only, Some(Only::Provider(_))))).flatten()
+    }
     pub fn reload(&self, cfg: &Config) {
         self.force_prefix.store(cfg.force_model_prefix, std::sync::atomic::Ordering::Relaxed);
         let specs = collect(cfg);
@@ -907,11 +942,23 @@ impl Pool {
                 }
             }
             let discovered = old.get(&s.id).map(|p| p.discovered.read().clone()).unwrap_or_default();
-            let state = AccountState {
-                disabled: s.disabled,
-                counters: old.get(&s.id).map(|p| p.state.lock().counters.clone()).unwrap_or_default(),
-                ..Default::default()
-            };
+            let mut state = old
+                .get(&s.id)
+                .map(|p| {
+                    let st = p.state.lock();
+                    AccountState {
+                        cooldowns: st.cooldowns.clone(),
+                        exhausted: st.exhausted.clone(),
+                        strikes: st.strikes,
+                        last_error: st.last_error.clone(),
+                        last_used: st.last_used,
+                        counters: st.counters.clone(),
+                        quota: st.quota.clone(),
+                        ..Default::default()
+                    }
+                })
+                .unwrap_or_default();
+            state.disabled = s.disabled;
             next.push(Arc::new(Account {
                 id: s.id,
                 provider: s.provider,
@@ -1074,14 +1121,14 @@ impl Pool {
         if candidates.is_empty() {
             return earliest.map(Pick::Cooling).unwrap_or(Pick::None);
         }
-        // Prefer the model vendor's own accounts; aggregators take the overflow.
-        if candidates.iter().any(|(a, _)| a.first_party(model)) {
-            candidates.retain(|(a, _)| a.first_party(model));
-        }
         if let Some(pin) = pinned
             && let Some((a, m)) = candidates.iter().find(|(a, _)| a.id == pin)
         {
             return Pick::Ok((*a).clone(), m.clone());
+        }
+        // Prefer the model vendor for new assignments, while preserving existing overflow pins.
+        if candidates.iter().any(|(a, _)| a.first_party(model)) {
+            candidates.retain(|(a, _)| a.first_party(model));
         }
         let idx = match routing {
             Routing::FillFirst => 0,

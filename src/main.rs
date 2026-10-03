@@ -1,4 +1,5 @@
 mod accounts;
+mod affinity;
 mod antigravity;
 mod banked_resets;
 mod compat;
@@ -13,6 +14,8 @@ mod mgmt;
 mod oauth;
 mod proxy;
 mod quota;
+#[cfg(test)]
+mod routing_tests;
 mod schema;
 mod server;
 mod sse;
@@ -143,7 +146,7 @@ async fn serve(app: Arc<App>) -> Result<()> {
     }
     println!();
 
-    let service = server::router(app).into_make_service_with_connect_info::<SocketAddr>();
+    let service = server::router(app.clone()).into_make_service_with_connect_info::<SocketAddr>();
     if let Some(tls) = tls {
         let handle = axum_server::Handle::new();
         let stop = handle.clone();
@@ -155,6 +158,7 @@ async fn serve(app: Arc<App>) -> Result<()> {
     } else {
         axum::serve(listener, service).with_graceful_shutdown(shutdown_signal()).await?;
     }
+    app.sessions.save();
     Ok(())
 }
 
@@ -195,6 +199,7 @@ async fn watch(app: Arc<App>) {
     let mut auth = auth_signature(&app.cfg().auth_dir());
     loop {
         tokio::time::sleep(Duration::from_secs(2)).await;
+        app.sessions.flush(app.cfg().session_affinity_idle_seconds);
         let t = mtime(&app.cfg_path);
         if t != cfg_time {
             cfg_time = t;
@@ -305,6 +310,11 @@ fn check(path: &Path) -> Result<()> {
         }
     );
     println!("  routing      {:?}, {} accounts per request", cfg.routing, cfg.request_retry.max(1));
+    println!(
+        "  affinity     {}, idle expiry {}s",
+        if cfg.session_affinity { "on" } else { "off" },
+        cfg.session_affinity_idle_seconds
+    );
     if !cfg.proxy_url.is_empty() {
         println!("  proxy        {}", cfg.proxy_url);
     }
