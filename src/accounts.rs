@@ -745,7 +745,7 @@ fn collect(cfg: &Config) -> Vec<Spec> {
             specs.push(Spec {
                 id: key_id(provider.as_str(), &e.api_key),
                 provider,
-                label: e.label.clone().unwrap_or_else(|| mask(&e.api_key)),
+                label: e.label.clone().filter(|s| !s.is_empty()).unwrap_or_else(|| mask(&e.api_key)),
                 path: None,
                 group: None,
                 models: e.models.clone(),

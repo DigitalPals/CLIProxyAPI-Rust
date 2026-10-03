@@ -420,6 +420,7 @@ async fn ui_index() -> Response {
 async fn ui_asset(Path(file): Path<String>) -> Response {
     let (body, ctype) = match file.as_str() {
         "app.js" => (APP_JS, "text/javascript; charset=utf-8"),
+        "config.js" => (include_str!("../ui/config.js"), "text/javascript; charset=utf-8"),
         "style.css" => (STYLE, "text/css; charset=utf-8"),
         "icon.svg" => (ICON, "image/svg+xml"),
         _ => return StatusCode::NOT_FOUND.into_response(),

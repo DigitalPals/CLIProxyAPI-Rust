@@ -107,7 +107,7 @@ cliproxyapi-rust --config config.yaml check
 | `oauth-model-alias`, `oauth-excluded-models`, per-file `prefix` and `model_aliases` | Used as is |
 | Payload rules, plugins, Redis usage queue, weighted routing, session affinity, the `/v0/management` API | Not supported. The built-in dashboard replaces the separate management panel. |
 
-Changes made from the dashboard keep your file's layout and every setting this binary doesn't use, so you can switch back at any time. Rewriting a file drops its YAML comments, so the first change saves the original as `config.yaml.bak`.
+Changes made from the dashboard keep your file's layout, YAML comments, and settings this binary doesn't use, so you can switch back at any time.
 
 ## Connect your tools
 
@@ -221,7 +221,7 @@ Everything is served from the binary at `/`, with no external requests.
 <td width="50%" valign="top"><img src="assets/screenshots/requests.png" alt="Live request log showing routes between client formats and providers, latency and tokens"></td>
 </tr>
 <tr>
-<td valign="top"><b>Accounts:</b> how much of each 5-hour and weekly limit is used, token expiry, cooldown timers per model, and one-click enable, refresh or remove.</td>
+<td valign="top"><b>Accounts:</b> used or remaining 5-hour and weekly quota with colored meters, token expiry, cooldown timers per model, and one-click enable, refresh or remove.</td>
 <td valign="top"><b>Requests:</b> every request as it happens, showing which client format went to which provider, time to first token, and tokens.</td>
 </tr>
 <tr>
@@ -236,9 +236,13 @@ Sharing a screenshot or your screen? The eye button in the top bar hides every e
 
 <sub>Screenshots use sample data.</sub>
 
+Choose **Used** or **Remaining** beside the quota meters on Overview or Accounts. The preference is remembered in your browser and applies to both pages. Colors always reflect capacity remaining: green above 25%, amber above 5% through 25%, and red at 5% or less. Exhausted quotas keep a red outline and label even when the remaining bar is empty. Unreported or expired quotas show a dash; reset countdowns stay visible for current windows.
+
 ## Configuration
 
 `config.yaml` reloads automatically when it changes, and the dashboard edits the same file.
+
+The dashboard's Config page provides forms for server and access settings, routing, connections, provider keys, model rules, and diagnostics. Settings that need explanation have brief descriptions. Save changes applies the whole draft; Discard changes restores the last saved values. Keys stay masked until revealed, and leaving an existing key blank keeps it unchanged. If the file changes elsewhere, reload the latest settings before saving. Bind address, port, HTTPS, and debug logging changes require a restart; the page shows which changes are pending.
 
 ```yaml
 host: "127.0.0.1"             # 0.0.0.0 to expose it (set api-keys first)

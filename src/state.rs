@@ -17,6 +17,9 @@ use crate::ir::Usage;
 pub struct App {
     cfg: ArcSwap<Config>,
     pub cfg_path: PathBuf,
+    pub config_write: Mutex<()>,
+    /// Startup settings remain separate from hot-reloaded settings.
+    pub startup_config: Config,
     pub pool: Pool,
     pub http: Http,
     pub stats: Stats,
@@ -34,8 +37,10 @@ impl App {
         let (live, _) = broadcast::channel(512);
         Arc::new(Self {
             http: Http::new(&cfg.proxy_url),
+            startup_config: cfg.clone(),
             cfg: ArcSwap::from_pointee(cfg),
             cfg_path,
+            config_write: Mutex::new(()),
             pool,
             stats: Stats::default(),
             logins: Mutex::new(HashMap::new()),

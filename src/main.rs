@@ -2,6 +2,7 @@ mod accounts;
 mod antigravity;
 mod compat;
 mod config;
+mod config_editor;
 mod device;
 mod devin;
 mod formats;
@@ -196,6 +197,7 @@ async fn watch(app: Arc<App>) {
         let t = mtime(&app.cfg_path);
         if t != cfg_time {
             cfg_time = t;
+            let _guard = app.config_write.lock();
             match std::fs::read_to_string(&app.cfg_path).map_err(anyhow::Error::from).and_then(|s| Config::parse(&s)) {
                 Ok(cfg) => {
                     tracing::info!("config reloaded");
