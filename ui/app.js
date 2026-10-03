@@ -23,7 +23,8 @@ const S = {
   setup: localStorage.getItem('cliproxyapi-rust.setup'), // 'open' | 'closed' | null (auto)
   quotaDisplay: localStorage.getItem('cliproxyapi-rust.quota-display') === 'remaining' ? 'remaining' : 'used',
   confirm: null,
-  resets: {}, // account-specific pending dialogs and errors
+  resets: {}, // account-specific confirmations and errors
+  resetModal: null,
   config: { values: null, saved: null, defaults: {}, revision: '', path: '', ignored: [], restart_fields: [],
     msg: null, busy: false, loading: false, section: 'server', provider: 'claude', oauthProvider: 'claude',
     errors: {}, opens: {}, secrets: {}, reloadConfirm: false },
@@ -147,6 +148,7 @@ function refreshAccounts() {
       patch('acct-list', accountListHTML);
       patch('acct-head', accountHeadHTML);
       patch('endpoint', endpointHTML);
+      syncResetModal();
     } catch {}
   }, 250);
 }
@@ -258,12 +260,13 @@ function render() {
     else a.removeAttribute('aria-current');
   }
   renderStatus();
-  if (S.locked) { view.innerHTML = lockHTML(); bindLock(); return; }
+  if (S.locked) { closeResetModal(); view.innerHTML = lockHTML(); bindLock(); return; }
   if (!S.overview) { view.innerHTML = skeletonHTML(); return; }
   const pages = { overview: overviewHTML, accounts: accountsHTML, requests: requestsHTML, config: configHTML };
   view.innerHTML = (pages[S.route] || overviewHTML)();
   if (S.route === 'config') bindConfig();
   if (S.route === 'requests') bindRequests();
+  syncResetModal();
 }
 
 function skeletonHTML() {
@@ -749,12 +752,11 @@ function accountListHTML() {
          <button class="btn ghost small" data-act="confirm-delete" data-id="${esc(a.id)}" aria-label="Remove ${esc(a.label)}" title="Remove">${ICON.trash}</button>`;
     const c = a.counters;
     return `<div class="row">
-      <div class="acct-name"><span class="dot ${esc(a.provider)}"></span><span class="who"><span class="label">${esc(a.label)}</span><span class="sub">${esc(acctSub(a))}</span></span></div>
+      <div class="acct-name"><span class="dot ${esc(a.provider)}"></span><span class="who"><span class="label">${esc(a.label)}</span><span class="sub">${esc(acctSub(a))}</span>${bankedSummaryHTML(a)}</span></div>
       <div class="stack">${statusHTML(a, false)}${cooling ? `<span class="sub">${esc(acctStatus(a).scope)} · <button class="linkbtn" data-act="reset" data-id="${esc(a.id)}" title="Clear local cooldowns; refresh quota to verify provider limits">Clear cooldowns</button></span>` : ''}<span class="sub quota-sub">${limitsHTML(a)}</span></div>
       <div class="stack hide-md"><span class="main"><b>${fmt(c.requests)}</b> ${c.requests === 1 ? 'request' : 'requests'}</span><span class="sub">${fmt(c.input_tokens)} in · ${fmt(c.output_tokens)} out${c.failures ? ` · <span class="err">${fmt(c.failures)} failed</span>` : ''}</span></div>
       <span class="num hide-md" style="text-align:left" data-ago="${esc(a.last_used || '')}">${ago(a.last_used)}</span>
       <div class="row-actions">${actions}</div>
-      ${bankedResetsHTML(a)}
       ${a.last_error ? `<div class="acct-err">${esc(a.last_error)}</div>` : ''}
     </div>`;
   }).join('');
@@ -764,82 +766,118 @@ function accountListHTML() {
 // banked resets ----------------------------------------------------------
 
 function hasBankedResets(a) { return a.kind === 'oauth' && ['claude', 'codex'].includes(a.provider); }
+function bankedLabel(a) {
+  const r = a.banked_resets;
+  if (['pending', 'unknown'].includes(r?.operation?.status)) return 'Reset needs review';
+  const count = !r?.error ? r?.inventory?.available : null;
+  return count == null ? 'Resets unavailable' : `${count} reset${count === 1 ? '' : 's'} available`;
+}
 function bankedSummaryHTML(a) {
   if (!hasBankedResets(a)) return '';
-  const r = a.banked_resets, inv = r?.inventory;
-  const uncertain = ['pending', 'unknown'].includes(r?.operation?.status);
-  const expiry = (inv?.grants || []).filter((g) => g.remaining && g.expires_at && Date.parse(g.expires_at) > Date.now()).sort((a, b) => Date.parse(a.expires_at) - Date.parse(b.expires_at))[0]?.expires_at;
-  const text = uncertain ? 'Reset needs review' : r?.error || !inv ? 'Banked resets unknown' : `${inv.available ?? '?'} banked reset${inv.available === 1 ? '' : 's'}`;
-  return `<a class="sub banked-summary${uncertain ? ' warn' : ''}" href="#/accounts" title="${esc(expiry ? `Next reset expires ${new Date(expiry).toLocaleString()}` : 'Manage banked subscription resets')}">${esc(text)}${expiry && !uncertain ? ` · expires in <span data-until="${esc(expiry)}">${until(expiry)}</span>` : ''}</a>`;
+  const review = ['pending', 'unknown'].includes(a.banked_resets?.operation?.status);
+  return `<button type="button" class="reset-badge${review ? ' warn' : ''}" data-act="banked-details" data-id="${esc(a.id)}" aria-haspopup="dialog" aria-controls="banked-reset-modal" aria-label="${esc(bankedLabel(a))} for ${esc(a.label)}">${esc(bankedLabel(a))}</button>`;
 }
 function resetButton(a, act, label, disabled = false, extra = '') {
-  return `<button type="button" class="btn small ${act === 'banked-confirm' ? 'primary' : 'ghost'}" data-act="${act}" data-id="${esc(a.id)}" ${disabled ? 'disabled' : ''} ${extra}>${label}</button>`;
+  return `<button type="button" class="btn small ${['banked-open', 'banked-confirm'].includes(act) ? 'primary' : 'ghost'}" data-act="${act}" data-id="${esc(a.id)}" ${disabled ? 'disabled' : ''} ${extra}>${label}</button>`;
+}
+function resetDate(value) {
+  return value ? new Date(value).toLocaleString(undefined, { dateStyle: 'medium', timeStyle: 'short' }) : 'No expiry reported';
+}
+function grantDetail(g) {
+  return `${g.expires_at ? `Expires ${resetDate(g.expires_at)}` : 'No expiry reported'} · Clears ${g.clears.join(', ') || 'provider limits'}`;
 }
 function bankedResetsHTML(a) {
-  if (!hasBankedResets(a)) return '';
-  const local = S.resets[a.id] || {}, r = a.banked_resets, inv = r?.inventory, op = r?.operation;
+  const local = S.resets[a.id] || {}, r = a.banked_resets, inv = r?.inventory, op = r?.operation, d = local.dialog;
   const uncertain = ['pending', 'unknown'].includes(op?.status);
   const stale = !r || !(Date.parse(r.checked_at) > Date.now() - 5 * 60 * 1000);
   const expiryChanged = inv?.grants?.some((g) => g.usable && ((g.expires_at && Date.parse(g.expires_at) <= Date.now()) || (g.starts_at && Date.parse(g.starts_at) > Date.now())));
-  const disabled = local.busy || a.disabled;
-  const usable = !disabled && !r?.error && !stale && !expiryChanged && inv?.eligible && r?.quote && !uncertain;
-  const summary = inv && !r?.error ? `${inv.available ?? '?'} banked reset${inv.available === 1 ? '' : 's'}${inv.applicable != null ? ` · ${inv.applicable} usable now` : ''}` : 'Banked resets unknown';
-  const grants = (inv?.grants || []).map((g) => `<li><div><b>${esc(g.label || 'Subscription reset')}</b> · ${g.remaining} left${g.expires_at ? ` · expires ${esc(new Date(g.expires_at).toLocaleString())}` : ''}</div><span class="sub">Clears ${esc(g.clears.join(', ') || 'provider limits')}${g.reason ? ` · ${esc(g.reason)}` : ''}</span></li>`).join('');
-  let controls = `${resetButton(a, 'banked-refresh', local.busy ? 'Checking…' : 'Refresh quota & resets', local.busy)}${resetButton(a, 'banked-open', 'Use 1 reset', !usable, r ? `data-reset-deadline="${esc(new Date(Date.parse(r.checked_at) + 5 * 60 * 1000).toISOString())}"` : '')}`;
-  let dialog = '';
-  if (uncertain) {
-    const retryable = r.retryable && Date.parse(op.retry_until) > Date.now();
-    controls = `${resetButton(a, 'banked-refresh', 'Refresh status', local.busy)}${resetButton(a, 'banked-retry', 'Retry same request', disabled || !retryable, `data-reset-deadline="${esc(op.retry_until)}"`)}${resetButton(a, 'banked-resolve', 'Reconcile outcome', local.busy)}`;
-    dialog = `<p class="warn">${esc(op.message)} New spending is blocked.${retryable ? ' A retry reuses the saved request ID.' : a.provider === 'codex' ? ' Verify the outcome with the provider before reconciling.' : ' The retry window has ended.'}</p>`;
-  }
-  if (local.dialog) {
-    const d = local.dialog;
+  const usable = !local.busy && !a.disabled && !r?.error && !stale && !expiryChanged && inv?.eligible && r?.quote && !uncertain;
+  let title = 'Banked resets', content, controls;
+  if (d) {
     const confirmedInventory = d.inventory || inv;
     const grant = confirmedInventory?.grants?.find((g) => g.id === d.grant);
-    let prompt;
-    if (d.action === 'redeem') prompt = `Use one banked reset for ${esc(a.label)}? ${a.provider === 'codex' ? 'Codex chooses the grant and resets its subscription limits.' : `This uses ${esc(grant?.label || 'the selected grant')} and clears ${esc(grant?.clears.join(', ') || 'its usage windows')}.`} This consumes one saved reset.`;
-    else if (d.action === 'retry') prompt = 'Retry the saved request? A reset may already have been spent. This sends the same request ID; it does not start a new redemption.';
-    else prompt = 'Check your provider account first. Confirm whether the saved request spent a reset. This records your finding and permits future spending.';
-    const selection = d.action === 'redeem' && a.provider === 'claude' ? `<label>Grant <select data-reset-grant="${esc(a.id)}">${(confirmedInventory?.grants || []).filter((g) => g.usable).map((g) => `<option value="${esc(g.id)}" ${g.id === d.grant ? 'selected' : ''}>${esc(g.label)} · ${g.remaining} left</option>`).join('')}</select></label>` : '';
-    dialog += `<div class="reset-confirm" role="group" aria-label="Confirm banked reset"><p>${prompt}</p>${selection}<div class="actions">${d.action === 'resolve' ? `${resetButton(a, 'banked-confirm', 'Verified: reset was used', local.busy, 'data-resolution="resolve-used"')}${resetButton(a, 'banked-confirm', 'Verified: no reset was used', local.busy, 'data-resolution="resolve-unused"')}` : resetButton(a, 'banked-confirm', d.action === 'retry' ? 'Confirm retry' : 'Confirm: use 1 reset', local.busy)}${resetButton(a, 'banked-cancel', 'Cancel', local.busy)}</div></div>`;
-    controls = '';
+    if (d.action === 'redeem') {
+      title = 'Use 1 reset?';
+      const choices = (confirmedInventory?.grants || []).filter((g) => g.usable);
+      const selection = a.provider === 'claude' && choices.length > 1
+        ? `<label class="reset-selection">Grant<select data-reset-grant="${esc(a.id)}" ${local.busy ? 'disabled' : ''}>${choices.map((g) => `<option value="${esc(g.id)}" ${g.id === d.grant ? 'selected' : ''}>${esc(g.label)} · ${g.remaining} left</option>`).join('')}</select></label>`
+        : grant ? `<p class="reset-grant-name">${esc(grant.label)}</p>` : '';
+      content = `<p>This uses one saved reset.</p>${a.provider === 'codex' ? '<p class="sub">Codex chooses the reset and restores its subscription limits.</p>' : `${selection}${grant ? `<p class="sub">${esc(grantDetail(grant))}</p>` : ''}`}`;
+      controls = `${resetButton(a, 'banked-cancel', 'Back', local.busy)}${resetButton(a, 'banked-confirm', local.busy ? 'Applying…' : 'Apply reset', local.busy || a.disabled)}`;
+    } else if (d.action === 'retry') {
+      title = 'Retry reset request?';
+      content = '<p>A reset may already have been used. This retries the saved request.</p>';
+      controls = `${resetButton(a, 'banked-cancel', 'Back', local.busy)}${resetButton(a, 'banked-confirm', local.busy ? 'Retrying…' : 'Confirm retry', local.busy || a.disabled)}`;
+    } else {
+      title = 'Resolve reset outcome';
+      content = '<p>Check your provider account first, then record the result.</p>';
+      controls = `${resetButton(a, 'banked-cancel', 'Back', local.busy)}${resetButton(a, 'banked-confirm', 'Reset was used', local.busy, 'data-resolution="resolve-used"')}${resetButton(a, 'banked-confirm', 'No reset was used', local.busy, 'data-resolution="resolve-unused"')}`;
+    }
+  } else {
+    const grants = (inv?.grants || []).map((g) => `<li><div class="reset-grant-head"><b>${esc(g.label || 'Subscription reset')}</b><span>${g.remaining} left</span></div><p class="sub">${esc(grantDetail(g))}</p>${g.reason ? `<p class="sub">${esc(g.reason)}</p>` : ''}</li>`).join('');
+    const reason = a.disabled ? 'Enable this account to apply a reset.' : stale || expiryChanged ? 'Refresh to check availability.' : inv?.reason;
+    const message = uncertain ? '<p class="warn">A reset may have been used. New resets are blocked until resolved.</p>' : op ? `<p class="${['applied', 'reconciled_used'].includes(op.status) ? 'ok' : 'sub'}" role="status">${esc(op.message)}</p>` : '';
+    content = `<p class="reset-count">${esc(bankedLabel(a))}${inv?.applicable != null && inv.applicable !== inv.available && !r?.error ? `<span class="sub"> · ${inv.applicable} usable now</span>` : ''}</p>${grants ? `<ul class="reset-grants">${grants}</ul>` : ''}${reason && !r?.error ? `<p class="sub">${esc(reason)}</p>` : ''}${message}`;
+    controls = `${resetButton(a, 'banked-refresh', local.busy ? 'Checking…' : 'Refresh', local.busy)}${resetButton(a, 'banked-open', 'Use 1 reset', !usable, r?.checked_at ? `data-reset-deadline="${esc(new Date(Date.parse(r.checked_at) + 5 * 60 * 1000).toISOString())}"` : '')}`;
+    if (uncertain) {
+      const retryable = a.provider === 'claude' && r.retryable && Date.parse(op.retry_until) > Date.now();
+      controls = `${resetButton(a, 'banked-refresh', local.busy ? 'Checking…' : 'Refresh', local.busy)}${retryable ? resetButton(a, 'banked-retry', 'Retry request', local.busy || a.disabled, `data-reset-deadline="${esc(op.retry_until)}"`) : ''}${resetButton(a, 'banked-resolve', 'Check outcome', local.busy)}`;
+    }
   }
-  const status = op && !uncertain ? `<p class="${['applied', 'reconciled_used'].includes(op.status) ? 'ok' : 'sub'}">${esc(op.message)}</p>` : '';
-  const reason = a.disabled ? 'Enable this account to apply a reset.' : stale || expiryChanged ? 'Refresh to check current eligibility.' : !r?.quote && !uncertain && inv?.eligible ? 'Refresh before using another reset.' : inv?.reason;
-  return `<section class="banked-resets" aria-label="Banked resets for ${esc(a.label)}"><div class="banked-head"><b>${esc(summary)}</b><div class="actions">${controls}</div></div>
-    <p class="sub reset-help">Banked resets restore subscription usage windows. Purchased credit balances are separate. Applying a reset is always manual.</p>
-    ${reason ? `<p class="sub">${esc(reason)}</p>` : ''}${grants ? `<details data-reset-details="${esc(a.id)}" ${local.expanded ? 'open' : ''}><summary>Grant details (${inv.grants.length})</summary><ul class="reset-grants">${grants}</ul></details>` : ''}
-    ${status}${dialog}${local.error || r?.error ? `<p class="err" role="alert">${esc(local.error || r.error)}</p>` : ''}${r ? `<span class="sub">Checked <span data-ago="${esc(r.checked_at)}">${ago(r.checked_at)}</span>${stale ? ' · stale' : ''}</span>` : ''}</section>`;
+  return `<header class="reset-modal-head"><div><h2 id="reset-modal-title">${title}</h2><p id="reset-modal-account">${esc(a.label)} · ${esc(PROVIDER[a.provider])}</p></div><button type="button" class="btn ghost small reset-close" data-act="banked-close" data-id="${esc(a.id)}" aria-label="Close reset details">×</button></header>
+    <div class="reset-modal-body" aria-busy="${!!local.busy}">${content}${local.error || r?.error ? `<p class="err" role="alert">${esc(local.error || r.error)}</p>` : ''}</div>
+    <footer class="reset-modal-footer">${!d && r ? `<span class="sub">Checked <span data-ago="${esc(r.checked_at)}">${ago(r.checked_at)}</span></span>` : ''}<div class="actions">${controls}</div></footer>`;
 }
-function patchResets() { patch('acct-list', accountListHTML); patch('ov-accounts', ovAccountsHTML); }
+function syncResetModal() {
+  if (!S.resetModal) return;
+  const a = (S.accounts || []).find((a) => a.id === S.resetModal);
+  if (!a || S.locked) { closeResetModal(); return; }
+  patch('banked-reset-modal', () => bankedResetsHTML(a));
+  const modal = $('#banked-reset-modal');
+  if (!modal.open) modal.showModal();
+}
+function closeResetModal() {
+  const id = S.resetModal;
+  if (!id) return;
+  S.resetModal = null;
+  if (S.resets[id]) S.resets[id].dialog = null;
+  $('#banked-reset-modal').close();
+  document.querySelector(`[data-act="banked-details"][data-id="${CSS.escape(id)}"]`)?.focus({ preventScroll: true });
+}
+function patchResets() {
+  patch('acct-list', accountListHTML);
+  patch('ov-accounts', ovAccountsHTML);
+  syncResetModal();
+}
 async function bankedAction(act, id, resolution) {
   let a = (S.accounts || []).find((x) => x.id === id);
   if (!a) return;
   const local = S.resets[id] ||= {};
-  if (local.busy) return;
-  if (act === 'banked-cancel') { local.dialog = null; patchResets(); $(`[data-act="banked-refresh"][data-id="${CSS.escape(id)}"]`)?.focus(); return; }
-  if (act === 'banked-resolve') {
-    local.dialog = { action: 'resolve', request: a.banked_resets?.operation?.request_id };
-    patchResets(); $(`[data-act="banked-cancel"][data-id="${CSS.escape(id)}"]`)?.focus(); return;
+  if (act === 'banked-details') {
+    S.resetModal = id;
+    local.dialog = null;
+    syncResetModal();
+    if (local.busy) return;
   }
-  if (act === 'banked-retry') {
-    local.dialog = { action: 'retry', request: a.banked_resets?.operation?.request_id };
-    patchResets(); $(`[data-act="banked-cancel"][data-id="${CSS.escape(id)}"]`)?.focus(); return;
+  if (local.busy) return;
+  if (act === 'banked-cancel') { local.dialog = null; syncResetModal(); $('#banked-reset-modal [data-act="banked-close"]')?.focus(); return; }
+  if (act === 'banked-resolve' || act === 'banked-retry') {
+    local.dialog = { action: act === 'banked-retry' ? 'retry' : 'resolve', request: a.banked_resets?.operation?.request_id };
+    syncResetModal(); $('#banked-reset-modal [data-act="banked-cancel"]')?.focus(); return;
   }
   local.busy = true; local.error = null;
   patchResets();
   try {
     const path = `/accounts/${encodeURIComponent(id)}/banked-resets`;
-    if (act === 'banked-refresh' || act === 'banked-open') {
+    if (['banked-details', 'banked-refresh', 'banked-open'].includes(act)) {
       const r = await api(act === 'banked-refresh' ? `/accounts/${encodeURIComponent(id)}/quota/refresh` : path, act === 'banked-refresh' ? { method: 'POST' } : {});
       a = (S.accounts || []).find((x) => x.id === id) || a;
       a.banked_resets = r;
-      if (act === 'banked-open' && r.quote && r.inventory?.eligible && !r.error) {
+      if (act === 'banked-open' && S.resetModal === id && r.quote && r.inventory?.eligible && !r.error) {
         local.dialog = { action: 'redeem', request: r.quote, grant: r.inventory.selected_grant || '', inventory: r.inventory };
       }
     } else if (act === 'banked-confirm' && local.dialog) {
       const d = local.dialog;
-      // Keep the exact ID on connection failure. A new claim is never sent automatically.
       const result = await api(path, { method: 'POST', body: JSON.stringify({ action: d.action === 'resolve' ? resolution : d.action, request_id: d.request, grant_id: d.grant || '', confirmed: true }) });
       a = (S.accounts || []).find((x) => x.id === id) || a;
       a.banked_resets = result;
@@ -849,27 +887,36 @@ async function bankedAction(act, id, resolution) {
     local.error = e.message;
     if (act === 'banked-confirm') {
       local.dialog = null;
+      a = (S.accounts || []).find((x) => x.id === id) || a;
       if (a.banked_resets) a.banked_resets.quote = null;
-      local.error += ' Refresh status before taking another action.';
+      local.error += ' Refresh status before continuing.';
     }
   } finally {
     local.busy = false;
     patchResets();
     refreshAccounts();
-    $(`[data-act="${local.dialog ? 'banked-cancel' : 'banked-refresh'}"][data-id="${CSS.escape(id)}"]`)?.focus();
+    if (S.resetModal === id) $('#banked-reset-modal [data-act="banked-cancel"], #banked-reset-modal [data-act="banked-close"]')?.focus();
   }
 }
 document.addEventListener('change', (e) => {
   if (e.target.matches('[data-reset-grant]')) {
     const local = S.resets[e.target.dataset.resetGrant];
-    if (local?.dialog) { local.dialog.grant = e.target.value; patchResets(); }
+    if (local?.dialog) { local.dialog.grant = e.target.value; syncResetModal(); }
   }
 });
-document.addEventListener('toggle', (e) => {
-  if (e.target.isConnected && e.target.matches?.('[data-reset-details]')) {
-    (S.resets[e.target.dataset.resetDetails] ||= {}).expanded = e.target.open;
-  }
-}, true);
+const resetModal = $('#banked-reset-modal');
+resetModal.addEventListener('cancel', (e) => { e.preventDefault(); closeResetModal(); });
+resetModal.addEventListener('keydown', (e) => {
+  if (e.key !== 'Tab') return;
+  const targets = [...resetModal.querySelectorAll('button:not([disabled]), select:not([disabled])')];
+  const first = targets[0], last = targets.at(-1);
+  if (e.shiftKey && document.activeElement === first) { e.preventDefault(); last?.focus(); }
+  else if (!e.shiftKey && document.activeElement === last) { e.preventDefault(); first?.focus(); }
+});
+resetModal.addEventListener('click', (e) => {
+  const box = resetModal.getBoundingClientRect();
+  if (e.target === resetModal && (e.clientX < box.left || e.clientX > box.right || e.clientY < box.top || e.clientY > box.bottom)) closeResetModal();
+});
 
 // requests --------------------------------------------------------------
 
@@ -1127,7 +1174,8 @@ document.addEventListener('click', (e) => {
     case 'cancel-delete':
       S.confirm = null;
       return patch('acct-list', accountListHTML);
-    case 'banked-refresh': case 'banked-open': case 'banked-confirm': case 'banked-cancel': case 'banked-retry': case 'banked-resolve':
+    case 'banked-close': return closeResetModal();
+    case 'banked-details': case 'banked-refresh': case 'banked-open': case 'banked-confirm': case 'banked-cancel': case 'banked-retry': case 'banked-resolve':
       return bankedAction(act, id, el.dataset.resolution);
     case 'toggle': case 'refresh': case 'reset': case 'delete':
       return accountAction(act, id);
@@ -1164,6 +1212,7 @@ document.addEventListener('submit', async (e) => {
 // ---------------------------------------------------------------- routing + timers
 
 function onRoute() {
+  closeResetModal();
   const r = (location.hash.replace(/^#\/?/, '') || 'overview').split('/')[0];
   S.route = ['overview', 'accounts', 'requests', 'config'].includes(r) ? r : 'overview';
   if (S.route !== 'config') S.config.msg = null;
@@ -1188,6 +1237,7 @@ setInterval(() => {
   if ([...document.querySelectorAll('[data-quota-reset]')].some((el) => Date.parse(el.dataset.quotaReset) <= Date.now())) {
     patch('ov-accounts', ovAccountsHTML);
     patch('acct-list', accountListHTML);
+    syncResetModal();
     expired = true;
   }
   if (expired) refreshAccounts();

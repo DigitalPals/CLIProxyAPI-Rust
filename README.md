@@ -236,7 +236,7 @@ Everything is served from the binary at `/`, with no external requests.
 
 Choose **Used** or **Remaining** beside the quota meters on Overview or Accounts. The preference is remembered in your browser and applies to both pages. Colors always reflect capacity remaining: green above 25%, amber above 5% through 25%, and red at 5% or less. Exhausted quotas keep a red outline and label even when the remaining bar is empty. Unreported or expired quotas show a dash; reset countdowns stay visible for current windows.
 
-Codex and Claude subscription accounts also show banked resets, grant expiry, and eligibility. Use **Refresh quota & resets** after a reset made elsewhere, or **Use 1 reset** to review and manually redeem one. Interrupted requests stay in a durable journal and block further spending until recovered or reconciled. See [banked reset controls and recovery](docs/banked-resets.md).
+Codex and Claude subscription accounts show a reset availability badge. Click it for expiry, eligibility, and manual redemption. In the modal, use **Refresh** after a reset made elsewhere, or **Use 1 reset** to review and manually redeem one. Interrupted requests stay in a durable journal and block further spending until recovered or reconciled. See [banked reset controls and recovery](docs/banked-resets.md).
 
 ## Configuration
 

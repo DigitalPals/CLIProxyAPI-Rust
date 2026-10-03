@@ -1,8 +1,8 @@
 # Banked subscription resets
 
-The Accounts page shows banked resets for native Codex and Claude OAuth subscriptions: counts, current eligibility, grant scopes, and expiry. Overview shows the count and nearest future expiry. Purchased monetary credits are separate. Accounts without provider reset metadata show an unknown state rather than zero.
+Overview and Accounts show a compact reset availability badge for native Codex and Claude OAuth subscriptions. Click the badge to open a modal with grant expiry, scopes, and current eligibility. Purchased monetary credits are separate. Accounts without provider reset metadata show an unknown state rather than zero.
 
-Select **Refresh quota & resets** to fetch current provider usage, including after a reset made outside this proxy. Select **Use 1 reset**, review the account and grant, and confirm. Claude defaults to the provider's recommended usable grant, then the earliest expiry; you can choose another usable grant. Codex selects its grant on the provider side. Applying a reset is always manual. API keys, custom endpoints, and disabled accounts cannot redeem.
+In the modal, select **Refresh** to fetch current provider usage, including after a reset made outside this proxy. Select **Use 1 reset**, review the account and grant, and confirm. Claude defaults to the provider's recommended usable grant, then the earliest expiry; you can choose another usable grant. Codex selects its grant on the provider side. Applying a reset is always manual. API keys, custom endpoints, and disabled accounts cannot redeem.
 
 The server rechecks identity, eligibility, and the confirmation before dispatch. A confirmation expires after two minutes. Changes in inventory or a reset submitted from another tab invalidate older confirmations. Confirmed success is saved independently of the subsequent usage refresh: a refresh failure does not change a successful redemption into a failure. Quota windows affected by a confirmed reset are invalidated; unrelated model quotas, disabled state, authentication cooldowns, and overload cooldowns are preserved.
 

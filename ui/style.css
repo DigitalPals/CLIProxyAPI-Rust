@@ -455,20 +455,28 @@ details[open] > summary > .cfg-chevron { transform: rotate(90deg); }
 }
 
 /* Banked subscription resets */
-.banked-summary { white-space: normal; text-decoration: none; }
-.banked-summary:hover { color: var(--fg); text-decoration: underline; }
-.banked-resets { grid-column: 1 / -1; min-width: 0; padding: 12px 14px; border: 1px solid var(--line); border-radius: 8px; font-size: 13px; }
-.banked-head { display: flex; align-items: center; justify-content: space-between; gap: 10px; flex-wrap: wrap; }
-.banked-resets .actions { display: flex; flex-wrap: wrap; gap: 6px; }
-.banked-resets p { margin: 6px 0; overflow-wrap: anywhere; }
-.banked-resets .sub { color: var(--fg-3); font-size: 12px; }
-.banked-resets summary { cursor: pointer; margin: 8px 0; }
-.reset-grants { padding-left: 20px; }
-.reset-grants li { margin: 8px 0; }
-.reset-confirm { margin-top: 10px; padding: 12px; border: 1px solid var(--line); border-radius: 6px; }
-.reset-confirm label { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; margin: 10px 0; }
-.reset-confirm select { max-width: 100%; }
-@media (max-width: 640px) {
-  .banked-resets { grid-area: auto; grid-column: 1 / -1; }
-  .banked-head .actions { width: 100%; }
-}
+.reset-badge { align-self: flex-start; margin-top: 5px; padding: 2px 8px; border: 1px solid var(--line-strong); border-radius: 20px; background: var(--raise); color: var(--fg-2); font: 12px/1.6 var(--font); cursor: pointer; }
+.reset-badge:hover { color: var(--fg); border-color: var(--fg-3); }
+.reset-badge.warn { color: var(--warn); }
+.reset-modal { width: min(480px, calc(100vw - 32px)); max-height: calc(100dvh - 32px); margin: auto; padding: 0; border: 1px solid var(--line-strong); border-radius: 12px; background: var(--raise); color: var(--fg-2); overflow: auto; font-size: 13px; box-shadow: 0 24px 80px #0009; }
+.reset-modal::backdrop { background: #000b; }
+.reset-modal-head { display: flex; justify-content: space-between; align-items: flex-start; gap: 16px; padding: 20px 20px 0; }
+.reset-modal h2 { margin: 0; color: var(--fg); font-size: 18px; font-weight: 600; }
+.reset-modal-head p { margin: 4px 0 0; color: var(--fg-3); font-size: 12px; overflow-wrap: anywhere; }
+.reset-close { font-size: 22px; line-height: 1; }
+.reset-modal-body { padding: 18px 20px; overflow-wrap: anywhere; }
+.reset-modal-body p { margin: 0 0 12px; }
+.reset-modal-body p:last-child { margin-bottom: 0; }
+.reset-modal .sub { color: var(--fg-3); font-size: 12px; }
+.reset-count, .reset-grant-name { color: var(--fg); font-weight: 500; }
+.reset-grants { list-style: none; margin: 0 0 14px; padding: 0; }
+.reset-grants li { padding: 12px 0; border-top: 1px solid var(--line); }
+.reset-grants li:last-child { border-bottom: 1px solid var(--line); }
+.reset-grant-head { display: flex; justify-content: space-between; gap: 12px; }
+.reset-grant-head b { color: var(--fg-2); font-weight: 500; }
+.reset-grant-head span { flex-shrink: 0; font-size: 12px; color: var(--fg-3); }
+.reset-grants li p { margin: 4px 0 0; }
+.reset-modal-footer { padding: 14px 20px; border-top: 1px solid var(--line); display: flex; align-items: center; justify-content: space-between; gap: 12px; flex-wrap: wrap; }
+.reset-modal-footer .actions { display: flex; flex-wrap: wrap; gap: 6px; margin-left: auto; }
+.reset-selection { display: grid; gap: 6px; margin-bottom: 10px; color: var(--fg-3); font-size: 12px; }
+.reset-selection select { width: 100%; min-width: 0; }
