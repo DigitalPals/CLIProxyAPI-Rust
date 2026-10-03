@@ -221,7 +221,7 @@ Everything is served from the binary at `/`, with no external requests.
 <td width="50%" valign="top"><img src="assets/screenshots/requests.png" alt="Live request log showing routes between client formats and providers, latency and tokens"></td>
 </tr>
 <tr>
-<td valign="top"><b>Accounts:</b> how much of each 5-hour and weekly limit is used, token expiry, cooldown timers per model, and one-click enable, refresh or remove.</td>
+<td valign="top"><b>Accounts:</b> used or remaining 5-hour and weekly quota with colored meters, token expiry, cooldown timers per model, and one-click enable, refresh or remove.</td>
 <td valign="top"><b>Requests:</b> every request as it happens, showing which client format went to which provider, time to first token, and tokens.</td>
 </tr>
 <tr>
@@ -233,6 +233,8 @@ Everything is served from the binary at `/`, with no external requests.
 </table>
 
 <sub>Screenshots use sample data.</sub>
+
+Choose **Used** or **Remaining** beside the quota meters on Overview or Accounts. The preference is remembered in your browser and applies to both pages. Colors always reflect capacity remaining: green above 25%, amber above 5% through 25%, and red at 5% or less. Exhausted quotas keep a red outline and label even when the remaining bar is empty. Unreported or expired quotas show a dash; reset countdowns stay visible for current windows.
 
 ## Configuration
 

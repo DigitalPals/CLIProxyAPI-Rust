@@ -21,6 +21,7 @@ const S = {
   keyProvider: 'claude',
   snippet: localStorage.getItem('cliproxyapi-rust.snippet') || 'claude',
   setup: localStorage.getItem('cliproxyapi-rust.setup'), // 'open' | 'closed' | null (auto)
+  quotaDisplay: localStorage.getItem('cliproxyapi-rust.quota-display') === 'remaining' ? 'remaining' : 'used',
   confirm: null,
   config: { values: null, saved: null, defaults: {}, revision: '', path: '', ignored: [], restart_fields: [],
     msg: null, busy: false, loading: false, section: 'server', provider: 'claude', oauthProvider: 'claude',
@@ -338,19 +339,60 @@ function acctSub(a) {
   return parts.join(' · ');
 }
 
+// Quota colors always describe capacity left, whichever percentage is displayed.
+function quotaOf(w, now = Date.now()) {
+  if (!w || typeof w.used !== 'number' || !Number.isFinite(w.used)) return null;
+  if (w.resets_at && !(Date.parse(w.resets_at) > now)) return null;
+  const used = Math.max(0, Math.min(100, w.used));
+  return { used, remaining: 100 - used, cls: used >= 95 ? 'err' : used >= 75 ? 'warn' : 'ok', exhausted: used === 100 };
+}
+
+function quotaPercent(value) {
+  const rounded = Math.round(value * 10) / 10;
+  if (value > 0 && rounded === 0) return '<0.1%';
+  if (value < 100 && rounded === 100) return '>99.9%';
+  return `${rounded}%`;
+}
+
+function quotaView(q) {
+  const mode = S.quotaDisplay;
+  const value = q[mode];
+  const text = `${quotaPercent(value)} ${mode}`;
+  const status = q.exhausted ? 'Exhausted' : q.cls === 'err' ? 'Almost exhausted' : q.cls === 'warn' ? 'Low quota' : 'Healthy';
+  return { mode, value, text, status };
+}
+
+function quotaControlsHTML() {
+  return `<div class="quota-controls"><span class="meta">Quota</span>
+    <div class="seg" role="group" aria-label="Quota display" title="Display preference saved in this browser">
+      ${['used', 'remaining'].map((mode) => `<button type="button" data-act="quota-display" data-id="${mode}" aria-pressed="${S.quotaDisplay === mode}">${mode === 'used' ? 'Used' : 'Remaining'}</button>`).join('')}
+    </div></div>`;
+}
+
+function setQuotaDisplay(mode, persist = true) {
+  S.quotaDisplay = mode === 'remaining' ? 'remaining' : 'used';
+  if (persist) {
+    try { localStorage.setItem('cliproxyapi-rust.quota-display', S.quotaDisplay); } catch {}
+  }
+  patch('ov-accounts', ovAccountsHTML);
+  patch('acct-list', accountListHTML);
+}
+
 // Subscription usage windows (Claude 5h / week, ChatGPT), tightest first.
 function limitsHTML(a, max = 2) {
   const now = Date.now();
   const ws = ((a.quota && a.quota.windows) || [])
-    .filter((w) => !w.model && (!w.resets_at || Date.parse(w.resets_at) > now))
+    .filter((w) => !w.model && quotaOf(w, now))
     .sort((x, y) => y.used - x.used)
     .slice(0, max);
-  if (!ws.length) return '';
+  if (!ws.length) return '<span class="limits none" title="Quota not reported"><span aria-label="Quota not reported">–</span></span>';
   return `<span class="limits">${ws.map((w) => {
-    const p = Math.round(w.used);
-    const cls = p >= 95 ? 'err' : p >= 75 ? 'warn' : '';
+    const q = quotaOf(w, now);
+    const v = quotaView(q);
     const resets = w.resets_at ? `, resets in ${until(w.resets_at)}` : '';
-    return `<span class="limit ${cls}" title="${esc(w.name)} limit: ${p}% used${resets}"><span>${esc(w.name)}</span><span class="bar"><i style="width:${Math.min(100, p)}%"></i></span><span class="pct">${p}%</span></span>`;
+    return `<span class="limit ${q.cls}${q.exhausted ? ' exhausted' : ''}"${w.resets_at ? ` data-quota-reset="${esc(w.resets_at)}"` : ''} title="${esc(w.name)}: ${esc(v.text)} · ${v.status}${resets}">
+      <span>${esc(w.name)}</span><span class="track" role="meter" aria-label="${esc(w.name)} quota ${v.mode}" aria-valuemin="0" aria-valuemax="100" aria-valuenow="${v.value}" aria-valuetext="${esc(v.text)} · ${v.status}"><i style="width:${v.value}%"></i></span>
+      <span class="pct">${esc(v.text)}</span>${q.exhausted ? '<span class="quota-exhausted">Exhausted</span>' : ''}</span>`;
   }).join('')}</span>`;
 }
 
@@ -363,7 +405,7 @@ function statusHTML(a, withScope = true) {
 function windowOf(a, short) {
   const now = Date.now();
   return ((a.quota && a.quota.windows) || [])
-    .filter((w) => !w.model && (!w.resets_at || Date.parse(w.resets_at) > now))
+    .filter((w) => !w.model && quotaOf(w, now))
     .filter((w) => /^\d+h$/.test(w.name) === short)
     .sort((x, y) => y.used - x.used)[0];
 }
@@ -371,14 +413,15 @@ function windowOf(a, short) {
 const hasLimits = (a) => !!(windowOf(a, true) || windowOf(a, false));
 
 function meterHTML(w, label) {
-  if (!w) return `<span class="meter none"><span class="m-lab">${label}</span><span aria-label="${label}: not reported">–</span></span>`;
-  const p = Math.round(w.used);
-  const cls = p >= 95 ? 'err' : p >= 75 ? 'warn' : '';
+  const q = quotaOf(w);
+  if (!q) return `<span class="meter none"><span class="m-lab">${label}</span><span aria-label="${label} quota not reported" title="Quota not reported">–</span></span>`;
+  const v = quotaView(q);
   const reset = w.resets_at
-    ? `<span class="reset">${p >= 100 ? 'Used up, resets in' : 'Resets in'} <span data-until="${esc(w.resets_at)}">${until(w.resets_at)}</span></span>`
-    : '';
-  return `<div class="meter ${cls}">
-    <div class="m-top"><span class="m-lab">${label}</span><span class="track" role="meter" aria-label="${label} used" aria-valuemin="0" aria-valuemax="100" aria-valuenow="${p}"><i style="width:${Math.min(100, p)}%"></i></span><span class="pct">${p}%</span></div>${reset}
+    ? `<span class="reset">${q.exhausted ? '<span class="quota-exhausted">Exhausted</span> · ' : ''}Resets in <span data-until="${esc(w.resets_at)}">${until(w.resets_at)}</span></span>`
+    : q.exhausted ? '<span class="reset"><span class="quota-exhausted">Exhausted</span></span>' : '';
+  return `<div class="meter ${q.cls}${q.exhausted ? ' exhausted' : ''}"${w.resets_at ? ` data-quota-reset="${esc(w.resets_at)}"` : ''}>
+    <div class="m-top"><span class="m-lab">${label}</span><span class="track" role="meter" aria-label="${label} quota ${v.mode}" aria-valuemin="0" aria-valuemax="100" aria-valuenow="${v.value}" aria-valuetext="${esc(v.text)} · ${v.status}" title="${v.status}"><i style="width:${v.value}%"></i></span>
+      <span class="pct"><span>${esc(quotaPercent(v.value))}</span><span class="quota-caption">${v.mode}</span></span></div>${reset}
   </div>`;
 }
 
@@ -391,7 +434,8 @@ const ROUTING = {
 function ovAccountsHTML() {
   const list = S.accounts || [];
   const routing = ROUTING[S.overview.routing] || '';
-  const head = `<div class="section-head"><div class="head-l"><h2>Accounts</h2>${list.length ? `<span class="meta hide-sm">${routing}</span>` : ''}</div><a class="link" href="#/accounts">Manage</a></div>`;
+  const head = `<div class="section-head quota-head"><div class="head-l"><h2>Accounts</h2>${list.length ? `<span class="meta hide-sm">${routing}</span>` : ''}</div>
+    <div class="quota-actions">${quotaControlsHTML()}<a class="link" href="#/accounts">Manage</a></div></div>`;
   if (!list.length) {
     return `${head}<div class="empty list">
       <h3>No accounts connected</h3>
@@ -406,7 +450,8 @@ function ovAccountsHTML() {
   // Subscriptions that report their limits lead; the rest follow in pool order.
   const sorted = [...list.filter(hasLimits), ...list.filter((a) => !hasLimits(a))];
   const shown = sorted.slice(0, 10);
-  const limits = list.some(hasLimits);
+  const limits = list.some((a) => (a.kind === 'oauth' && ['claude', 'codex'].includes(a.provider))
+    || (a.quota?.windows || []).some((w) => !w.model));
   const name = (a) => `<div class="acct-name"><span class="dot ${esc(a.provider)}"></span><span class="who"><span class="label">${esc(a.label)}</span><span class="sub">${esc(acctSub(a))}</span></span></div>`;
   const req = (a) => `<span class="num"><b>${fmt(a.counters.requests)}</b> req</span>`;
   const more = list.length > shown.length ? `<p class="note"><a class="link" href="#/accounts">${list.length - shown.length} more</a></p>` : '';
@@ -415,11 +460,10 @@ function ovAccountsHTML() {
     return `${head}<div class="list">${rows}</div>${more}`;
   }
   const rows = shown.map((a) => {
-    const lim = hasLimits(a);
     return `<div class="row lim-row">
       ${name(a)}
-      <div class="lim-5h">${lim ? meterHTML(windowOf(a, true), '5h') : ''}</div>
-      <div class="lim-wk">${lim ? meterHTML(windowOf(a, false), 'Week') : ''}</div>
+      <div class="lim-5h">${meterHTML(windowOf(a, true), '5h')}</div>
+      <div class="lim-wk">${meterHTML(windowOf(a, false), 'Week')}</div>
       <div class="lim-status">${statusHTML(a, false)}</div>
       <div class="lim-req hide-md">${req(a)}</div>
     </div>`;
@@ -684,7 +728,8 @@ function accountListHTML() {
     return `<div class="empty" style="border-top:1px solid var(--line)"><h3>No accounts yet</h3>
       <p>Connect a subscription or add an API key above, or run <code>cliproxyapi-rust login &lt;provider&gt;</code> on the server. Existing CLIProxyAPI credentials in the auth directory are picked up automatically.</p></div>`;
   }
-  const head = `<div class="row" style="min-height:36px;color:var(--fg-3);font-size:12px;font-weight:500"><span>Account</span><span>Status</span><span class="hide-md">Usage</span><span class="hide-md">Last used</span><span></span></div>`;
+  const head = `<div class="account-quota-controls">${quotaControlsHTML()}</div>
+    <div class="row acct-columns" style="min-height:36px;color:var(--fg-3);font-size:12px;font-weight:500"><span>Account</span><span>Status / quota</span><span class="hide-md">Requests / tokens</span><span class="hide-md">Last used</span><span></span></div>`;
   const rows = list.map((a) => {
     const confirming = S.confirm === a.id;
     const cooling = Object.keys(a.cooldowns || {}).length > 0;
@@ -696,7 +741,7 @@ function accountListHTML() {
     const c = a.counters;
     return `<div class="row">
       <div class="acct-name"><span class="dot ${esc(a.provider)}"></span><span class="who"><span class="label">${esc(a.label)}</span><span class="sub">${esc(acctSub(a))}</span></span></div>
-      <div class="stack">${statusHTML(a, false)}${cooling ? `<span class="sub">${esc(acctStatus(a).scope)} · <button class="linkbtn" data-act="reset" data-id="${esc(a.id)}" title="Make this account available again now">Clear</button></span>` : limitsHTML(a) ? `<span class="sub">${limitsHTML(a)}</span>` : ''}</div>
+      <div class="stack">${statusHTML(a, false)}${cooling ? `<span class="sub">${esc(acctStatus(a).scope)} · <button class="linkbtn" data-act="reset" data-id="${esc(a.id)}" title="Make this account available again now">Clear</button></span>` : ''}<span class="sub quota-sub">${limitsHTML(a)}</span></div>
       <div class="stack hide-md"><span class="main"><b>${fmt(c.requests)}</b> ${c.requests === 1 ? 'request' : 'requests'}</span><span class="sub">${fmt(c.input_tokens)} in · ${fmt(c.output_tokens)} out${c.failures ? ` · <span class="err">${fmt(c.failures)} failed</span>` : ''}</span></div>
       <span class="num hide-md" style="text-align:left" data-ago="${esc(a.last_used || '')}">${ago(a.last_used)}</span>
       <div class="row-actions">${actions}</div>
@@ -924,6 +969,9 @@ document.addEventListener('click', (e) => {
   const { act, id } = el.dataset;
   switch (act) {
     case 'copy': return copy(el);
+    case 'quota-display':
+      setQuotaDisplay(id);
+      return $(`[data-act="quota-display"][data-id="${S.quotaDisplay}"]`)?.focus();
     case 'snippet':
       S.snippet = id;
       localStorage.setItem('cliproxyapi-rust.snippet', id);
@@ -1012,6 +1060,11 @@ setInterval(() => {
   for (const el of document.querySelectorAll('[data-ago]')) el.textContent = ago(el.dataset.ago);
   const up = $('[data-uptime]');
   if (up && S.overview) up.textContent = span((Date.now() - Date.parse(S.overview.started_at)) / 1000);
+  if ([...document.querySelectorAll('[data-quota-reset]')].some((el) => Date.parse(el.dataset.quotaReset) <= Date.now())) {
+    patch('ov-accounts', ovAccountsHTML);
+    patch('acct-list', accountListHTML);
+    expired = true;
+  }
   if (expired) refreshAccounts();
 }, 1000);
 
@@ -1026,6 +1079,10 @@ setInterval(async () => {
 
 window.addEventListener('beforeunload', (e) => {
   if (configDirty()) e.preventDefault();
+});
+
+window.addEventListener('storage', (e) => {
+  if (e.key === 'cliproxyapi-rust.quota-display' || e.key === null) setQuotaDisplay(e.newValue, false);
 });
 
 async function boot() {
