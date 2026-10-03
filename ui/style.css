@@ -453,3 +453,22 @@ details[open] > summary > .cfg-chevron { transform: rotate(90deg); }
 @media (prefers-reduced-motion: reduce) {
   *, *::before, *::after { animation: none !important; transition: none !important; }
 }
+
+/* Banked subscription resets */
+.banked-summary { white-space: normal; text-decoration: none; }
+.banked-summary:hover { color: var(--fg); text-decoration: underline; }
+.banked-resets { grid-column: 1 / -1; min-width: 0; padding: 12px 14px; border: 1px solid var(--line); border-radius: 8px; font-size: 13px; }
+.banked-head { display: flex; align-items: center; justify-content: space-between; gap: 10px; flex-wrap: wrap; }
+.banked-resets .actions { display: flex; flex-wrap: wrap; gap: 6px; }
+.banked-resets p { margin: 6px 0; overflow-wrap: anywhere; }
+.banked-resets .sub { color: var(--fg-3); font-size: 12px; }
+.banked-resets summary { cursor: pointer; margin: 8px 0; }
+.reset-grants { padding-left: 20px; }
+.reset-grants li { margin: 8px 0; }
+.reset-confirm { margin-top: 10px; padding: 12px; border: 1px solid var(--line); border-radius: 6px; }
+.reset-confirm label { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; margin: 10px 0; }
+.reset-confirm select { max-width: 100%; }
+@media (max-width: 640px) {
+  .banked-resets { grid-area: auto; grid-column: 1 / -1; }
+  .banked-head .actions { width: 100%; }
+}

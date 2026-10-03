@@ -286,6 +286,8 @@ pub fn router(app: Arc<App>) -> Router<Arc<App>> {
         .route("/accounts/{id}/toggle", post(toggle_account))
         .route("/accounts/{id}/refresh", post(refresh_account))
         .route("/accounts/{id}/reset", post(reset_account))
+        .route("/accounts/{id}/banked-resets", get(banked_resets).post(apply_banked_reset))
+        .route("/accounts/{id}/quota/refresh", post(refresh_quota))
         .route("/keys", post(add_key))
         .route("/vertex", post(import_vertex))
         .route("/requests", get(requests))
@@ -375,7 +377,11 @@ async fn overview(State(app): State<Arc<App>>) -> Json<Value> {
         let st = a.state.lock();
         if st.disabled {
             disabled += 1;
-        } else if st.cooldowns.get("*").is_some_and(|t| *t > chrono::Utc::now()) {
+        } else if st.quota_refreshing
+            || st.cooldowns.get("*").is_some_and(|t| *t > chrono::Utc::now())
+            || st.quota_cooldowns.get("*").is_some_and(|t| *t > chrono::Utc::now())
+            || st.quota.exhausted_until("").is_some()
+        {
             cooling += 1;
         } else {
             active += 1;
@@ -450,11 +456,56 @@ async fn reset_account(State(app): State<Arc<App>>, Path(id): Path<String>) -> R
     let Some(acct) = app.pool.get(&id) else { return err(StatusCode::NOT_FOUND, "unknown account") };
     let mut st = acct.state.lock();
     st.cooldowns.clear();
+    st.quota_cooldowns.clear();
     st.strikes = 0;
     st.last_error = None;
     drop(st);
     app.broadcast("accounts", Value::Null);
     ok()
+}
+
+async fn banked_resets(State(app): State<Arc<App>>, Path(id): Path<String>) -> Response {
+    let Some(acct) = app.pool.get(&id) else { return err(StatusCode::NOT_FOUND, "unknown account") };
+    match crate::banked_resets::refresh(&app, &acct).await {
+        Ok(view) => Json(view).into_response(),
+        Err(e) => err(StatusCode::BAD_GATEWAY, e.to_string()),
+    }
+}
+async fn apply_banked_reset(
+    State(app): State<Arc<App>>,
+    Path(id): Path<String>,
+    Json(body): Json<crate::banked_resets::Action>,
+) -> Response {
+    let Some(acct) = app.pool.get(&id) else { return err(StatusCode::NOT_FOUND, "unknown account") };
+    match tokio::spawn(crate::banked_resets::apply(app, acct, body)).await {
+        Ok(Ok(view)) => Json(view).into_response(),
+        Ok(Err(e)) => err(StatusCode::CONFLICT, e.to_string()),
+        Err(_) => {
+            err(StatusCode::INTERNAL_SERVER_ERROR, "Reset operation interrupted; refresh its status before continuing")
+        }
+    }
+}
+async fn refresh_quota(State(app): State<Arc<App>>, Path(id): Path<String>) -> Response {
+    let Some(acct) = app.pool.get(&id) else { return err(StatusCode::NOT_FOUND, "unknown account") };
+    if !matches!(acct.provider, Provider::Codex | Provider::Claude) || !acct.is_oauth() {
+        return err(
+            StatusCode::BAD_REQUEST,
+            "Subscription quota is only available for Codex and Claude OAuth accounts",
+        );
+    }
+    if oauth::ensure_fresh(&app, &acct, chrono::Duration::minutes(5), false).await.is_err() {
+        return err(StatusCode::BAD_GATEWAY, "Could not refresh subscription credentials");
+    }
+    // Quota can still refresh if this subscription does not offer banked resets.
+    acct.state.lock().quota_epoch += 1;
+    if crate::quota::poll(&app, &acct).await.is_err() {
+        return err(StatusCode::BAD_GATEWAY, "Could not refresh provider usage");
+    }
+    app.broadcast("accounts", Value::Null);
+    match crate::banked_resets::refresh(&app, &acct).await {
+        Ok(view) => Json(view).into_response(),
+        Err(e) => err(StatusCode::BAD_GATEWAY, e.to_string()),
+    }
 }
 
 async fn delete_account(State(app): State<Arc<App>>, Path(id): Path<String>) -> Response {

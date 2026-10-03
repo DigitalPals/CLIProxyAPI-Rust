@@ -296,6 +296,10 @@ pub struct AccountState {
     pub disabled: bool,
     /// Cooldowns keyed by model ("*" = whole account).
     pub cooldowns: HashMap<String, DateTime<Utc>>,
+    pub quota_cooldowns: HashMap<String, DateTime<Utc>>,
+    pub quota_epoch: u64,
+    pub quota_refreshing: bool,
+    pub banked_resets: Option<crate::banked_resets::View>,
     pub strikes: u32,
     pub last_error: Option<String>,
     pub last_used: Option<DateTime<Utc>>,
@@ -458,20 +462,41 @@ impl Account {
     pub fn cooling_until(&self, model: &str) -> Option<DateTime<Utc>> {
         let st = self.state.lock();
         let now = Utc::now();
+        if st.quota_refreshing {
+            return Some(now + chrono::Duration::seconds(30));
+        }
         // A used-up quota window counts as a cooldown, so we don't wait for the 429.
         let spent = st.quota.exhausted_until(model);
-        [st.cooldowns.get("*"), st.cooldowns.get(model), spent.as_ref()]
-            .into_iter()
-            .flatten()
-            .filter(|t| **t > now)
-            .max()
-            .copied()
+        [
+            st.cooldowns.get("*"),
+            st.cooldowns.get(model),
+            st.quota_cooldowns.get("*"),
+            st.quota_cooldowns.get(model),
+            spent.as_ref(),
+        ]
+        .into_iter()
+        .flatten()
+        .filter(|t| **t > now)
+        .max()
+        .copied()
     }
 
     pub fn cool(&self, model: Option<&str>, until: DateTime<Utc>, reason: &str) {
         let mut st = self.state.lock();
         st.cooldowns.insert(model.unwrap_or("*").to_string(), until);
         st.last_error = Some(reason.to_string());
+    }
+
+    pub fn quota_epoch(&self) -> u64 {
+        self.state.lock().quota_epoch
+    }
+
+    pub fn cool_quota(&self, model: &str, until: DateTime<Utc>, reason: &str, epoch: u64) {
+        let mut st = self.state.lock();
+        if st.quota_epoch == epoch && !st.quota_refreshing {
+            st.quota_cooldowns.insert(model.to_string(), until);
+            st.last_error = Some(reason.to_string());
+        }
     }
 
     pub fn record_ok(&self) {
@@ -485,6 +510,22 @@ impl Account {
         let now = Utc::now();
         let mut cooldowns: BTreeMap<&str, String> =
             st.cooldowns.iter().filter(|(_, t)| **t > now).map(|(k, t)| (k.as_str(), t.to_rfc3339())).collect();
+        for (model, deadline) in &st.quota_cooldowns {
+            if *deadline > now {
+                let value = deadline.to_rfc3339();
+                cooldowns
+                    .entry(model.as_str())
+                    .and_modify(|v| {
+                        if value > *v {
+                            *v = value.clone();
+                        }
+                    })
+                    .or_insert(value);
+            }
+        }
+        if st.quota_refreshing {
+            cooldowns.insert("*", (now + chrono::Duration::seconds(30)).to_rfc3339());
+        }
         // A used-up usage window blocks every model until it resets.
         if let Some(t) = st.quota.exhausted_until("") {
             cooldowns.entry("*").or_insert(t.to_rfc3339());
@@ -509,6 +550,7 @@ impl Account {
             "expires_at": expires,
             "counters": st.counters,
             "quota": st.quota,
+            "banked_resets": st.banked_resets,
             "models": self.public_models(),
         })
     }
@@ -843,8 +885,23 @@ impl Pool {
                     && prev.excluded == s.excluded
                     && prev.aliases == s.aliases;
                 if same_shape {
+                    let identity_changed = match (&*prev.cred.read(), &s.cred) {
+                        (Credential::OAuth(old), Credential::OAuth(new)) => {
+                            old.account_id != new.account_id || old.base_url != new.base_url
+                        }
+                        _ => false,
+                    };
                     *prev.cred.write() = s.cred;
-                    prev.state.lock().disabled = s.disabled;
+                    let mut st = prev.state.lock();
+                    st.disabled = s.disabled;
+                    if identity_changed {
+                        st.quota_epoch += 1;
+                        st.quota_refreshing = false;
+                        st.quota = Default::default();
+                        st.quota_cooldowns.clear();
+                        st.banked_resets = None;
+                    }
+                    drop(st);
                     next.push(prev.clone());
                     continue;
                 }

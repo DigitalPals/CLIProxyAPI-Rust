@@ -264,6 +264,7 @@ async fn native_turn(app: &Arc<App>, sess: &mut Session, body: &Value, full: &[V
     }
     payload["type"] = "response.create".into();
 
+    let quota_epoch = acct.quota_epoch();
     let mut tracker = Tracker::new(app, Format::Responses, true, "ws", &model);
     tracker.attempt(&acct);
     if up.send(tungstenite::Message::Text(payload.to_string().into())).await.is_err() {
@@ -298,7 +299,7 @@ async fn native_turn(app: &Arc<App>, sess: &mut Session, body: &Value, full: &[V
         };
         let v: Value = serde_json::from_str(&text).unwrap_or(Value::Null);
         let kind = v["type"].as_str().unwrap_or_default().to_string();
-        crate::quota::observe_codex_event(&acct, &v);
+        crate::quota::observe_codex_event(&acct, &v, quota_epoch);
         parser.feed(&SseEvent { event: None, data: text.clone() }, &mut evs);
         for ev in evs.drain(..) {
             match ev {
@@ -314,7 +315,16 @@ async fn native_turn(app: &Arc<App>, sess: &mut Session, body: &Value, full: &[V
             && let Some((status @ (429 | 401 | 403), msg)) = error.clone()
         {
             if status == 429 {
-                acct.cool(Some(&model), chrono::Utc::now() + chrono::Duration::seconds(60), &format!("429: {msg}"));
+                if crate::banked_resets::quota_error(&acct, &text) {
+                    acct.cool_quota(
+                        &model,
+                        chrono::Utc::now() + chrono::Duration::seconds(60),
+                        &format!("429: {msg}"),
+                        quota_epoch,
+                    );
+                } else {
+                    acct.cool(Some(&model), chrono::Utc::now() + chrono::Duration::seconds(60), &format!("429: {msg}"));
+                }
             } else {
                 acct.cool(None, chrono::Utc::now() + chrono::Duration::minutes(10), &format!("{status}: {msg}"));
             }
