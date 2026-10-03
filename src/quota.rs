@@ -93,7 +93,7 @@ fn ts(secs: i64) -> Option<DateTime<Utc>> {
 }
 
 /// Reads the quota headers a Claude or ChatGPT response carries.
-pub fn observe(acct: &Account, headers: &reqwest::header::HeaderMap) {
+pub fn observe(acct: &Account, headers: &reqwest::header::HeaderMap, epoch: u64) {
     let h = |n: &str| headers.get(n).and_then(|v| v.to_str().ok()).map(str::trim).filter(|s| !s.is_empty());
     let num = |n: &str| h(n).and_then(|v| v.parse::<f64>().ok());
     let mut windows = Vec::new();
@@ -129,11 +129,14 @@ pub fn observe(acct: &Account, headers: &reqwest::header::HeaderMap) {
         }
         _ => return,
     }
-    acct.state.lock().quota.set(windows, plan);
+    let mut st = acct.state.lock();
+    if st.quota_epoch == epoch && !st.quota_refreshing {
+        st.quota.set(windows, plan);
+    }
 }
 
 /// Codex websocket sessions report quota as a `codex.rate_limits` event.
-pub fn observe_codex_event(acct: &Account, v: &Value) {
+pub fn observe_codex_event(acct: &Account, v: &Value, epoch: u64) {
     if v["type"] != "codex.rate_limits" {
         return;
     }
@@ -150,7 +153,10 @@ pub fn observe_codex_event(acct: &Account, v: &Value) {
             Some(Window { name: label(minutes * 60), used: w["used_percent"].as_f64()?, resets_at: reset, model: None })
         })
         .collect();
-    acct.state.lock().quota.set(windows, v["plan_type"].as_str().map(String::from));
+    let mut st = acct.state.lock();
+    if st.quota_epoch == epoch && !st.quota_refreshing {
+        st.quota.set(windows, v["plan_type"].as_str().map(String::from));
+    }
 }
 
 fn claude_windows(v: &Value) -> Vec<Window> {
@@ -160,6 +166,7 @@ fn claude_windows(v: &Value) -> Vec<Window> {
         ("seven_day", "week", None),
         ("seven_day_opus", "week opus", Some("opus")),
         ("seven_day_sonnet", "week sonnet", Some("sonnet")),
+        ("seven_day_overage_included", "week overage", None),
     ]
     .iter()
     .filter_map(|(key, name, model)| {
@@ -192,6 +199,7 @@ fn codex_windows(v: &Value) -> Vec<Window> {
 
 /// Asks the provider's usage endpoint (free, no tokens) for current quota.
 pub async fn poll(app: &App, acct: &Arc<Account>) -> anyhow::Result<()> {
+    let epoch = acct.quota_epoch();
     let (token, account_id) = match &*acct.cred.read() {
         Credential::OAuth(o) if o.base_url.is_none() => (o.access_token.clone(), o.account_id.clone()),
         _ => return Ok(()),
@@ -227,8 +235,55 @@ pub async fn poll(app: &App, acct: &Arc<Account>) -> anyhow::Result<()> {
         }
         _ => return Ok(()),
     };
-    acct.state.lock().quota.set(windows, plan);
+    let mut st = acct.state.lock();
+    if st.quota_epoch == epoch && !st.quota_refreshing {
+        st.quota_epoch += 1;
+        authoritative(&mut st, windows, plan);
+    }
     Ok(())
+}
+
+/// Provider usage is authoritative, but absent windows cannot prove a cooldown has ended.
+pub fn authoritative(st: &mut crate::accounts::AccountState, windows: Vec<Window>, plan: Option<String>) {
+    if windows.is_empty() {
+        return;
+    }
+    let covered: Vec<String> = st
+        .quota_cooldowns
+        .keys()
+        .filter(|model| {
+            st.quota
+                .windows
+                .iter()
+                .filter(|old| old.model.as_ref().is_none_or(|m| model.contains(m)))
+                .all(|old| windows.iter().any(|new| new.name == old.name))
+        })
+        .cloned()
+        .collect();
+    // An absent field is unknown; retain its old window until it expires.
+    let mut merged = windows;
+    merged.extend(
+        st.quota
+            .windows
+            .iter()
+            .filter(|old| !merged.iter().any(|new| new.name == old.name))
+            .cloned()
+            .collect::<Vec<_>>(),
+    );
+    st.quota.set(merged, plan);
+    let quota = &st.quota;
+    st.quota_cooldowns.retain(|model, _| {
+        !covered.contains(model) || quota.pressure(if model == "*" { "" } else { model }).is_none_or(|u| u >= 100.0)
+    });
+}
+
+pub fn usage(st: &mut crate::accounts::AccountState, provider: Provider, value: &Value) {
+    let (windows, plan) = match provider {
+        Provider::Claude => (claude_windows(value), None),
+        Provider::Codex => (codex_windows(value), value["plan_type"].as_str().map(String::from)),
+        _ => return,
+    };
+    authoritative(st, windows, plan);
 }
 
 /// Keeps quota fresh for signed-in Claude and ChatGPT accounts.
@@ -250,6 +305,15 @@ pub async fn poller(app: Arc<App>) {
             }
             if !matches!(acct.provider, Provider::Claude | Provider::Codex) || !acct.is_oauth() {
                 continue;
+            }
+            let reset_stale = {
+                let st = acct.state.lock();
+                !st.disabled
+                    && st.banked_resets.as_ref().is_none_or(|v| (Utc::now() - v.checked_at).num_seconds() >= POLL_EVERY)
+            };
+            if reset_stale {
+                let _ = crate::banked_resets::refresh(&app, &acct).await;
+                changed = true;
             }
             let stale = {
                 let st = acct.state.lock();

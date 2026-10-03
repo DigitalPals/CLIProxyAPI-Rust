@@ -24,6 +24,9 @@ pub struct App {
     pub http: Http,
     pub stats: Stats,
     pub logins: Mutex<HashMap<String, crate::mgmt::Login>>,
+    pub reset_quotes: Mutex<HashMap<String, crate::banked_resets::Quote>>,
+    #[cfg(test)]
+    pub reset_test_origin: Mutex<Option<String>>,
     pub started: DateTime<Utc>,
     pub live: broadcast::Sender<String>,
     /// Ignore our own writes to the auth dir in the file watcher.
@@ -44,6 +47,9 @@ impl App {
             pool,
             stats: Stats::default(),
             logins: Mutex::new(HashMap::new()),
+            reset_quotes: Mutex::new(HashMap::new()),
+            #[cfg(test)]
+            reset_test_origin: Mutex::new(None),
             started: Utc::now(),
             live,
             quiet_until: AtomicI64::new(0),
@@ -100,25 +106,33 @@ impl Http {
 
     /// Client for the given proxy (falls back to the configured default).
     pub fn client(&self, proxy: Option<&str>) -> reqwest::Client {
-        self.build(proxy, None)
+        self.build(proxy, None, false)
+    }
+
+    /// Spending requests must never follow redirects or retry in the HTTP layer.
+    pub fn for_reset(&self, proxy: Option<&str>) -> reqwest::Client {
+        self.build(proxy, None, true)
     }
 
     /// Antigravity accounts each get their own HTTP/1.1 pool, as the IDE does;
     /// Google's backend treats shared HTTP/2 connections less kindly.
     pub fn for_account(&self, acct: &crate::accounts::Account) -> reqwest::Client {
         match acct.provider {
-            crate::accounts::Provider::Antigravity => self.build(acct.proxy_url.as_deref(), Some(&acct.id)),
-            _ => self.build(acct.proxy_url.as_deref(), None),
+            crate::accounts::Provider::Antigravity => self.build(acct.proxy_url.as_deref(), Some(&acct.id), false),
+            _ => self.build(acct.proxy_url.as_deref(), None, false),
         }
     }
 
-    fn build(&self, proxy: Option<&str>, h1_pool: Option<&str>) -> reqwest::Client {
+    fn build(&self, proxy: Option<&str>, h1_pool: Option<&str>, reset: bool) -> reqwest::Client {
         let proxy =
             proxy.filter(|p| !p.is_empty()).map(String::from).unwrap_or_else(|| self.default_proxy.lock().clone());
-        let key = match h1_pool {
+        let mut key = match h1_pool {
             Some(id) => format!("{proxy}\0h1:{id}"),
             None => proxy.clone(),
         };
+        if reset {
+            key.push_str("\0reset");
+        }
         let mut clients = self.clients.lock();
         if let Some(c) = clients.get(&key) {
             return c.clone();
@@ -128,6 +142,9 @@ impl Http {
             .read_timeout(Duration::from_secs(600))
             .pool_idle_timeout(Duration::from_secs(90))
             .tcp_keepalive(Duration::from_secs(30));
+        if reset {
+            b = b.redirect(reqwest::redirect::Policy::none()).retry(reqwest::retry::never());
+        }
         if proxy == "direct" || proxy == "none" {
             // CLIProxyAPI's spelling for "no proxy, not even the default one".
             b = b.no_proxy();

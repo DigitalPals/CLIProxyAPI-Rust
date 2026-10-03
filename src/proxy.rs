@@ -374,6 +374,7 @@ pub async fn execute(app: Arc<App>, call: Call) -> Reply {
             continue;
         }
 
+        let quota_epoch = acct.quota_epoch();
         let provider = acct.provider;
         let devin = provider == Provider::Devin;
         // Freeform (custom) tools only exist on OpenAI's own Responses backends.
@@ -475,7 +476,7 @@ pub async fn execute(app: Arc<App>, call: Call) -> Reply {
         };
 
         let status = resp.status().as_u16();
-        crate::quota::observe(&acct, resp.headers());
+        crate::quota::observe(&acct, resp.headers(), quota_epoch);
         if !resp.status().is_success() {
             let headers = resp.headers().clone();
             let text = resp.text().await.unwrap_or_default();
@@ -511,7 +512,11 @@ pub async fn execute(app: Arc<App>, call: Call) -> Reply {
             match status {
                 429 => {
                     let until = reset_after(&headers, &text).unwrap_or_else(|| backoff(&acct));
-                    acct.cool(Some(&model), until, &format!("429: {msg}"));
+                    if crate::banked_resets::quota_error(&acct, &text) {
+                        acct.cool_quota(&model, until, &format!("429: {msg}"), quota_epoch);
+                    } else {
+                        acct.cool(Some(&model), until, &format!("429: {msg}"));
+                    }
                     app.broadcast("accounts", Value::Null);
                 }
                 401 | 403 if acct.is_oauth() && !refreshed.contains(&acct.id) && !forbidden_for_good(&text) => {
