@@ -280,59 +280,76 @@ impl Sessions {
         let mut registry = self.registry.lock();
         Self::prune_locked(&mut registry, cfg.session_affinity_idle_seconds);
         let mut excluded = exclude.to_vec();
+        // Why an existing assignment has to move, if it does.
+        let mut moving: Option<&'static str> = None;
         if let Some(binding) = registry.bindings.get_mut(&key) {
             binding.last_seen = Utc::now().timestamp();
-            let Some(acct) = pool.get(&binding.account) else {
-                return Err((
-                    409,
-                    "the session's assigned account was removed; start a new session to choose another subscription"
-                        .into(),
-                ));
-            };
-            if acct.state.lock().disabled {
-                return Err((
-                    409,
-                    "the session's assigned account is disabled; re-enable it or start a new session".into(),
-                ));
-            }
-            let Some(upstream) = pool.resolve_account(&acct, model, only) else {
-                return Err((
-                    409,
-                    format!(
-                        "the session's assigned account cannot serve `{model}`; use another provider or start a new session"
-                    ),
-                ));
-            };
-            if acct.exhausted_until(model).is_none() {
-                if let Some(until) = acct.cooling_until(model) {
-                    return Err((
-                        429,
-                        format!(
-                            "the session's assigned account is temporarily unavailable; retry in {}s (subscription preserved)",
-                            (until - Utc::now()).num_seconds().max(1)
-                        ),
-                    ));
+            let assigned = pool.get(&binding.account);
+            let upstream = assigned.as_ref().and_then(|acct| pool.resolve_account(acct, model, only));
+            match (&assigned, upstream) {
+                (None, _) => moving = Some("account_removed"),
+                (Some(acct), _) if acct.state.lock().disabled => moving = Some("account_disabled"),
+                (Some(_), None) => moving = Some("model_unavailable"),
+                (Some(acct), Some(_)) if acct.exhausted_until(model).is_some() => moving = Some("quota_exhausted"),
+                (Some(acct), Some(upstream)) => {
+                    if acct.cooling_until(model).is_none() && !excluded.contains(&acct.id) {
+                        registry.dirty = true;
+                        return Ok(Selected {
+                            account: acct.clone(),
+                            model: upstream,
+                            strategy: cfg.routing,
+                            reason: "session_reused",
+                            previous_account: None,
+                        });
+                    }
+                    // A rate limit or failed attempt is temporary: serve this request from
+                    // another account but keep the assignment, so the session comes back
+                    // (and finds its prompt cache) once its subscription recovers.
+                    let assigned_id = acct.id.clone();
+                    drop(registry);
+                    if !excluded.contains(&assigned_id) {
+                        excluded.push(assigned_id.clone());
+                    }
+                    let (account, model) = selection(pool.pick(model, &excluded, cfg.routing, None, only), model)?;
+                    return Ok(Selected {
+                        account,
+                        model,
+                        strategy: cfg.routing,
+                        reason: "temporary_detour",
+                        previous_account: Some(assigned_id),
+                    });
                 }
-                if excluded.contains(&acct.id) {
-                    return Err((
-                        503,
-                        "the session's assigned account is temporarily unavailable; subscription preserved".into(),
-                    ));
-                }
-                registry.dirty = true;
-                return Ok(Selected {
-                    account: acct,
-                    model: upstream,
-                    strategy: cfg.routing,
-                    reason: "session_reused",
-                    previous_account: None,
-                });
             }
-            if !excluded.contains(&acct.id) {
+            if let Some(acct) = &assigned
+                && !excluded.contains(&acct.id)
+            {
                 excluded.push(acct.id.clone());
             }
         } else if registry.bindings.len() >= MAX_SESSIONS {
-            return Err((503, "session assignment capacity reached; retry after inactive sessions expire".into()));
+            // Make room by forgetting the longest-idle assignment with nothing in flight.
+            let oldest = registry
+                .bindings
+                .iter()
+                .filter(|(_, b)| !registry.active.contains_key(&b.session))
+                .min_by_key(|(_, b)| b.last_seen)
+                .map(|(k, _)| k.clone());
+            match oldest {
+                Some(oldest) => {
+                    registry.bindings.remove(&oldest);
+                }
+                // Every assignment is in use: route this request on its own rather than fail it.
+                None => {
+                    drop(registry);
+                    let (account, model) = selection(pool.pick(model, exclude, cfg.routing, None, only), model)?;
+                    return Ok(Selected {
+                        account,
+                        model,
+                        strategy: cfg.routing,
+                        reason: "missing_session",
+                        previous_account: None,
+                    });
+                }
+            }
         }
         let (acct, upstream) = selection(pool.pick(model, &excluded, cfg.routing, None, only), model)?;
         let previous = registry.bindings.insert(
@@ -344,7 +361,7 @@ impl Sessions {
             },
         );
         if let Some(old) = &previous {
-            tracing::info!(from = %old.account, to = %acct.id, "session moved after subscription quota exhaustion");
+            tracing::info!(from = %old.account, to = %acct.id, reason = moving.unwrap_or("quota_exhausted"), "session moved to another account");
         }
         registry.dirty = true;
         self.flush_locked(&mut registry);
@@ -352,7 +369,7 @@ impl Sessions {
             account: acct,
             model: upstream,
             strategy: cfg.routing,
-            reason: if previous.is_some() { "quota_exhausted" } else { "new_session" },
+            reason: if previous.is_some() { moving.unwrap_or("quota_exhausted") } else { "new_session" },
             previous_account: previous.map(|binding| binding.account),
         })
     }
@@ -586,17 +603,61 @@ mod tests {
     }
 
     #[test]
-    fn temporary_cooldowns_and_removed_accounts_do_not_migrate() {
+    fn temporary_cooldowns_detour_and_disabled_accounts_move_the_session() {
         let cfg = config(Routing::RoundRobin);
         let pool = Pool::default();
         pool.reload(&cfg);
         let sessions = Sessions::memory();
-        let a = sessions.pick(&pool, &cfg, "gpt-6.1-sol", Some("task"), &[], None).unwrap().0;
+        let pick = || sessions.pick_with_reason(&pool, &cfg, "gpt-6.1-sol", Some("task"), &[], None).unwrap();
+        let a = pick().account;
+        // A rate limit serves the request elsewhere but keeps the assignment.
         a.cool(None, Utc::now() + Duration::seconds(60), "temporary");
-        assert_eq!(sessions.pick(&pool, &cfg, "gpt-6.1-sol", Some("task"), &[], None).err().unwrap().0, 429);
+        let detour = pick();
+        assert_eq!(detour.reason, "temporary_detour");
+        assert_ne!(detour.account.id, a.id);
+        assert_eq!(detour.previous_account.as_deref(), Some(a.id.as_str()));
         a.state.lock().cooldowns.clear();
+        assert_eq!(pick().account.id, a.id);
+        // So does a failed attempt within one request.
+        let retry = sessions
+            .pick_with_reason(&pool, &cfg, "gpt-6.1-sol", Some("task"), std::slice::from_ref(&a.id), None)
+            .unwrap();
+        assert_eq!(retry.reason, "temporary_detour");
+        assert_eq!(pick().account.id, a.id);
+        // Disabling the account moves the session for good.
         a.state.lock().disabled = true;
-        assert_eq!(sessions.pick(&pool, &cfg, "gpt-6.1-sol", Some("task"), &[], None).err().unwrap().0, 409);
+        let moved = pick();
+        assert_eq!(moved.reason, "account_disabled");
+        assert_ne!(moved.account.id, a.id);
+        a.state.lock().disabled = false;
+        assert_eq!(pick().account.id, moved.account.id);
+    }
+
+    #[test]
+    fn a_full_table_forgets_the_longest_idle_session_instead_of_failing() {
+        let cfg = config(Routing::RoundRobin);
+        let pool = Pool::default();
+        pool.reload(&cfg);
+        let sessions = Sessions::memory();
+        {
+            let mut registry = sessions.registry.lock();
+            let now = Utc::now().timestamp();
+            for i in 0..MAX_SESSIONS {
+                registry.bindings.insert(
+                    format!("old-{i}"),
+                    Binding {
+                        session: format!("owner-{i}"),
+                        account: "gone".into(),
+                        last_seen: now - 20_000 + i as i64,
+                    },
+                );
+            }
+        }
+        let selected = sessions.pick_with_reason(&pool, &cfg, "gpt-6.1-sol", Some("new-task"), &[], None).unwrap();
+        assert_eq!(selected.reason, "new_session");
+        let registry = sessions.registry.lock();
+        assert_eq!(registry.bindings.len(), MAX_SESSIONS);
+        assert!(!registry.bindings.contains_key("old-0"));
     }
 
     #[test]

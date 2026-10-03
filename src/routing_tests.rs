@@ -363,20 +363,17 @@ async fn http_tasks_stay_pinned_and_migrate_only_when_quota_runs_out() {
 }
 
 #[tokio::test]
-async fn burst_limits_and_temporary_server_failures_preserve_the_subscription() {
+async fn temporary_failures_detour_and_the_session_returns_to_its_subscription() {
     for mode in [2, 3, 6] {
         let fixture = Fixture::new(Routing::RoundRobin, false).await;
         assert_eq!(answer(&fixture.request(Some("task"), prompt()).await.1), "a");
         fixture.mock.mode.store(mode, Ordering::Relaxed);
-        assert_eq!(
-            fixture.request(Some("task"), prompt()).await.0,
-            match mode {
-                2 => 429,
-                6 => 401,
-                _ => 503,
-            }
-        );
-        assert!(fixture.mock.calls.lock().iter().all(|(account, _, _)| account == "a"));
+        // The client still gets an answer, from the other subscription...
+        let (status, body) = fixture.request(Some("task"), prompt()).await;
+        assert_eq!(status, 200, "mode {mode}");
+        assert_eq!(answer(&body), "b");
+        assert_eq!(fixture.logs(2).await.pop().unwrap().routing_reason, Some("temporary_detour"));
+        // ...and the session goes back to its own once that recovers.
         fixture.recover();
         assert_eq!(answer(&fixture.request(Some("task"), prompt()).await.1), "a");
     }
@@ -409,7 +406,8 @@ async fn response_ids_continue_the_task_without_session_headers_and_replay_full_
     assert_eq!(next_log.session_id, first_log.session_id);
     assert_eq!(next_log.session_source, Some("previous_response_id"));
     assert_eq!(next_log.routing_warning, Some("response_id_only"));
-    assert_eq!(next_log.routing_reason, Some("quota_exhausted"));
+    // The first turn had no session id, so the continuation makes the first assignment.
+    assert_eq!(next_log.routing_reason, Some("new_session"));
     {
         let calls = fixture.mock.calls.lock();
         let (_, sent, _) = calls.last().unwrap();
@@ -636,7 +634,7 @@ async fn diagnostics_distinguish_agent_threads_and_missing_or_disabled_affinity(
     assert_ne!(logs[4].account, logs[5].account);
     for log in &logs[4..] {
         assert_eq!(log.session_source, Some("generated_response"));
-        assert_eq!(log.routing_reason, Some("new_session"));
+        assert_eq!(log.routing_reason, Some("missing_session"));
         assert_eq!(log.routing_warning, Some("missing_session_id"));
     }
 

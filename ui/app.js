@@ -627,6 +627,10 @@ const ROUTING_REASON = {
   new_session: 'New session',
   session_reused: 'Same session',
   quota_exhausted: 'Switched: quota exhausted',
+  account_disabled: 'Switched: account disabled',
+  account_removed: 'Switched: account removed',
+  model_unavailable: 'Switched: model not served',
+  temporary_detour: 'Detour: account busy',
   missing_session: 'No session assignment',
   affinity_disabled: 'Affinity disabled',
   retry_same: 'Retried same account',
@@ -651,12 +655,14 @@ function routingReason(reason) {
 function requestAccountHTML(r) {
   const reason = routingReason(r.routing_reason);
   const strategy = ROUTING_LABEL[r.routing_strategy] || r.routing_strategy;
+  // Attempts name accounts by id; show their (privacy-aware) labels instead.
+  const named = (id) => { const a = (S.accounts || []).find((x) => x.id === id); return a ? acctLabel(a) : 'another account'; };
   const attempts = (r.routing_attempts || []).map((a) => {
-    const from = a.previous_account ? `${a.previous_account} → ` : '';
-    return `${from}${a.account || 'Unknown account'}: ${routingReason(a.reason)}`;
+    const from = a.previous_account ? `${named(a.previous_account)} → ` : '';
+    return `${from}${named(a.account_id) || 'Unknown account'}: ${routingReason(a.reason)}`;
   });
   const detail = [strategy && `Routing: ${strategy}`, ...attempts].filter(Boolean).join('\n');
-  return `<span class="request-account">${esc((accountOf(r) ? acctLabel(accountOf(r)) : who(r.account)) || '—')}</span>${reason ? `<span class="request-detail${r.routing_reason === 'quota_exhausted' ? ' warn' : ''}" title="${esc(detail)}">${esc(reason)}</span>` : ''}`;
+  return `<span class="request-account">${esc((accountOf(r) ? acctLabel(accountOf(r)) : who(r.account)) || '—')}</span>${reason ? `<span class="request-detail${/^(quota_exhausted|account_|model_unavailable|temporary_detour)/.test(r.routing_reason) ? ' warn' : ''}" title="${esc(detail)}">${esc(reason)}</span>` : ''}`;
 }
 
 function requestSessionHTML(r) {

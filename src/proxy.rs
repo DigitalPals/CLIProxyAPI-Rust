@@ -118,7 +118,9 @@ impl Tracker {
 
     pub fn selected(&mut self, selected: &crate::affinity::Selected) {
         // Preserve the initial allocation and any migration even if later retries reuse it.
-        if self.log.routing_reason.is_none() || selected.reason == "quota_exhausted" {
+        if self.log.routing_reason.is_none()
+            || !matches!(selected.reason, "new_session" | "session_reused" | "retry_same")
+        {
             self.log.routing_reason = Some(selected.reason);
         }
         self.log.routing_strategy = selected.strategy;
@@ -536,33 +538,36 @@ async fn execute_inner(app: Arc<App>, call: Call) -> Reply {
 
     while tried.len() < attempts {
         let pin = retry_same.take();
-        let picked = if cfg.session_affinity && call.session.is_some() {
-            app.sessions.pick_with_reason(&app.pool, &cfg, &model, call.session.as_deref(), &tried, only.as_ref())
-        } else {
-            match app.pool.pick(&model, &tried, cfg.routing, pin.as_deref(), only.as_ref()) {
-                Pick::Ok(a, m) => Ok(crate::affinity::Selected {
-                    reason: if pin.as_deref() == Some(a.id.as_str()) {
-                        "retry_same"
-                    } else if !cfg.session_affinity {
-                        "affinity_disabled"
-                    } else {
-                        "missing_session"
-                    },
-                    account: a,
-                    model: m,
-                    strategy: cfg.routing,
-                    previous_account: None,
-                }),
-                Pick::Cooling(until) => Err((
-                    429,
-                    format!(
-                        "all accounts for {model} are rate limited; next available in {}s",
-                        (until - Utc::now()).num_seconds().max(1)
-                    ),
-                )),
-                Pick::None => Err((404, format!("no available account serves model `{model}`"))),
-            }
-        };
+        // A generated id only threads previous_response_id continuations; it must not
+        // create an assignment for every request that arrives without a session.
+        let picked =
+            if cfg.session_affinity && call.session.is_some() && call.session_source != Some("generated_response") {
+                app.sessions.pick_with_reason(&app.pool, &cfg, &model, call.session.as_deref(), &tried, only.as_ref())
+            } else {
+                match app.pool.pick(&model, &tried, cfg.routing, pin.as_deref(), only.as_ref()) {
+                    Pick::Ok(a, m) => Ok(crate::affinity::Selected {
+                        reason: if pin.as_deref() == Some(a.id.as_str()) {
+                            "retry_same"
+                        } else if !cfg.session_affinity {
+                            "affinity_disabled"
+                        } else {
+                            "missing_session"
+                        },
+                        account: a,
+                        model: m,
+                        strategy: cfg.routing,
+                        previous_account: None,
+                    }),
+                    Pick::Cooling(until) => Err((
+                        429,
+                        format!(
+                            "all accounts for {model} are rate limited; next available in {}s",
+                            (until - Utc::now()).num_seconds().max(1)
+                        ),
+                    )),
+                    Pick::None => Err((404, format!("no available account serves model `{model}`"))),
+                }
+            };
         let mut selected = match picked {
             Ok(pair) => pair,
             Err((status, msg)) => {
