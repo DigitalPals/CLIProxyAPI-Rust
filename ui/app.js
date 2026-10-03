@@ -464,7 +464,7 @@ function ovAccountsHTML() {
   const shown = sorted.slice(0, 10);
   const limits = list.some((a) => (a.kind === 'oauth' && ['claude', 'codex'].includes(a.provider))
     || (a.quota?.windows || []).some((w) => !w.model));
-  const name = (a) => `<div class="acct-name"><span class="dot ${esc(a.provider)}"></span><span class="who"><span class="label">${esc(a.label)}</span><span class="sub">${esc(acctSub(a))}</span>${bankedSummaryHTML(a)}</span></div>`;
+  const name = accountNameHTML;
   const req = (a) => `<span class="num"><b>${fmt(a.counters.requests)}</b> req</span>`;
   const more = list.length > shown.length ? `<p class="note"><a class="link" href="#/accounts">${list.length - shown.length} more</a></p>` : '';
   if (!limits) {
@@ -752,7 +752,7 @@ function accountListHTML() {
          <button class="btn ghost small" data-act="confirm-delete" data-id="${esc(a.id)}" aria-label="Remove ${esc(a.label)}" title="Remove">${ICON.trash}</button>`;
     const c = a.counters;
     return `<div class="row">
-      <div class="acct-name"><span class="dot ${esc(a.provider)}"></span><span class="who"><span class="label">${esc(a.label)}</span><span class="sub">${esc(acctSub(a))}</span>${bankedSummaryHTML(a)}</span></div>
+      ${accountNameHTML(a)}
       <div class="stack">${statusHTML(a, false)}${cooling ? `<span class="sub">${esc(acctStatus(a).scope)} · <button class="linkbtn" data-act="reset" data-id="${esc(a.id)}" title="Clear local cooldowns; refresh quota to verify provider limits">Clear cooldowns</button></span>` : ''}<span class="sub quota-sub">${limitsHTML(a)}</span></div>
       <div class="stack hide-md"><span class="main"><b>${fmt(c.requests)}</b> ${c.requests === 1 ? 'request' : 'requests'}</span><span class="sub">${fmt(c.input_tokens)} in · ${fmt(c.output_tokens)} out${c.failures ? ` · <span class="err">${fmt(c.failures)} failed</span>` : ''}</span></div>
       <span class="num hide-md" style="text-align:left" data-ago="${esc(a.last_used || '')}">${ago(a.last_used)}</span>
@@ -766,6 +766,9 @@ function accountListHTML() {
 // banked resets ----------------------------------------------------------
 
 function hasBankedResets(a) { return a.kind === 'oauth' && ['claude', 'codex'].includes(a.provider); }
+function accountNameHTML(a) {
+  return `<div class="acct-name"><span class="dot ${esc(a.provider)}"></span><span class="who"><span class="acct-title"><span class="label" title="${esc(a.label)}">${esc(a.label)}</span>${bankedSummaryHTML(a)}</span><span class="sub">${esc(acctSub(a))}</span></span></div>`;
+}
 function bankedLabel(a) {
   const r = a.banked_resets;
   if (['pending', 'unknown'].includes(r?.operation?.status)) return 'Reset needs review';
@@ -775,6 +778,7 @@ function bankedLabel(a) {
 function bankedSummaryHTML(a) {
   if (!hasBankedResets(a)) return '';
   const review = ['pending', 'unknown'].includes(a.banked_resets?.operation?.status);
+  if (!review && a.banked_resets?.inventory?.available === 0) return '';
   return `<button type="button" class="reset-badge${review ? ' warn' : ''}" data-act="banked-details" data-id="${esc(a.id)}" aria-haspopup="dialog" aria-controls="banked-reset-modal" aria-label="${esc(bankedLabel(a))} for ${esc(a.label)}">${esc(bankedLabel(a))}</button>`;
 }
 function resetButton(a, act, label, disabled = false, extra = '') {
@@ -817,7 +821,7 @@ function bankedResetsHTML(a) {
     const grants = (inv?.grants || []).map((g) => `<li><div class="reset-grant-head"><b>${esc(g.label || 'Subscription reset')}</b><span>${g.remaining} left</span></div><p class="sub">${esc(grantDetail(g))}</p>${g.reason ? `<p class="sub">${esc(g.reason)}</p>` : ''}</li>`).join('');
     const reason = a.disabled ? 'Enable this account to apply a reset.' : stale || expiryChanged ? 'Refresh to check availability.' : inv?.reason;
     const message = uncertain ? '<p class="warn">A reset may have been used. New resets are blocked until resolved.</p>' : op ? `<p class="${['applied', 'reconciled_used'].includes(op.status) ? 'ok' : 'sub'}" role="status">${esc(op.message)}</p>` : '';
-    content = `<p class="reset-count">${esc(bankedLabel(a))}${inv?.applicable != null && inv.applicable !== inv.available && !r?.error ? `<span class="sub"> · ${inv.applicable} usable now</span>` : ''}</p>${grants ? `<ul class="reset-grants">${grants}</ul>` : ''}${reason && !r?.error ? `<p class="sub">${esc(reason)}</p>` : ''}${message}`;
+    content = `<p class="reset-count">${esc(bankedLabel(a))}${a.provider === 'claude' && inv?.applicable != null && inv.applicable !== inv.available && !r?.error ? `<span class="sub"> · ${inv.applicable} usable now</span>` : ''}</p>${grants ? `<ul class="reset-grants">${grants}</ul>` : ''}${reason && !r?.error ? `<p class="sub">${esc(reason)}</p>` : ''}${message}`;
     controls = `${resetButton(a, 'banked-refresh', local.busy ? 'Checking…' : 'Refresh', local.busy)}${resetButton(a, 'banked-open', 'Use 1 reset', !usable, r?.checked_at ? `data-reset-deadline="${esc(new Date(Date.parse(r.checked_at) + 5 * 60 * 1000).toISOString())}"` : '')}`;
     if (uncertain) {
       const retryable = a.provider === 'claude' && r.retryable && Date.parse(op.retry_until) > Date.now();

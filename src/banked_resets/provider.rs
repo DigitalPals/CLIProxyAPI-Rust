@@ -71,7 +71,7 @@ pub fn codex(usage: &Value, details: &Value, now: DateTime<Utc>) -> Result<Inven
             let id = credit["id"].as_str().filter(|s| s.len() <= 200).unwrap_or("");
             ensure!(id.is_empty() || seen.insert(id), "Duplicate reset grant");
             let expires = timestamp(&credit["expires_at"])?;
-            let usable = expires.is_none_or(|t| t > now) && applicable != Some(0);
+            let usable = expires.is_none_or(|t| t > now);
             grants.push(Grant {
                 id: id.into(),
                 label: "Codex reset".into(),
@@ -80,7 +80,7 @@ pub fn codex(usage: &Value, details: &Value, now: DateTime<Utc>) -> Result<Inven
                 starts_at: None,
                 clears: vec!["subscription limits".into()],
                 usable,
-                reason: if usable { None } else { Some("Not currently applicable or expired".into()) },
+                reason: if usable { None } else { Some("Reset has expired".into()) },
             });
         }
     }
@@ -89,11 +89,15 @@ pub fn codex(usage: &Value, details: &Value, now: DateTime<Utc>) -> Result<Inven
             .is_array()
             .then(|| grants.iter().filter(|g| g.expires_at.is_none_or(|t| t > now)).count() as u64)
     });
-    let eligible = available.is_some_and(|n| n > 0) && applicable != Some(0);
+    // The usage endpoint's applicable count describes current limits, not whether
+    // a saved credit can be manually redeemed. Match the upstream management
+    // center: offer a manual reset when credits remain; the consume endpoint
+    // decides whether to accept it. Known expired credits still cannot be used.
+    let eligible = available.is_some_and(|n| n > 0) && (grants.is_empty() || grants.iter().any(|g| g.usable));
     let reason = if available == Some(0) {
         Some("No banked resets available".into())
-    } else if applicable == Some(0) {
-        Some("Banked resets cannot be applied to the current limits".into())
+    } else if !grants.is_empty() && !grants.iter().any(|g| g.usable) {
+        Some("Available resets have expired".into())
     } else if available.is_none() {
         Some("Reset count unavailable".into())
     } else {

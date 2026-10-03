@@ -94,8 +94,9 @@ fn codex_counts_and_expiries() {
     let i = provider::codex(&usage, &details, Utc::now()).unwrap();
     assert_eq!(i.available, Some(2));
     assert_eq!(i.applicable, Some(0));
-    assert!(!i.eligible);
-    assert!(!i.grants[0].usable);
+    assert!(i.eligible);
+    assert!(i.grants[0].usable);
+    assert!(i.reason.is_none());
     assert_eq!(provider::codex(&json!({}), &json!({"credits":[]}), Utc::now()).unwrap().available, Some(0));
     assert!(
         provider::codex(
@@ -109,6 +110,73 @@ fn codex_counts_and_expiries() {
     let i = provider::codex(&json!({}), &json!({"credits":[{"id":"x","status":"available","reset_type":"codex_rate_limits","expires_at":"2000-01-01T00:00:00Z"}]}), Utc::now()).unwrap();
     assert_eq!(i.available, Some(0));
     assert!(!i.eligible);
+}
+#[test]
+fn codex_manual_reset_uses_available_credits_and_checks_expiry() {
+    let usage = json!({"rate_limit_reset_credits":{"available_count":1,"applicable_available_count":0},"rate_limit":{"allowed":true,"limit_reached":false}});
+    let mut details = json!({"available_count":1,"credits":[{"id":"saved-credit","reset_type":"codex_rate_limits","status":"available","expires_at":"2099-01-01T00:00:00Z"}]});
+    let inventory = provider::codex(&usage, &details, Utc::now()).unwrap();
+    assert_eq!(inventory.applicable, Some(0));
+    assert!(inventory.eligible);
+    assert!(inventory.grants[0].usable);
+    details["credits"][0]["expires_at"] = json!("2000-01-01T00:00:00Z");
+    let expired = provider::codex(&usage, &details, Utc::now()).unwrap();
+    assert!(!expired.eligible);
+    assert!(!expired.grants[0].usable);
+    assert_eq!(expired.reason.as_deref(), Some("Available resets have expired"));
+    details["available_count"] = json!(0);
+    assert!(!provider::codex(&usage, &details, Utc::now()).unwrap().eligible);
+}
+#[tokio::test]
+async fn codex_available_credit_returns_confirmation_quote_without_spending() {
+    use axum::{Router, body::Body, http::Request, routing::any};
+    async fn backend(req: Request<Body>) -> axum::Json<Value> {
+        assert_eq!(req.method(), axum::http::Method::GET, "Inventory must never spend a credit");
+        axum::Json(match req.uri().path() {
+            "/backend-api/wham/usage" => json!({
+                "rate_limit_reset_credits":{"available_count":1,"applicable_available_count":0},
+                "rate_limit":{"allowed":true,"limit_reached":false}
+            }),
+            "/backend-api/wham/rate-limit-reset-credits" => json!({
+                "available_count":1,
+                "credits":[{"id":"saved-credit","reset_type":"codex_rate_limits","status":"available","expires_at":"2099-01-01T00:00:00Z"}]
+            }),
+            _ => panic!("Unexpected provider request"),
+        })
+    }
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let provider_origin = format!("http://{}", listener.local_addr().unwrap());
+    let provider_server = tokio::spawn(axum::serve(listener, Router::new().fallback(any(backend))).into_future());
+    let (_temp, app, acct) = fixture(Provider::Codex, 1);
+    *app.reset_test_origin.lock() = Some(provider_origin);
+    let mut config = (*app.cfg()).clone();
+    config.management_key = "test-management-key".into();
+    app.set_config(config);
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let origin = format!("http://{}", listener.local_addr().unwrap());
+    let router = crate::mgmt::router(app.clone()).with_state(app.clone());
+    let server = tokio::spawn(
+        axum::serve(listener, router.into_make_service_with_connect_info::<std::net::SocketAddr>()).into_future(),
+    );
+    let client = reqwest::Client::new();
+    let path = format!("{origin}/accounts/{}/banked-resets", acct.id);
+    let response = client.get(&path).bearer_auth("test-management-key").send().await.unwrap();
+    assert_eq!(response.status(), reqwest::StatusCode::OK);
+    let view: Value = response.json().await.unwrap();
+    assert_eq!(view["inventory"]["applicable"], 0);
+    assert_eq!(view["inventory"]["eligible"], true);
+    let quote = view["quote"].as_str().unwrap();
+    let denied = client
+        .post(&path)
+        .bearer_auth("test-management-key")
+        .json(&json!({"action":"redeem","request_id":quote,"confirmed":false}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(denied.status(), reqwest::StatusCode::CONFLICT);
+    assert!(ledger::last_operation(&app.startup_config.auth_dir(), Provider::Codex, "account-1").unwrap().is_none());
+    server.abort();
+    provider_server.abort();
 }
 #[test]
 fn claude_eligibility_and_selection() {

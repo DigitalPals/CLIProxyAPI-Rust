@@ -1,8 +1,10 @@
 # Banked subscription resets
 
-Overview and Accounts show a compact reset availability badge for native Codex and Claude OAuth subscriptions. Click the badge to open a modal with grant expiry, scopes, and current eligibility. Purchased monetary credits are separate. Accounts without provider reset metadata show an unknown state rather than zero.
+Overview and Accounts show a compact reset availability badge beside the account name for native Codex and Claude OAuth subscriptions. Zero-count badges are hidden; unresolved operations keep a review badge so recovery remains accessible. Click the badge to open a modal with grant expiry, scopes, and current eligibility. Purchased monetary credits are separate. Accounts without provider reset metadata show an unknown state rather than zero.
 
 In the modal, select **Refresh** to fetch current provider usage, including after a reset made outside this proxy. Select **Use 1 reset**, review the account and grant, and confirm. Claude defaults to the provider's recommended usable grant, then the earliest expiry; you can choose another usable grant. Codex selects its grant on the provider side. Applying a reset is always manual. API keys, custom endpoints, and disabled accounts cannot redeem.
+
+Codex manual reset availability follows the upstream management center: an available, unexpired credit permits confirmation even when the usage endpoint reports zero currently applicable credits. That counter does not block manual redemption. The provider decides whether to accept the confirmed request. Claude eligibility continues to follow each grant's provider rules.
 
 The server rechecks identity, eligibility, and the confirmation before dispatch. A confirmation expires after two minutes. Changes in inventory or a reset submitted from another tab invalidate older confirmations. Confirmed success is saved independently of the subsequent usage refresh: a refresh failure does not change a successful redemption into a failure. Quota windows affected by a confirmed reset are invalidated; unrelated model quotas, disabled state, authentication cooldowns, and overload cooldowns are preserved.
 
