@@ -57,6 +57,10 @@ pub fn parse_request(format: Format, body: &Value) -> Result<Request, String> {
 /// Keep compatible OpenAI cache controls, including explicit caller extensions,
 /// when translating into either OpenAI wire format.
 /// Provider-specific cache controls (such as Anthropic's TTLs) are not interchangeable.
+///
+/// Only prewarming fails a request: it asks for a different kind of request. Hints
+/// that can't be carried over exactly are dropped, so the upstream falls back to its
+/// default caching rather than the client losing its answer.
 pub fn preserve_cache_hints(
     source: Format,
     target: Format,
@@ -66,6 +70,39 @@ pub fn preserve_cache_hints(
     if target != Format::Responses && original["prompt_cache_options"]["prewarm"] == true {
         return Err("Prompt cache prewarming is only supported by the Responses API".into());
     }
+    if let Err(reason) = carry_cache_hints(source, target, original, translated) {
+        tracing::warn!("dropping explicit prompt cache hints: {reason}");
+        strip_breakpoints(translated);
+        if let Some(body) = translated.as_object_mut() {
+            body.remove("prompt_cache_options");
+        }
+        if matches!(target, Format::Chat | Format::Responses) {
+            for field in ["prompt_cache_key", "prompt_cache_retention"] {
+                if !original[field].is_null() {
+                    translated[field] = original[field].clone();
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+fn strip_breakpoints(body: &mut Value) {
+    // get_mut, not indexing: indexing a missing key would insert a null field.
+    for field in ["messages", "input"] {
+        for item in body.get_mut(field).and_then(Value::as_array_mut).into_iter().flatten() {
+            for part in ["content", "output"] {
+                for block in item.get_mut(part).and_then(Value::as_array_mut).into_iter().flatten() {
+                    if let Some(block) = block.as_object_mut() {
+                        block.remove("prompt_cache_breakpoint");
+                    }
+                }
+            }
+        }
+    }
+}
+
+fn carry_cache_hints(source: Format, target: Format, original: &Value, translated: &mut Value) -> Result<(), String> {
     let breakpoints = openai_breakpoint_count(source, original);
     if !matches!(target, Format::Chat | Format::Responses) {
         if breakpoints > 0 || original["prompt_cache_options"]["mode"] == "explicit" {
@@ -464,12 +501,12 @@ mod tests {
     fn cache_translation_rejects_unsupported_boundaries_and_responses_only_prewarm() {
         let body = json!({"input":[{"role":"user","content":[
             {"type":"input_file","file_id":"file_1","prompt_cache_breakpoint":{"mode":"explicit"}}
-        ]}],"prompt_cache_options":{"mode":"explicit"}});
-        assert!(
-            translated_cache_request(Format::Responses, Format::Chat, &body)
-                .unwrap_err()
-                .contains("cannot be preserved")
-        );
+        ]}],"prompt_cache_key":"task","prompt_cache_options":{"mode":"explicit"}});
+        // Boundaries that can't be kept fall back to default caching; the request still goes.
+        let out = translated_cache_request(Format::Responses, Format::Chat, &body).unwrap();
+        assert!(out["prompt_cache_options"].is_null());
+        assert_eq!(out["prompt_cache_key"], "task");
+        assert!(!out.to_string().contains("prompt_cache_breakpoint"));
         let body = json!({"input":"context","prompt_cache_options":{"prewarm":true}});
         assert!(translated_cache_request(Format::Responses, Format::Chat, &body).unwrap_err().contains("prewarming"));
         let body = json!({"input":"context","prompt_cache_options":{"mode":"implicit","ttl":"30m","prewarm":false}});
@@ -477,7 +514,9 @@ mod tests {
         assert_eq!(out["prompt_cache_options"], json!({"mode":"implicit","ttl":"30m"}));
         let body =
             json!({"messages":[{"role":"user","content":"question"}],"prompt_cache_options":{"mode":"explicit"}});
-        assert!(preserve_cache_hints(Format::Chat, Format::Claude, &body, &mut json!({})).is_err());
+        let mut claude = json!({});
+        preserve_cache_hints(Format::Chat, Format::Claude, &body, &mut claude).unwrap();
+        assert_eq!(claude, json!({}));
         let mut out = json!({});
         preserve_cache_hints(
             Format::Claude,
@@ -515,30 +554,40 @@ mod tests {
     }
 
     #[test]
-    fn cache_translation_rejects_reordering_that_would_move_a_breakpoint() {
-        let original = json!({"input":[
-            {"role":"user","content":"question"},
-            {"role":"developer","content":[{"type":"input_text","text":"late instructions","prompt_cache_breakpoint":{"mode":"explicit"}}]}
-        ]});
-        assert!(
-            translated_cache_request(Format::Responses, Format::Chat, &original).unwrap_err().contains("interleaved")
-        );
-        let original = json!({"input":[{"type":"function_call_output","call_id":"call_1","output":[
-            {"type":"input_image","image_url":"https://example.com/image.png"},
-            {"type":"input_text","text":"result","prompt_cache_breakpoint":{"mode":"explicit"}}
-        ]}]});
-        assert!(
-            translated_cache_request(Format::Responses, Format::Chat, &original).unwrap_err().contains("non-text tool")
-        );
-        let original = json!({"input":[{"role":"user","content":[
-            {"type":"input_file","file_id":"file_1"},
-            {"type":"input_text","text":"cached suffix","prompt_cache_breakpoint":{"mode":"explicit"}}
-        ]}]});
-        assert!(
-            translated_cache_request(Format::Responses, Format::Chat, &original)
-                .unwrap_err()
-                .contains("unsupported content")
-        );
+    fn cache_translation_drops_breakpoints_that_reordering_would_move() {
+        // Why each request can't keep its breakpoints, and that it still goes out without them.
+        let cases = [
+            (
+                json!({"input":[
+                    {"role":"user","content":"question"},
+                    {"role":"developer","content":[{"type":"input_text","text":"late instructions","prompt_cache_breakpoint":{"mode":"explicit"}}]}
+                ]}),
+                "interleaved",
+            ),
+            (
+                json!({"input":[{"type":"function_call_output","call_id":"call_1","output":[
+                    {"type":"input_image","image_url":"https://example.com/image.png"},
+                    {"type":"input_text","text":"result","prompt_cache_breakpoint":{"mode":"explicit"}}
+                ]}]}),
+                "non-text tool",
+            ),
+            (
+                json!({"input":[{"role":"user","content":[
+                    {"type":"input_file","file_id":"file_1"},
+                    {"type":"input_text","text":"cached suffix","prompt_cache_breakpoint":{"mode":"explicit"}}
+                ]}]}),
+                "unsupported content",
+            ),
+        ];
+        for (original, reason) in cases {
+            let req = parse_request(Format::Responses, &original).unwrap();
+            let mut built = chat::build_request(&req, "gpt-6-astra");
+            assert!(
+                carry_cache_hints(Format::Responses, Format::Chat, &original, &mut built).unwrap_err().contains(reason)
+            );
+            let out = translated_cache_request(Format::Responses, Format::Chat, &original).unwrap();
+            assert!(!out.to_string().contains("prompt_cache_breakpoint"), "{reason}");
+        }
     }
 
     #[test]
