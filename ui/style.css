@@ -104,11 +104,9 @@ a { color: inherit; text-decoration: none; }
 .m-lab { display: none; color: var(--fg-3); font-size: 12px; min-width: 34px; }
 .meter .track { flex: 1; height: 6px; border-radius: 3px; background: var(--track); overflow: hidden; }
 .meter .track i { display: block; height: 100%; border-radius: 3px; background: var(--fg-2); }
-.meter.ok .track i { background: var(--ok); }
 .meter.warn .track i { background: var(--warn); }
 .meter.err .track i { background: var(--err); }
-.meter .pct { display: flex; flex-direction: column; min-width: 4ch; color: var(--fg); font-size: 13px; text-align: right; font-variant-numeric: tabular-nums; line-height: 1.3; }
-.meter .quota-caption { color: var(--fg-3); font-size: 10px; }
+.meter .pct { min-width: 4ch; color: var(--fg); font-size: 13px; text-align: right; font-variant-numeric: tabular-nums; }
 .meter.err .pct { color: var(--err); }
 .meter.exhausted .track, .limit.exhausted .track { box-shadow: inset 0 0 0 1px var(--err); }
 .quota-exhausted { color: var(--err); }
@@ -171,7 +169,6 @@ td .route .logo, .btn .logo, .seg .logo { width: 14px; height: 14px; }
 .limit { display: inline-flex; flex-wrap: wrap; align-items: center; gap: 4px 6px; color: var(--fg-3); font-size: 12px; font-variant-numeric: tabular-nums; }
 .limit .track { flex: none; width: 28px; height: 5px; border-radius: 2px; background: var(--track); overflow: hidden; }
 .limit .track i { display: block; height: 100%; border-radius: 2px; background: var(--fg-3); }
-.limit.ok .track i { background: var(--ok); }
 .limit.warn .track i { background: var(--warn); }
 .limit.err .track i { background: var(--err); }
 .limit .pct { color: var(--fg-2); }

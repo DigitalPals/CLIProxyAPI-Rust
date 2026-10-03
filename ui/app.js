@@ -399,20 +399,24 @@ function quotaOf(w, now = Date.now()) {
   if (!w || typeof w.used !== 'number' || !Number.isFinite(w.used)) return null;
   if (w.resets_at && !(Date.parse(w.resets_at) > now)) return null;
   const used = Math.max(0, Math.min(100, w.used));
-  return { used, remaining: 100 - used, cls: used >= 95 ? 'err' : used >= 75 ? 'warn' : 'ok', exhausted: used === 100 };
+  return { used, remaining: 100 - used, cls: used >= 95 ? 'err' : used >= 75 ? 'warn' : '', exhausted: used === 100 };
 }
 
+// Whole percentages; the ends never round onto 0% or 100% unless they are.
 function quotaPercent(value) {
-  const rounded = Math.round(value * 10) / 10;
-  if (value > 0 && rounded === 0) return '<0.1%';
-  if (value < 100 && rounded === 100) return '>99.9%';
+  const rounded = Math.round(value);
+  if (value > 0 && rounded === 0) return '<1%';
+  if (value < 100 && rounded === 100) return '>99%';
   return `${rounded}%`;
 }
+
+// "used" or "left", for headings and labels.
+const quotaWord = () => (S.quotaDisplay === 'used' ? 'used' : 'left');
 
 function quotaView(q) {
   const mode = S.quotaDisplay;
   const value = q[mode];
-  const text = `${quotaPercent(value)} ${mode}`;
+  const text = `${quotaPercent(value)} ${quotaWord()}`;
   const status = q.exhausted ? 'Exhausted' : q.cls === 'err' ? 'Almost exhausted' : q.cls === 'warn' ? 'Low quota' : 'Healthy';
   return { mode, value, text, status };
 }
@@ -433,6 +437,10 @@ function setQuotaDisplay(mode, persist = true) {
   patch('acct-list', accountListHTML);
 }
 
+// Subscriptions that can report limits get meters (a dash until they do); API keys have none.
+const metered = (a) => (a.kind === 'oauth' && ['claude', 'codex'].includes(a.provider))
+  || (a.quota?.windows || []).some((w) => !w.model);
+
 // Subscription usage windows (Claude 5h / week, ChatGPT), tightest first.
 function limitsHTML(a, max = 2) {
   const now = Date.now();
@@ -440,7 +448,7 @@ function limitsHTML(a, max = 2) {
     .filter((w) => !w.model && quotaOf(w, now))
     .sort((x, y) => y.used - x.used)
     .slice(0, max);
-  if (!ws.length) return '<span class="limits none" title="Quota not reported"><span aria-label="Quota not reported">–</span></span>';
+  if (!ws.length) return metered(a) ? '<span class="limits none" title="Quota not reported"><span aria-label="Quota not reported">–</span></span>' : '';
   return `<span class="limits">${ws.map((w) => {
     const q = quotaOf(w, now);
     const v = quotaView(q);
@@ -475,8 +483,8 @@ function meterHTML(w, label) {
     ? `<span class="reset">${q.exhausted ? '<span class="quota-exhausted">Exhausted</span> · ' : ''}Resets in <span data-until="${esc(w.resets_at)}">${until(w.resets_at)}</span></span>`
     : q.exhausted ? '<span class="reset"><span class="quota-exhausted">Exhausted</span></span>' : '';
   return `<div class="meter ${q.cls}${q.exhausted ? ' exhausted' : ''}"${w.resets_at ? ` data-quota-reset="${esc(w.resets_at)}"` : ''}>
-    <div class="m-top"><span class="m-lab">${label}</span><span class="track" role="meter" aria-label="${label} quota ${v.mode}" aria-valuemin="0" aria-valuemax="100" aria-valuenow="${v.value}" aria-valuetext="${esc(v.text)} · ${v.status}" title="${v.status}"><i style="width:${v.value}%"></i></span>
-      <span class="pct"><span>${esc(quotaPercent(v.value))}</span><span class="quota-caption">${v.mode}</span></span></div>${reset}
+    <div class="m-top"><span class="m-lab">${label} ${quotaWord()}</span><span class="track" role="meter" aria-label="${label} quota ${v.mode}" aria-valuemin="0" aria-valuemax="100" aria-valuenow="${v.value}" aria-valuetext="${esc(v.text)} · ${v.status}" title="${v.status}"><i style="width:${v.value}%"></i></span>
+      <span class="pct">${esc(quotaPercent(v.value))}</span></div>${reset}
   </div>`;
 }
 
@@ -505,8 +513,7 @@ function ovAccountsHTML() {
   // Subscriptions that report their limits lead; the rest follow in pool order.
   const sorted = [...list.filter(hasLimits), ...list.filter((a) => !hasLimits(a))];
   const shown = sorted.slice(0, 10);
-  const limits = list.some((a) => (a.kind === 'oauth' && ['claude', 'codex'].includes(a.provider))
-    || (a.quota?.windows || []).some((w) => !w.model));
+  const limits = list.some(metered);
   const name = accountNameHTML;
   const req = (a) => `<span class="num"><b>${fmt(a.counters.requests)}</b> req</span>`;
   const more = list.length > shown.length ? `<p class="note"><a class="link" href="#/accounts">${list.length - shown.length} more</a></p>` : '';
@@ -517,14 +524,14 @@ function ovAccountsHTML() {
   const rows = shown.map((a) => {
     return `<div class="row lim-row">
       ${name(a)}
-      <div class="lim-5h">${meterHTML(windowOf(a, true), '5h')}</div>
-      <div class="lim-wk">${meterHTML(windowOf(a, false), 'Week')}</div>
+      <div class="lim-5h">${metered(a) ? meterHTML(windowOf(a, true), '5h') : ''}</div>
+      <div class="lim-wk">${metered(a) ? meterHTML(windowOf(a, false), 'Week') : ''}</div>
       <div class="lim-status">${statusHTML(a, false)}</div>
       <div class="lim-req hide-md">${req(a)}</div>
     </div>`;
   }).join('');
   return `${head}<div class="lim-table">
-    <div class="row lim-row lim-head" aria-hidden="true"><span>Account</span><span>5-hour limit</span><span>Weekly limit</span><span>Status</span><span class="hide-md r">Requests</span></div>
+    <div class="row lim-row lim-head" aria-hidden="true"><span>Account</span><span>5-hour limit <span class="dim">· ${quotaWord()}</span></span><span>Weekly limit <span class="dim">· ${quotaWord()}</span></span><span>Status</span><span class="hide-md r">Requests</span></div>
     ${rows}
   </div>${more}`;
 }
