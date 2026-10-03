@@ -2,7 +2,7 @@
 
 const CONFIG_SECTIONS = [
   ['server', 'Server'], ['access', 'Access'], ['routing', 'Routing'], ['connections', 'Connections'],
-  ['providers', 'Providers'], ['models', 'Models'], ['diagnostics', 'Diagnostics'],
+  ['providers', 'Providers'], ['models', 'Models'], ['diagnostics', 'Diagnostics'], ['yaml', 'YAML file'],
 ];
 const CONFIG_PROVIDERS = [
   ['claude', 'Claude', 'claude-api-key'], ['codex', 'OpenAI / Codex', 'codex-api-key'],
@@ -152,18 +152,21 @@ function configConnectionsHTML() {
     ${configSwitch(['claude-cloak'], 'Claude Code compatibility', 'Make requests through Claude OAuth accounts resemble Claude Code requests for other clients.')}`;
 }
 
+// Provider ids here are config groups; the logo sprite knows them as account providers.
+const configLogo = (provider, name) => logo(provider === 'compat' ? 'openai-compat' : provider, name, 'api-key');
+
 function configProvidersHTML() {
   const c = S.config;
   const [provider, label, field] = CONFIG_PROVIDERS.find(([p]) => p === c.provider);
   const entries = configGet([field]) || [];
   const compatible = provider === 'compat';
   return `<div class="cfg-section-head"><h2>Providers</h2><button type="button" class="btn" data-config-act="add-provider">Add ${compatible ? 'provider' : 'key'}</button></div>
-    <div class="cfg-provider-tabs" role="group" aria-label="Provider">${CONFIG_PROVIDERS.map(([p, name, f]) => `<button type="button" class="btn ghost small" data-config-act="provider" data-provider="${p}" aria-pressed="${p === provider}">${esc(name)}<span class="cfg-count">${configGet([f])?.length || 0}</span></button>`).join('')}</div>
+    <div class="cfg-provider-tabs" role="group" aria-label="Provider">${CONFIG_PROVIDERS.map(([p, name, f]) => `<button type="button" class="btn ghost small" data-config-act="provider" data-provider="${p}" aria-pressed="${p === provider}">${configLogo(p)}${esc(name)}<span class="cfg-count">${configGet([f])?.length || 0}</span></button>`).join('')}</div>
     ${entries.length ? entries.map((entry, i) => {
       const path = [field, i];
       const openKey = `${field}:${i}`;
       return `<details class="cfg-provider" data-cfg-open="${openKey}" ${c.opens[openKey] ? 'open' : ''}>
-        <summary><span class="dot ${provider}"></span><span>${esc(entry.label || entry.name || `${label} key ${i + 1}`)}</span>
+        <summary>${configLogo(provider, entry.name)}<span>${esc(entry.label || entry.name || `${label} key ${i + 1}`)}</span>
           ${entry.prefix ? `<span class="cfg-count mono">${esc(entry.prefix)}/</span>` : ''}
           ${compatible && entry.disabled ? '<span class="cfg-count">Disabled</span>' : ''}<span class="cfg-chevron" aria-hidden="true">›</span></summary>
         <div class="cfg-provider-body"><div class="cfg-grid">
@@ -199,8 +202,66 @@ function configDiagnosticsHTML() {
     ${S.config.ignored.length ? `<p class="cfg-description">These settings are retained in the file but have no effect in CLIProxyAPI-Rust.</p><ul class="cfg-notices">${S.config.ignored.map((s) => `<li>${esc(s)}</li>`).join('')}</ul>` : '<p class="cfg-description">No ignored CLIProxyAPI features were detected.</p>'}`;
 }
 
+// The whole file, for settings the sections don't cover. One kind of edit at a time:
+// form drafts and YAML drafts never pile up on top of each other.
+const rawDirty = () => S.config.raw.text != null && S.config.raw.text !== S.config.raw.saved;
+
+function configYamlHTML() {
+  const c = S.config;
+  const r = c.raw;
+  const head = '<h2>YAML file</h2><p class="cfg-description">The whole config.yaml, including settings the other sections don\'t cover. Changes are checked before they are applied.</p>';
+  if (configDirty()) return `${head}<p class="cfg-empty">Save or discard the changes in the other sections first.</p>`;
+  if (S.private && !c.reveal) {
+    return `${head}<div class="cfg-empty-state"><h3>Hidden while emails and keys are hidden</h3><p>config.yaml holds your API keys in plain text.</p>
+      <button type="button" class="btn" data-act="reveal-config">${ICON.eye}Show file</button></div>`;
+  }
+  if (r.text == null) {
+    loadRawConfig();
+    return `${head}<div class="skel-rows" aria-busy="true" aria-label="Loading">${'<div class="skel"></div>'.repeat(4)}</div>`;
+  }
+  return `${head}<label class="sr-only" for="cfg-yaml">config.yaml</label>
+    <textarea id="cfg-yaml" class="editor" spellcheck="false" autocapitalize="off" autocomplete="off">${esc(r.text)}</textarea>`;
+}
+
+async function loadRawConfig() {
+  const r = S.config.raw;
+  if (r.loading) return;
+  r.loading = true;
+  try {
+    const res = await api('/config');
+    Object.assign(r, { text: res.text, saved: res.text });
+  } catch (e) { S.config.msg = { kind: 'err', text: e.message }; }
+  r.loading = false;
+  if (S.route === 'config' && S.config.section === 'yaml') render();
+}
+
+async function saveRawConfig() {
+  const c = S.config;
+  if (c.busy || !rawDirty()) return;
+  const ta = $('#cfg-yaml');
+  const pos = ta ? [ta.selectionStart, ta.scrollTop] : null;
+  c.busy = true; c.msg = null; render();
+  try {
+    const res = await api('/config', { method: 'PUT', body: JSON.stringify({ text: c.raw.text }) });
+    c.raw.saved = c.raw.text;
+    acceptConfig(await api('/config/settings'));
+    c.msg = { kind: 'ok', text: res.restart_required ? 'Saved. Some changes need a server restart.' : 'Saved and applied.' };
+    refreshAccounts();
+  } catch (e) { c.msg = { kind: 'err', text: e.message }; }
+  c.busy = false; render();
+  const ta2 = $('#cfg-yaml');
+  if (ta2 && pos) { ta2.focus(); ta2.selectionStart = ta2.selectionEnd = pos[0]; ta2.scrollTop = pos[1]; }
+}
+
 function configFootHTML() {
   const c = S.config;
+  if (c.section === 'yaml') {
+    const dirty = rawDirty();
+    const msg = c.msg || (dirty ? { kind: '', text: 'The file has unsaved changes.' } : { kind: 'dim', text: 'Saved changes apply immediately.' });
+    return `<div class="cfg-foot-actions"><button type="button" class="btn primary" data-config-act="save" ${dirty && !c.busy ? '' : 'disabled'}>${c.busy ? 'Saving…' : 'Save file'}</button>
+      <button type="button" class="btn ghost" data-config-act="discard" ${dirty && !c.busy ? '' : 'disabled'}>Revert</button></div>
+      <p class="msg ${msg.kind}" role="status">${esc(msg.text)}</p>`;
+  }
   const count = Object.keys(configChanges()).length;
   const error = Object.values(c.errors).find(Boolean);
   const msg = c.msg || (count ? { kind: '', text: `${count} ${count === 1 ? 'setting has' : 'settings have'} unsaved changes.` } : { kind: 'dim', text: 'Changes are saved to your config file.' });
@@ -217,8 +278,8 @@ function configHTML() {
     return skeletonHTML();
   }
   const sections = { server: configServerHTML, access: configAccessHTML, routing: configRoutingHTML,
-    connections: configConnectionsHTML, providers: configProvidersHTML, models: configModelsHTML, diagnostics: configDiagnosticsHTML };
-  return `<div class="page-head"><div><h1>Configuration</h1><p class="mono cfg-path">${esc(c.path)}</p></div>
+    connections: configConnectionsHTML, providers: configProvidersHTML, models: configModelsHTML, diagnostics: configDiagnosticsHTML, yaml: configYamlHTML };
+  return `<div class="page-head"><div><h1>Configuration</h1><p class="mono cfg-path">${esc(home(c.path))}</p></div>
       <button type="button" class="btn ghost" data-config-act="reload" ${c.busy ? 'disabled' : ''}>Reload settings</button></div>
     ${c.reloadConfirm ? '<div class="cfg-banner"><span>Reloading will discard your unsaved changes.</span><button class="btn small" data-config-act="confirm-reload">Reload and discard</button><button class="btn ghost small" data-config-act="cancel-reload">Keep editing</button></div>' : ''}
     ${c.restart_fields.length ? `<div class="cfg-banner warn" role="status">Restart CLIProxyAPI-Rust to apply changes to ${esc(c.restart_fields.join(', '))}.</div>` : ''}
@@ -231,7 +292,8 @@ function configHTML() {
 function acceptConfig(result) {
   const c = S.config;
   Object.assign(c, { values: result.values, saved: configClone(result.values), defaults: result.defaults, revision: result.revision,
-    path: result.path, ignored: result.ignored || [], restart_fields: result.restart_fields || [], errors: {}, secrets: {}, reloadConfirm: false });
+    path: result.path, ignored: result.ignored || [], restart_fields: result.restart_fields || [], errors: {}, secrets: {}, reloadConfirm: false,
+    raw: { text: null, saved: null, loading: false } });
 }
 
 async function loadConfig() {
@@ -333,6 +395,7 @@ function configValidate() {
 
 async function saveConfig() {
   const c = S.config;
+  if (c.section === 'yaml') return saveRawConfig();
   if (c.busy || !configDirty() || !configValidate()) return;
   const changes = configChanges();
   const oldKey = c.saved['management-key'];
@@ -341,7 +404,8 @@ async function saveConfig() {
   try {
     const result = await api('/config/settings', { method: 'PATCH', body: JSON.stringify({ revision: c.revision, changes }) });
     acceptConfig(result);
-    c.msg = { kind: 'ok', text: result.restart_required ? 'Saved. Some changes need a server restart.' : 'Saved and applied.' };
+    c.msg = { kind: 'ok', text: [result.restart_required ? 'Saved. Some changes need a server restart.' : 'Saved and applied.',
+      result.rewritten ? 'This file\'s layout couldn\'t be kept, so its comments were removed; the original is in config.yaml.bak.' : ''].filter(Boolean).join(' ') };
     // A newly configured dashboard key must also authenticate this browser's next request.
     if (oldKey !== newKey) {
       S.key = newKey;
@@ -355,6 +419,11 @@ async function saveConfig() {
 
 function discardConfig() {
   if (S.config.busy) return;
+  if (S.config.section === 'yaml') {
+    Object.assign(S.config.raw, { text: S.config.raw.saved });
+    S.config.msg = null;
+    return render();
+  }
   Object.assign(S.config, { values: configClone(S.config.saved), errors: {}, msg: null, secrets: {}, reloadConfirm: false });
   render();
 }
@@ -362,6 +431,15 @@ function discardConfig() {
 function bindConfig() {
   const form = $('#config-form');
   if (!form) return;
+  const ta = $('#cfg-yaml');
+  ta?.addEventListener('input', () => { S.config.raw.text = ta.value; S.config.msg = null; configUpdateFoot(); });
+  ta?.addEventListener('keydown', (e) => {
+    if (e.key === 'Tab' && !e.shiftKey) {
+      e.preventDefault();
+      ta.setRangeText('  ', ta.selectionStart, ta.selectionEnd, 'end');
+      S.config.raw.text = ta.value; configUpdateFoot();
+    }
+  });
   form.addEventListener('submit', (e) => { e.preventDefault(); saveConfig(); });
   form.addEventListener('input', (e) => {
     const input = e.target.closest('[data-cfg]');
@@ -428,12 +506,17 @@ document.addEventListener('click', (e) => {
   if (act === 'save') return saveConfig();
   if (act === 'discard') return discardConfig();
   if (act === 'reload') {
-    if (configDirty()) { c.reloadConfirm = true; render(); return; }
+    if (configDirty() || rawDirty()) { c.reloadConfirm = true; render(); return; }
     return loadConfig();
   }
   if (act === 'confirm-reload') return loadConfig();
   if (act === 'cancel-reload') { c.reloadConfirm = false; render(); return; }
-  if (act === 'section') { c.section = button.dataset.section; render(); $('.cfg-content h2')?.scrollIntoView({ block: 'nearest' }); return; }
+  if (act === 'section') {
+    if (c.section === 'yaml' && button.dataset.section !== 'yaml' && rawDirty()) {
+      c.msg = { kind: 'err', text: 'Save or revert the file first.' }; configUpdateFoot(); return;
+    }
+    c.section = button.dataset.section; c.msg = null; render(); $('.cfg-content h2')?.scrollIntoView({ block: 'nearest' }); return;
+  }
   if (act === 'provider') { c.provider = button.dataset.provider; render(); return; }
   if (act === 'switch') {
     configSet(path, !configGet(path)); c.msg = null; render(); document.getElementById(configId(path))?.focus(); return;

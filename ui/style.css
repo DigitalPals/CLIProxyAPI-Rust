@@ -296,6 +296,9 @@ textarea.mono { resize: vertical; min-height: 120px; }
 .msg.err { color: var(--err); }
 .msg.ok { color: var(--ok); }
 
+/* config file editor */
+.editor { width: 100%; min-height: 62vh; padding: 16px 18px; resize: vertical; font: 12.5px/1.7 var(--mono); color: var(--fg); tab-size: 2; white-space: pre; border-radius: 12px; }
+
 /* empty states */
 .empty { padding: 28px 4px; border-bottom: 1px solid var(--line); }
 .empty h3 { margin: 0 0 4px; color: var(--fg); font-size: 15px; font-weight: 600; }

@@ -604,6 +604,14 @@ async fn import_vertex(State(app): State<Arc<App>>, Json(b): Json<VertexBody>) -
 
 /// Applies an edit to the config file's YAML tree, keeping every setting this
 /// binary doesn't know about (so the file still works with CLIProxyAPI).
+/// A rewrite drops comments, so the commented original is kept once as config.yaml.bak.
+fn keep_original(app: &App, text: &str) {
+    let backup = app.cfg_path.with_extension("yaml.bak");
+    if text.contains('#') && !backup.exists() {
+        let _ = std::fs::write(&backup, text);
+    }
+}
+
 fn edit_config(app: &Arc<App>, edit: impl FnOnce(&mut serde_yaml::Value)) -> Response {
     let _guard = app.config_write.lock();
     let text = match std::fs::read_to_string(&app.cfg_path) {
@@ -619,9 +627,14 @@ fn edit_config(app: &Arc<App>, edit: impl FnOnce(&mut serde_yaml::Value)) -> Res
     };
     let original = doc.clone();
     edit(&mut doc);
-    let out = match crate::config_editor::preserve(&text, &original, &doc) {
-        Ok(t) => t,
-        Err(e) => return err(StatusCode::BAD_REQUEST, e.to_string()),
+    let out = match crate::config_editor::render(&text, &original, &doc) {
+        Ok((t, rewritten)) => {
+            if rewritten {
+                keep_original(app, &text);
+            }
+            t
+        }
+        Err(e) => return err(StatusCode::INTERNAL_SERVER_ERROR, format!("{e:#}")),
     };
     let cfg = match Config::parse(&out) {
         Ok(c) => c,
@@ -702,19 +715,23 @@ async fn patch_settings(State(app): State<Arc<App>>, Json(body): Json<SettingsBo
             "The config changed since you opened it. Reload the latest settings before saving.",
         );
     }
-    let (out, cfg) = match crate::config_editor::apply(&text, &body.changes) {
+    let (out, cfg, rewritten) = match crate::config_editor::apply(&text, &body.changes) {
         Ok(result) => result,
         Err(e) => return err(StatusCode::BAD_REQUEST, format!("{e:#}")),
     };
-    let response = match settings_response(&app, &out) {
+    let mut response = match settings_response(&app, &out) {
         Ok(body) => body,
         Err(e) => return err(StatusCode::BAD_REQUEST, format!("{e:#}")),
     };
+    response["rewritten"] = rewritten.into();
     // Also catch external file changes made while validation was running.
     if std::fs::read_to_string(&app.cfg_path).ok().as_deref() != Some(&text) {
         return err(StatusCode::CONFLICT, "The config changed while saving. Reload the latest settings before saving.");
     }
     if out != text {
+        if rewritten {
+            keep_original(&app, &text);
+        }
         if let Err(e) = std::fs::write(&app.cfg_path, &out) {
             return err(StatusCode::INTERNAL_SERVER_ERROR, format!("Could not save config: {e}"));
         }
@@ -790,6 +807,37 @@ async fn live(State(app): State<Arc<App>>, ws: WebSocketUpgrade) -> Response {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn key_edits_fall_back_to_a_rewrite_when_formatting_cannot_be_kept() {
+        let dir = std::env::temp_dir().join(format!("cliproxyapi-edit-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("config.yaml");
+        let original = format!(
+            "# indentless list\nauth-dir: {}\nclaude-api-key:\n- api-key: first\n  headers: {{X-Team: core}}\n",
+            dir.display()
+        );
+        std::fs::write(&path, &original).unwrap();
+        let app = App::new(Config::parse(&original).unwrap(), path.clone());
+        let response = edit_config(&app, |doc| {
+            crate::compat::add_key(
+                doc,
+                &crate::compat::NewKey {
+                    group: "claude",
+                    api_key: "second",
+                    base_url: None,
+                    models: vec![],
+                    name: None,
+                },
+            )
+        });
+        assert_eq!(response.status(), StatusCode::OK);
+        let cfg = Config::parse(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(cfg.claude_api_key.len(), 2);
+        assert_eq!(cfg.claude_api_key[0].headers["X-Team"], "core");
+        assert_eq!(std::fs::read_to_string(dir.join("config.yaml.bak")).unwrap(), original);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
 
     #[tokio::test]
     async fn structured_saves_validate_and_reject_stale_edits() {

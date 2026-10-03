@@ -653,7 +653,22 @@ pub fn preserve(text: &str, before: &Yaml, after: &Yaml) -> Result<String> {
     Ok(output)
 }
 
-pub fn apply(text: &str, changes: &Map<String, Value>) -> Result<(String, Config)> {
+/// Lossless when the file's layout allows it; otherwise a plain rewrite that drops
+/// comments and layout (the second value is true). Some valid YAML, such as lists
+/// written without indentation, can't be edited in place.
+pub fn render(text: &str, before: &Yaml, after: &Yaml) -> Result<(String, bool)> {
+    match preserve(text, before, after) {
+        Ok(out) => Ok((out, false)),
+        Err(e) => {
+            tracing::warn!("rewriting config.yaml without its formatting: {e:#}");
+            let out = serde_yaml::to_string(after)?;
+            ensure!(yaml(&out)? == *after, "Could not write this config");
+            Ok((out, true))
+        }
+    }
+}
+
+pub fn apply(text: &str, changes: &Map<String, Value>) -> Result<(String, Config, bool)> {
     let before_values = values(text)?;
     validate(&before_values, changes)?;
     let before = yaml(text)?;
@@ -674,9 +689,9 @@ pub fn apply(text: &str, changes: &Map<String, Value>) -> Result<(String, Config
             set_path(&mut after, &path, raw)?;
         }
     }
-    let output = preserve(text, &before, &after)?;
+    let (output, rewritten) = render(text, &before, &after)?;
     let cfg = Config::parse(&output)?;
-    Ok((output, cfg))
+    Ok((output, cfg, rewritten))
 }
 
 pub fn restart_fields(startup: &Config, current: &Config) -> Vec<&'static str> {
@@ -704,7 +719,26 @@ mod tests {
     use super::*;
 
     fn edit(text: &str, changes: Value) -> (String, Config) {
-        apply(text, changes.as_object().unwrap()).unwrap()
+        let (out, cfg, rewritten) = apply(text, changes.as_object().unwrap()).unwrap();
+        assert!(!rewritten, "expected a lossless edit");
+        (out, cfg)
+    }
+
+    #[test]
+    fn layouts_the_lossless_editor_cannot_follow_are_rewritten() {
+        for source in [
+            "# indentless list\nport: 8317\nclaude-api-key:\n- api-key: first\n",
+            "---\n# explicit document\nport: 8317\nclaude-api-key:\n  - api-key: first\n...\n",
+        ] {
+            let mut keys = values(source).unwrap()["claude-api-key"].clone();
+            keys.as_array_mut().unwrap().push(json!({"api-key": "second", "models": [], "headers": {}}));
+            let (out, cfg, rewritten) =
+                apply(source, json!({"claude-api-key": keys, "port": 9000}).as_object().unwrap()).unwrap();
+            assert!(rewritten);
+            assert_eq!(cfg.port, 9000);
+            assert_eq!(cfg.claude_api_key.len(), 2);
+            assert_eq!(Config::parse(&out).unwrap().claude_api_key[1].api_key, "second");
+        }
     }
 
     #[test]

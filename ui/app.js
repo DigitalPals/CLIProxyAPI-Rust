@@ -28,7 +28,7 @@ const S = {
   resetModal: null,
   config: { values: null, saved: null, defaults: {}, revision: '', path: '', ignored: [], restart_fields: [],
     msg: null, busy: false, loading: false, section: 'server', provider: 'claude', oauthProvider: 'claude',
-    errors: {}, opens: {}, secrets: {}, reloadConfirm: false, reveal: false },
+    errors: {}, opens: {}, secrets: {}, reloadConfirm: false, reveal: false, raw: { text: null, saved: null, loading: false } },
 };
 
 const PROVIDER = {
@@ -1205,7 +1205,7 @@ document.addEventListener('click', (e) => {
     case 'reveal-config':
       S.config.reveal = true;
       render();
-      return $('#cfg')?.focus();
+      return $('#cfg-yaml')?.focus();
     case 'quota-display':
       setQuotaDisplay(id);
       return $(`[data-act="quota-display"][data-id="${S.quotaDisplay}"]`)?.focus();
@@ -1321,7 +1321,7 @@ setInterval(async () => {
 }, 60000);
 
 window.addEventListener('beforeunload', (e) => {
-  if (configDirty()) e.preventDefault();
+  if (configDirty() || rawDirty()) e.preventDefault();
 });
 
 window.addEventListener('storage', (e) => {
