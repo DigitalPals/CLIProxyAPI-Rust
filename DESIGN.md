@@ -142,7 +142,7 @@ Flat. Depth comes only from `raise` surfaces and 1px `line` hairlines. No shadow
 ## Components
 
 - Buttons: outline (line-strong border) by default; one white-filled primary per view at most; ghost buttons for row actions.
-- Tables: 12px fg-3 headers, 40px rows, 1px line separators, row hover `#070707`.
+- Tables: 12px fg-3 headers, 10px cell padding, 1px line separators, row hover `#070707`. The request table's account cell has a second `fg-3` line: why the account was chosen ("Same session", amber for "Moved: quota used up" or "Detour: account busy") and the session's 8-character fingerprint, which filters the table to that session.
 - Status: dot + word ("Ready", "Cooling 4:12", "Disabled", "Error").
 - Provider logos: an inline SVG sprite (`ui/logos.svg`, from LobeHub Icons, MIT) used through `<use>`; 18px beside account names, 14px in routes, buttons and the segmented control, 20px in the sign-in picker. OpenAI-compatible groups get their vendor's logo when the group name gives it away (OpenRouter, Ollama, LM Studio, DeepSeek, Groq, Mistral, Qwen, Kimi), otherwise the generic mark. xAI API keys show the xAI mark; Grok sign-ins show Grok.
 - Privacy toggle: a 30px ghost icon button (eye / eye-off) at the right end of the bar, pressed state on `#18181b`, remembered per browser. When on, emails read `••••••@••••••`, key ends `••••…••••`, the client key `••••••••`, sign-ins without an email are hidden whole, home folders read `~`, and the YAML file section waits behind "Show file"; secret fields in the settings forms stay masked. Copy buttons still copy the real value.
