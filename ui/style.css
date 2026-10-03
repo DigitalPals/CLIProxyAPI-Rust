@@ -458,9 +458,13 @@ details[open] > summary > .cfg-chevron { transform: rotate(90deg); }
 }
 
 /* Banked subscription resets */
-.reset-badge { flex: none; padding: 2px 8px; border: 1px solid var(--line-strong); border-radius: 20px; background: var(--raise); color: var(--fg-2); font: 12px/1.6 var(--font); cursor: pointer; }
-.reset-badge:hover { color: var(--fg); border-color: var(--fg-3); }
-.reset-badge.warn { color: var(--warn); }
+.reset-badge { display: inline-flex; align-items: center; gap: 5px; flex: none; min-height: 24px; padding: 1px 7px; border: 1px solid #60a5fa40; border-radius: 20px; background: #60a5fa0d; color: #93c5fd; font: 500 11.5px/1.5 var(--font); white-space: nowrap; cursor: pointer; transition: color .15s, border-color .15s, background .15s; }
+.reset-badge svg { width: 12px; height: 12px; flex: none; }
+.reset-badge:hover { color: #bfdbfe; border-color: #60a5fa80; background: #60a5fa1a; }
+.reset-badge:focus-visible { outline: 2px solid #93c5fd; outline-offset: 3px; border-radius: 20px; }
+.reset-badge.warn { color: var(--warn); border-color: #fbbf2440; background: #fbbf240d; }
+.reset-badge.warn:hover { border-color: #fbbf2480; background: #fbbf241a; }
+.reset-expiry-dot { width: 5px; height: 5px; border-radius: 50%; background: var(--warn); flex: none; }
 .reset-modal { width: min(480px, calc(100vw - 32px)); max-height: calc(100dvh - 32px); margin: auto; padding: 0; border: 1px solid var(--line-strong); border-radius: 12px; background: var(--raise); color: var(--fg-2); overflow: auto; font-size: 13px; box-shadow: 0 24px 80px #0009; }
 .reset-modal::backdrop { background: #000b; }
 .reset-modal-head { display: flex; justify-content: space-between; align-items: flex-start; gap: 16px; padding: 20px 20px 0; }

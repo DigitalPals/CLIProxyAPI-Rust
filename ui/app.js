@@ -777,9 +777,15 @@ function bankedLabel(a) {
 }
 function bankedSummaryHTML(a) {
   if (!hasBankedResets(a)) return '';
-  const review = ['pending', 'unknown'].includes(a.banked_resets?.operation?.status);
-  if (!review && a.banked_resets?.inventory?.available === 0) return '';
-  return `<button type="button" class="reset-badge${review ? ' warn' : ''}" data-act="banked-details" data-id="${esc(a.id)}" aria-haspopup="dialog" aria-controls="banked-reset-modal" aria-label="${esc(bankedLabel(a))} for ${esc(a.label)}">${esc(bankedLabel(a))}</button>`;
+  const r = a.banked_resets, review = ['pending', 'unknown'].includes(r?.operation?.status);
+  if (!review && r?.inventory?.available === 0) return '';
+  const count = !r?.error ? r?.inventory?.available : null;
+  const label = review ? 'Review reset' : count == null ? 'Resets unavailable' : `${count} reset${count === 1 ? '' : 's'}`;
+  const now = Date.now();
+  const expiring = !review && !r?.error && (r?.inventory?.grants || []).some((g) =>
+    g.remaining > 0 && Date.parse(g.expires_at) > now && Date.parse(g.expires_at) <= now + 24 * 60 * 60 * 1000);
+  const hint = expiring ? ' A reset expires within 24 hours.' : '';
+  return `<button type="button" class="reset-badge${review ? ' warn' : ''}" data-act="banked-details" data-id="${esc(a.id)}" aria-haspopup="dialog" aria-controls="banked-reset-modal" aria-label="${esc(bankedLabel(a))} for ${esc(a.label)}.${hint}" title="View saved resets and expiry dates.${hint}">${ICON.refresh}<span>${esc(label)}</span>${expiring ? '<span class="reset-expiry-dot" aria-hidden="true"></span>' : ''}</button>`;
 }
 function resetButton(a, act, label, disabled = false, extra = '') {
   return `<button type="button" class="btn small ${['banked-open', 'banked-confirm'].includes(act) ? 'primary' : 'ghost'}" data-act="${act}" data-id="${esc(a.id)}" ${disabled ? 'disabled' : ''} ${extra}>${label}</button>`;
