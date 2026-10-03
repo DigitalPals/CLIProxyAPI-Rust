@@ -820,7 +820,8 @@ function accountListHTML() {
 
 // banked resets ----------------------------------------------------------
 
-function hasBankedResets(a) { return a.kind === 'oauth' && ['claude', 'codex'].includes(a.provider); }
+// Opt-in (banked-resets in config.yaml): it relies on unofficial provider endpoints.
+function hasBankedResets(a) { return !!S.overview?.banked_resets && a.kind === 'oauth' && ['claude', 'codex'].includes(a.provider); }
 function accountNameHTML(a) {
   return `<div class="acct-name">${logo(a.provider, a.group, a.kind)}<span class="who"><span class="acct-title"><span class="label" title="${esc(acctLabel(a))}">${esc(acctLabel(a))}</span>${bankedSummaryHTML(a)}</span><span class="sub">${esc(acctSub(a))}</span></span></div>`;
 }
@@ -833,14 +834,15 @@ function bankedLabel(a) {
 function bankedSummaryHTML(a) {
   if (!hasBankedResets(a)) return '';
   const r = a.banked_resets, review = ['pending', 'unknown'].includes(r?.operation?.status);
-  if (!review && r?.inventory?.available === 0) return '';
   const count = !r?.error ? r?.inventory?.available : null;
+  // Only resets you have, or one that needs a decision, earn a badge.
+  if (!review && !count) return '';
   const label = review ? 'Review reset' : count == null ? 'Resets unavailable' : `${count} reset${count === 1 ? '' : 's'}`;
   const now = Date.now();
   const expiring = !review && !r?.error && (r?.inventory?.grants || []).some((g) =>
     g.remaining > 0 && Date.parse(g.expires_at) > now && Date.parse(g.expires_at) <= now + 24 * 60 * 60 * 1000);
   const hint = expiring ? ' A reset expires within 24 hours.' : '';
-  return `<button type="button" class="reset-badge${review ? ' warn' : ''}" data-act="banked-details" data-id="${esc(a.id)}" aria-haspopup="dialog" aria-controls="banked-reset-modal" aria-label="${esc(bankedLabel(a))} for ${esc(a.label)}.${hint}" title="View saved resets and expiry dates.${hint}">${ICON.refresh}<span>${esc(label)}</span>${expiring ? '<span class="reset-expiry-dot" aria-hidden="true"></span>' : ''}</button>`;
+  return `<button type="button" class="reset-badge${review ? ' warn' : ''}" data-act="banked-details" data-id="${esc(a.id)}" aria-haspopup="dialog" aria-controls="banked-reset-modal" aria-label="${esc(bankedLabel(a))} for ${esc(acctLabel(a))}.${hint}" title="View saved resets and expiry dates.${hint}">${ICON.refresh}<span>${esc(label)}</span>${expiring ? '<span class="reset-expiry-dot" aria-hidden="true"></span>' : ''}</button>`;
 }
 function resetButton(a, act, label, disabled = false, extra = '') {
   return `<button type="button" class="btn small ${['banked-open', 'banked-confirm'].includes(act) ? 'primary' : 'ghost'}" data-act="${act}" data-id="${esc(a.id)}" ${disabled ? 'disabled' : ''} ${extra}>${label}</button>`;
@@ -889,7 +891,7 @@ function bankedResetsHTML(a) {
       controls = `${resetButton(a, 'banked-refresh', local.busy ? 'Checking…' : 'Refresh', local.busy)}${retryable ? resetButton(a, 'banked-retry', 'Retry request', local.busy || a.disabled, `data-reset-deadline="${esc(op.retry_until)}"`) : ''}${resetButton(a, 'banked-resolve', 'Check outcome', local.busy)}`;
     }
   }
-  return `<header class="reset-modal-head"><div><h2 id="reset-modal-title">${title}</h2><p id="reset-modal-account">${esc(a.label)} · ${esc(PROVIDER[a.provider])}</p></div><button type="button" class="btn ghost small reset-close" data-act="banked-close" data-id="${esc(a.id)}" aria-label="Close reset details">×</button></header>
+  return `<header class="reset-modal-head"><div><h2 id="reset-modal-title">${title}</h2><p id="reset-modal-account">${esc(acctLabel(a))} · ${esc(PROVIDER[a.provider])}</p></div><button type="button" class="btn ghost small reset-close" data-act="banked-close" data-id="${esc(a.id)}" aria-label="Close reset details">×</button></header>
     <div class="reset-modal-body" aria-busy="${!!local.busy}">${content}${local.error || r?.error ? `<p class="err" role="alert">${esc(local.error || r.error)}</p>` : ''}</div>
     <footer class="reset-modal-footer">${!d && r ? `<span class="sub">Checked <span data-ago="${esc(r.checked_at)}">${ago(r.checked_at)}</span></span>` : ''}<div class="actions">${controls}</div></footer>`;
 }

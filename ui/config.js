@@ -149,7 +149,8 @@ function configConnectionsHTML() {
   return `<h2>Connections</h2><div class="cfg-grid">${configField(['proxy-url'], 'Upstream proxy', { wide: true,
     placeholder: 'socks5://127.0.0.1:1080', help: 'Default proxy for upstream requests. Supports HTTP, HTTPS and SOCKS5; individual providers can override it.' })}</div>
     <div class="cfg-divider"></div>${configSwitch(['codex-websockets'], 'Native Codex websockets', 'Keep a native upstream websocket connection for clients using Codex over websockets.')}
-    ${configSwitch(['claude-cloak'], 'Claude Code compatibility', 'Make requests through Claude OAuth accounts resemble Claude Code requests for other clients.')}`;
+    ${configSwitch(['claude-cloak'], 'Claude Code compatibility', 'Make requests through Claude OAuth accounts resemble Claude Code requests for other clients.')}
+    ${configSwitch(['banked-resets'], 'Banked resets', 'Show saved Claude and ChatGPT limit resets beside each subscription and let you spend them. Checks every 30 minutes through unofficial provider endpoints.')}`;
 }
 
 // Provider ids here are config groups; the logo sprite knows them as account providers.

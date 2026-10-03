@@ -395,6 +395,7 @@ async fn overview(State(app): State<Arc<App>>) -> Json<Value> {
         "base_url": format!("http://{host}:{}", cfg.port),
         "client_keys": cfg.api_keys,
         "routing": cfg.routing,
+        "banked_resets": cfg.banked_resets,
         "management_key": !cfg.management_key.is_empty(),
         "totals": *app.stats.totals.lock(),
         "active": app.stats.active.load(Ordering::Relaxed),
@@ -464,7 +465,12 @@ async fn reset_account(State(app): State<Arc<App>>, Path(id): Path<String>) -> R
     ok()
 }
 
+const RESETS_OFF: &str = "Banked resets are turned off. Turn them on under Config, Connections.";
+
 async fn banked_resets(State(app): State<Arc<App>>, Path(id): Path<String>) -> Response {
+    if !app.cfg().banked_resets {
+        return err(StatusCode::NOT_FOUND, RESETS_OFF);
+    }
     let Some(acct) = app.pool.get(&id) else { return err(StatusCode::NOT_FOUND, "unknown account") };
     match crate::banked_resets::refresh(&app, &acct).await {
         Ok(view) => Json(view).into_response(),
@@ -476,6 +482,9 @@ async fn apply_banked_reset(
     Path(id): Path<String>,
     Json(body): Json<crate::banked_resets::Action>,
 ) -> Response {
+    if !app.cfg().banked_resets {
+        return err(StatusCode::NOT_FOUND, RESETS_OFF);
+    }
     let Some(acct) = app.pool.get(&id) else { return err(StatusCode::NOT_FOUND, "unknown account") };
     match tokio::spawn(crate::banked_resets::apply(app, acct, body)).await {
         Ok(Ok(view)) => Json(view).into_response(),
@@ -502,6 +511,9 @@ async fn refresh_quota(State(app): State<Arc<App>>, Path(id): Path<String>) -> R
         return err(StatusCode::BAD_GATEWAY, "Could not refresh provider usage");
     }
     app.broadcast("accounts", Value::Null);
+    if !app.cfg().banked_resets {
+        return ok();
+    }
     match crate::banked_resets::refresh(&app, &acct).await {
         Ok(view) => Json(view).into_response(),
         Err(e) => err(StatusCode::BAD_GATEWAY, e.to_string()),

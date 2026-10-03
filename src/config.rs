@@ -33,6 +33,9 @@ pub struct Config {
     pub codex_websockets: bool,
     /// Rewrite non-Claude-Code requests on Claude OAuth accounts so they look like Claude Code.
     pub claude_cloak: bool,
+    /// Check Claude and ChatGPT subscriptions for banked rate-limit resets and allow
+    /// spending them from the dashboard. Off by default: it uses unofficial endpoints.
+    pub banked_resets: bool,
     pub debug: bool,
     /// Serve HTTPS with this certificate.
     #[serde(skip_serializing_if = "Tls::is_off")]
@@ -192,6 +195,7 @@ impl Default for Config {
             routing: Routing::LeastUsed,
             codex_websockets: true,
             claude_cloak: true,
+            banked_resets: false,
             debug: false,
             tls: Tls::default(),
             force_model_prefix: false,
@@ -227,6 +231,7 @@ request-retry: 3            # accounts to try before failing a request
 routing: least-used         # least-used (most quota left) | round-robin | fill-first
 codex-websockets: true      # native upstream websocket for Codex websocket clients
 claude-cloak: true          # make non-Claude-Code clients look like Claude Code on OAuth accounts
+banked-resets: false        # show and spend banked Claude/ChatGPT limit resets (unofficial endpoints)
 debug: false
 
 # API keys (optional). Accounts (Claude, Codex, Antigravity, Kimi, xAI, Meta, Devin, Vertex)

@@ -107,7 +107,7 @@ cliproxyapi-rust --config config.yaml check
 | `oauth-model-alias`, `oauth-excluded-models`, per-file `prefix` and `model_aliases` | Used as is |
 | Payload rules, plugins, Redis usage queue, weighted routing, session affinity, the `/v0/management` API | Not supported. The built-in dashboard replaces the separate management panel. |
 
-Changes made from the dashboard keep your file's layout, YAML comments, and settings this binary doesn't use, so you can switch back at any time.
+Changes made from the dashboard keep your file's layout, YAML comments, and settings this binary doesn't use, so you can switch back at any time. The rare layout that can't be edited in place, such as lists written without indentation, is rewritten instead, and the original is kept as `config.yaml.bak`.
 
 ## Connect your tools
 
@@ -234,17 +234,17 @@ Everything is served from the binary at `/`, with no external requests.
 
 Sharing a screenshot or your screen? The eye button in the top bar hides every email and API key on the page, and copy buttons still copy the real values.
 
+Choose **Used** or **Remaining** beside the quota meters on Overview or Accounts; your browser remembers it. Meters stay gray while there's room, turn amber with a quarter or less left and red at 5% or less, and a used-up window keeps a red outline until it resets.
+
+**Banked resets** (off by default). Claude and ChatGPT sometimes give subscribers saved resets that clear a usage limit early. Turn on `banked-resets` (Config, Connections) and subscriptions that have some show a badge beside the account name; click it to see expiry dates and spend one, always with a confirmation. It relies on unofficial provider endpoints, checks every 30 minutes, and keeps a crash-safe journal so a reset is never spent twice. See [banked resets](docs/banked-resets.md).
+
 <sub>Screenshots use sample data.</sub>
-
-Choose **Used** or **Remaining** beside the quota meters on Overview or Accounts. The preference is remembered in your browser and applies to both pages. Colors always reflect capacity remaining: green above 25%, amber above 5% through 25%, and red at 5% or less. Exhausted quotas keep a red outline and label even when the remaining bar is empty. Unreported or expired quotas show a dash; reset countdowns stay visible for current windows.
-
-Codex and Claude subscription accounts show a reset availability badge beside the account name; zero-count badges are hidden. Click it for expiry, eligibility, and manual redemption. In the modal, use **Refresh** after a reset made elsewhere, or **Use 1 reset** to review and manually redeem one. Interrupted requests keep a review badge and stay in a durable journal, blocking further spending until recovered or reconciled. See [banked reset controls and recovery](docs/banked-resets.md).
 
 ## Configuration
 
 `config.yaml` reloads automatically when it changes, and the dashboard edits the same file.
 
-The dashboard's Config page provides forms for server and access settings, routing, connections, provider keys, model rules, and diagnostics. Settings that need explanation have brief descriptions. Save changes applies the whole draft; Discard changes restores the last saved values. Keys stay masked until revealed, and leaving an existing key blank keeps it unchanged. If the file changes elsewhere, reload the latest settings before saving. Bind address, port, HTTPS, and debug logging changes require a restart; the page shows which changes are pending.
+The dashboard's Config page has forms for server and access settings, routing, connections, provider keys, model rules and diagnostics, plus a **YAML file** section for everything else. Keys stay masked until revealed, and leaving an existing key blank keeps it unchanged. If the file changes elsewhere while you edit, the page asks you to reload before saving. Bind address, port, HTTPS and debug logging changes need a restart; the page shows which are pending.
 
 ```yaml
 host: "127.0.0.1"             # 0.0.0.0 to expose it (set api-keys first)
@@ -257,6 +257,7 @@ request-retry: 3              # accounts to try before giving up
 routing: least-used           # most quota left first; or round-robin, fill-first
 codex-websockets: true        # native WebSocket relay to ChatGPT
 claude-cloak: true            # present non-Claude-Code clients as Claude Code on OAuth accounts
+banked-resets: false          # show and spend banked Claude/ChatGPT limit resets (unofficial endpoints)
 
 claude-api-key:
   - api-key: "sk-ant-..."

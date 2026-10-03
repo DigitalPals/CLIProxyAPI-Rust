@@ -23,7 +23,8 @@ fn fixture(provider: Provider, copies: usize) -> (Temp, Arc<App>, Arc<Account>) 
     for i in 0..copies {
         std::fs::write(temp.0.join(format!("account-{i}.json")), json!({"type":provider.as_str(),"account_id":"account-1", "access_token":"test-only", "expired":"2099-01-01T00:00:00Z"}).to_string()).unwrap();
     }
-    let cfg = crate::config::Config { auth_dir: temp.0.to_string_lossy().into(), ..Default::default() };
+    let cfg =
+        crate::config::Config { auth_dir: temp.0.to_string_lossy().into(), banked_resets: true, ..Default::default() };
     let app = App::new(cfg, temp.0.join("config.yaml"));
     let acct = app.pool.all()[0].clone();
     (temp, app, acct)
@@ -127,6 +128,48 @@ fn codex_manual_reset_uses_available_credits_and_checks_expiry() {
     details["available_count"] = json!(0);
     assert!(!provider::codex(&usage, &details, Utc::now()).unwrap().eligible);
 }
+#[tokio::test]
+async fn turned_off_resets_never_reach_the_provider() {
+    use axum::{Router, body::Body, http::Request, routing::any};
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    static HITS: AtomicUsize = AtomicUsize::new(0);
+    async fn backend(_: Request<Body>) -> axum::Json<Value> {
+        HITS.fetch_add(1, Ordering::SeqCst);
+        axum::Json(json!({}))
+    }
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let provider_origin = format!("http://{}", listener.local_addr().unwrap());
+    let provider_server = tokio::spawn(axum::serve(listener, Router::new().fallback(any(backend))).into_future());
+    let (temp, app, acct) = fixture(Provider::Claude, 1);
+    *app.reset_test_origin.lock() = Some(provider_origin);
+    let mut config = (*app.cfg()).clone();
+    config.management_key = "test-management-key".into();
+    config.banked_resets = false;
+    app.set_config(config);
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let origin = format!("http://{}", listener.local_addr().unwrap());
+    let router = crate::mgmt::router(app.clone()).with_state(app.clone());
+    let server = tokio::spawn(
+        axum::serve(listener, router.into_make_service_with_connect_info::<std::net::SocketAddr>()).into_future(),
+    );
+    let client = reqwest::Client::new();
+    let path = format!("{origin}/accounts/{}/banked-resets", acct.id);
+    let read = client.get(&path).bearer_auth("test-management-key").send().await.unwrap();
+    assert_eq!(read.status(), reqwest::StatusCode::NOT_FOUND);
+    let spend = client
+        .post(&path)
+        .bearer_auth("test-management-key")
+        .json(&json!({"action":"redeem","request_id":uuid::Uuid::new_v4().to_string(),"confirmed":true}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(spend.status(), reqwest::StatusCode::NOT_FOUND);
+    assert_eq!(HITS.load(Ordering::SeqCst), 0);
+    assert!(!temp.0.join(".banked-resets").exists());
+    server.abort();
+    provider_server.abort();
+}
+
 #[tokio::test]
 async fn codex_available_credit_returns_confirmation_quote_without_spending() {
     use axum::{Router, body::Body, http::Request, routing::any};

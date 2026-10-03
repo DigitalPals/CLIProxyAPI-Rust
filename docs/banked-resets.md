@@ -1,6 +1,18 @@
 # Banked subscription resets
 
-Overview and Accounts show a compact reset availability badge beside the account name for native Codex and Claude OAuth subscriptions. Zero-count badges are hidden; unresolved operations keep a review badge so recovery remains accessible. Click the badge to open a modal with grant expiry, scopes, and current eligibility. Purchased monetary credits are separate. Accounts without provider reset metadata show an unknown state rather than zero.
+## Turning it on
+
+Banked resets are off by default, because they rely on unofficial subscription endpoints. Turn them on with **Banked resets** under Config, Connections, or in `config.yaml`:
+
+```yaml
+banked-resets: true
+```
+
+While off, nothing contacts these endpoints and no journal is created. While on, each Claude and ChatGPT subscription is checked every 30 minutes, and again whenever you open its reset panel or press **Refresh**.
+
+## Using a reset
+
+Overview and Accounts show a compact badge beside the account name for native Codex and Claude OAuth subscriptions that have resets. Accounts with none, or whose reset status can't be read, show no badge; unresolved operations keep a review badge so recovery remains accessible. Click the badge to open a modal with grant expiry, scopes, and current eligibility. Purchased monetary credits are separate.
 
 In the modal, select **Refresh** to fetch current provider usage, including after a reset made outside this proxy. Select **Use 1 reset**, review the account and grant, and confirm. Claude defaults to the provider's recommended usable grant, then the earliest expiry; you can choose another usable grant. Codex selects its grant on the provider side. Applying a reset is always manual. API keys, custom endpoints, and disabled accounts cannot redeem.
 
@@ -12,9 +24,9 @@ The server rechecks identity, eligibility, and the confirmation before dispatch.
 
 A timeout, connection failure, or unknown provider response can mean that a reset was spent. The saved request blocks new spending for that subscription identity until resolved, including after a restart or from a duplicate credential file.
 
-For Claude, **Retry same request** manually reuses the saved request and grant IDs within ten minutes of the original submission. The proxy never retries a spending POST automatically or follows its redirects. A refusal on a retry leaves the original uncertain outcome unresolved. Codex has no documented retry guarantee in the upstream management implementation, so ambiguous Codex requests require reconciliation instead.
+For Claude, **Retry request** manually reuses the saved request and grant IDs within ten minutes of the original submission. The proxy never retries a spending POST automatically or follows its redirects. A refusal on a retry leaves the original uncertain outcome unresolved. Codex has no documented retry guarantee in the upstream management implementation, so ambiguous Codex requests require reconciliation instead.
 
-Use **Reconcile outcome** only after checking the provider account. **Verified: reset was used** or **Verified: no reset was used** records the operator's finding without sending another spending request. Refreshing inventory alone does not prove what an interrupted request did, and never releases this safeguard. Another account in the same Claude organization cannot retry or reconcile an operation belonging to a different account.
+Use **Check outcome** only after checking the provider account. **Reset was used** or **No reset was used** records the operator's finding without sending another spending request. Refreshing inventory alone does not prove what an interrupted request did, and never releases this safeguard. Another account in the same Claude organization cannot retry or reconcile an operation belonging to a different account.
 
 ## Storage and deployment
 
@@ -25,6 +37,8 @@ Keep this directory in auth-volume backups and through binary rollbacks. Do not 
 ## Management API
 
 All routes use the existing management authentication and remote-access policy.
+
+While the feature is off, the two `banked-resets` routes answer 404 and `quota/refresh` only refreshes usage.
 
 - `GET /api/accounts/{id}/banked-resets`: fetch inventory and current saved operation; returns a short-lived `quote` when redemption is available.
 - `POST /api/accounts/{id}/quota/refresh`: refresh authoritative usage and reset inventory without consuming a reset. Usage can refresh even if banked-reset metadata is unavailable.

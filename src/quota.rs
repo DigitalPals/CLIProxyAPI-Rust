@@ -18,6 +18,8 @@ const CODEX_USAGE: &str = "https://chatgpt.com/backend-api/wham/usage";
 /// Accounts without quota data count as half used.
 pub const UNKNOWN: f64 = 50.0;
 const POLL_EVERY: i64 = 5 * 60;
+/// Banked resets change rarely; opening the dashboard panel checks on demand.
+const RESET_POLL_EVERY: i64 = 30 * 60;
 
 #[derive(Debug, Clone, Serialize, PartialEq)]
 pub struct Window {
@@ -306,10 +308,13 @@ pub async fn poller(app: Arc<App>) {
             if !matches!(acct.provider, Provider::Claude | Provider::Codex) || !acct.is_oauth() {
                 continue;
             }
-            let reset_stale = {
+            let reset_stale = app.cfg().banked_resets && {
                 let st = acct.state.lock();
                 !st.disabled
-                    && st.banked_resets.as_ref().is_none_or(|v| (Utc::now() - v.checked_at).num_seconds() >= POLL_EVERY)
+                    && st
+                        .banked_resets
+                        .as_ref()
+                        .is_none_or(|v| (Utc::now() - v.checked_at).num_seconds() >= RESET_POLL_EVERY)
             };
             if reset_stale {
                 let _ = crate::banked_resets::refresh(&app, &acct).await;

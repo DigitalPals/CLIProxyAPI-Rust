@@ -462,7 +462,7 @@ fn validate(values: &Value, changes: &Map<String, Value>) -> Result<()> {
             "management-allow-remote" => {
                 ensure!(value.is_null() || value.is_boolean(), "Remote access must be enabled or disabled")
             }
-            "codex-websockets" | "claude-cloak" | "force-model-prefix" | "debug" => {
+            "codex-websockets" | "claude-cloak" | "banked-resets" | "force-model-prefix" | "debug" => {
                 ensure!(value.is_boolean(), "{field}: use a boolean")
             }
             _ => {}
