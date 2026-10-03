@@ -256,7 +256,7 @@ impl Fixture {
         for account in self.app.pool.all() {
             let mut state = account.state.lock();
             state.cooldowns.clear();
-            state.exhausted.clear();
+            state.quota_cooldowns.clear();
             state.quota = Default::default();
         }
     }

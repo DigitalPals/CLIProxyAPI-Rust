@@ -459,7 +459,6 @@ async fn reset_account(State(app): State<Arc<App>>, Path(id): Path<String>) -> R
     let mut st = acct.state.lock();
     st.cooldowns.clear();
     st.quota_cooldowns.clear();
-    st.exhausted.clear();
     st.strikes = 0;
     st.last_error = None;
     drop(st);

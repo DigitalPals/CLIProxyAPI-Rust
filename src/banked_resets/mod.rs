@@ -470,17 +470,3 @@ impl Drop for QuotaGuard {
         }
     }
 }
-
-/// Overload and token-rate cooldowns must survive a subscription quota reset.
-pub fn quota_error(acct: &Account, body: &str) -> bool {
-    if !matches!(acct.provider, Provider::Claude | Provider::Codex) {
-        return false;
-    }
-    let v: Value = serde_json::from_str(body).unwrap_or(Value::Null);
-    let error = if v["error"].is_object() { &v["error"] } else { &v["response"]["error"] };
-    [error["type"].as_str(), error["code"].as_str()]
-        .into_iter()
-        .flatten()
-        .any(|kind| matches!(kind, "usage_limit_reached" | "quota_exceeded"))
-        || (error["type"] == "rate_limit_error" && acct.state.lock().quota.exhausted_until("").is_some())
-}

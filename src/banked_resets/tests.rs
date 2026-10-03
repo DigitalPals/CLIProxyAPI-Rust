@@ -404,6 +404,25 @@ async fn applied_reset_survives_refresh_failure_and_preserves_other_cooldowns() 
     );
 }
 #[test]
+fn a_reset_clears_exhaustion_the_proxy_detected() {
+    let (_temp, app, acct) = fixture(Provider::Claude, 1);
+    let body =
+        r#"{"error":{"type":"rate_limit_error","code":"usage_limit_reached","message":"You've hit your usage limit"}}"#;
+    assert!(crate::proxy::quota_exhausted(&acct, "claude-sonnet-5-5", 429, body));
+    crate::proxy::mark_quota_exhausted(&acct, "claude-sonnet-5-5", &reqwest::header::HeaderMap::new(), body);
+    assert!(acct.exhausted_until("claude-sonnet-5-5").is_some());
+    assert!(acct.cooling_until("claude-sonnet-5-5").is_some());
+    // Applying a reset and reading fresh usage makes the account routable again.
+    let guard = QuotaGuard::new(&app, &acct, "account-1");
+    guard.invalidate(&["5h".into()]);
+    drop(guard);
+    let usage = json!({"five_hour":{"utilization":0,"resets_at":"2099-01-01T00:00:00Z"},"seven_day":{"utilization":10,"resets_at":"2099-01-01T00:00:00Z"}});
+    reconcile(&app, &acct, "account-1", &usage);
+    assert!(acct.exhausted_until("claude-sonnet-5-5").is_none());
+    assert!(acct.cooling_until("claude-sonnet-5-5").is_none());
+}
+
+#[test]
 fn authoritative_refresh_recovers_routing_and_retains_overload() {
     let (_temp, app, acct) = fixture(Provider::Claude, 1);
     crate::quota::usage(&mut acct.state.lock(), Provider::Claude, &claude_usage());
@@ -413,8 +432,9 @@ fn authoritative_refresh_recovers_routing_and_retains_overload() {
     reconcile(&app, &acct, "account-1", &usage);
     assert!(acct.cooling_until("claude-sonnet-5-5").is_none());
     assert!(acct.cooling_until("claude-opus-5-5").is_some());
-    assert!(!quota_error(&acct, r#"{"error":{"type":"overloaded_error"}}"#));
-    assert!(quota_error(&acct, r#"{"type":"response.failed","response":{"error":{"code":"usage_limit_reached"}}}"#));
+    let quota_error = |body: &str| crate::proxy::quota_exhausted(&acct, "claude-opus-5-5", 429, body);
+    assert!(!quota_error(r#"{"error":{"type":"overloaded_error"}}"#));
+    assert!(quota_error(r#"{"type":"response.failed","response":{"error":{"code":"usage_limit_reached"}}}"#));
 }
 
 #[tokio::test]

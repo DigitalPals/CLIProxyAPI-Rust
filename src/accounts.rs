@@ -296,12 +296,12 @@ pub struct AccountState {
     pub disabled: bool,
     /// Cooldowns keyed by model ("*" = whole account).
     pub cooldowns: HashMap<String, DateTime<Utc>>,
+    /// Confirmed subscription exhaustion, distinct from temporary rate limits. A
+    /// banked reset or a fresh usage poll clears it; sessions move off it.
     pub quota_cooldowns: HashMap<String, DateTime<Utc>>,
     pub quota_epoch: u64,
     pub quota_refreshing: bool,
     pub banked_resets: Option<crate::banked_resets::View>,
-    /// Confirmed subscription exhaustion, distinct from temporary rate limits.
-    pub exhausted: HashMap<String, DateTime<Utc>>,
     pub strikes: u32,
     pub last_error: Option<String>,
     pub last_used: Option<DateTime<Utc>>,
@@ -477,8 +477,6 @@ impl Account {
             st.cooldowns.get(model),
             st.quota_cooldowns.get("*"),
             st.quota_cooldowns.get(model),
-            st.exhausted.get("*"),
-            st.exhausted.get(model),
             spent.as_ref(),
         ]
         .into_iter()
@@ -494,7 +492,7 @@ impl Account {
             .quota
             .exhausted_until(model)
             .or_else(|| st.quota.exhausted(model).then(|| Utc::now() + chrono::Duration::minutes(5)));
-        [st.exhausted.get("*"), st.exhausted.get(model), spent.as_ref()]
+        [st.quota_cooldowns.get("*"), st.quota_cooldowns.get(model), spent.as_ref()]
             .into_iter()
             .flatten()
             .filter(|t| **t > Utc::now())
@@ -502,9 +500,10 @@ impl Account {
             .copied()
     }
 
+    /// Records confirmed quota exhaustion, unless a banked reset is being applied.
     pub fn exhaust(&self, model: &str, until: DateTime<Utc>, reason: &str) {
-        self.state.lock().exhausted.insert(model.to_string(), until);
-        self.cool(Some(model), until, reason);
+        let epoch = self.quota_epoch();
+        self.cool_quota(model, until, reason, epoch);
     }
 
     pub fn cool(&self, model: Option<&str>, until: DateTime<Utc>, reason: &str) {
@@ -948,7 +947,7 @@ impl Pool {
                     let st = p.state.lock();
                     AccountState {
                         cooldowns: st.cooldowns.clone(),
-                        exhausted: st.exhausted.clone(),
+                        quota_cooldowns: st.quota_cooldowns.clone(),
                         strikes: st.strikes,
                         last_error: st.last_error.clone(),
                         last_used: st.last_used,

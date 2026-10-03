@@ -306,6 +306,7 @@ pub fn quota_exhausted(acct: &Account, model: &str, status: u16, body: &str) -> 
     let b = body.to_ascii_lowercase();
     [
         "quota_exhausted",
+        "quota_exceeded",
         "insufficient_quota",
         "usage_limit_reached",
         "usage limit reached",
@@ -761,12 +762,9 @@ async fn execute_inner(app: Arc<App>, call: Call) -> Reply {
             }
             match status {
                 429 => {
+                    // Quota exhaustion was handled above; this is a rate limit.
                     let until = reset_after(&headers, &text).unwrap_or_else(|| backoff(&acct));
-                    if crate::banked_resets::quota_error(&acct, &text) {
-                        acct.cool_quota(&model, until, &format!("429: {msg}"), quota_epoch);
-                    } else {
-                        acct.cool(Some(&model), until, &format!("429: {msg}"));
-                    }
+                    acct.cool(Some(&model), until, &format!("429: {msg}"));
                     app.broadcast("accounts", Value::Null);
                 }
                 401 | 403 if acct.is_oauth() && !refreshed.contains(&acct.id) && !forbidden_for_good(&text) => {

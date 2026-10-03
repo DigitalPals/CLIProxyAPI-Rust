@@ -396,6 +396,10 @@ async fn native_turn(
                 sess.upstream_responses.clear();
                 tracker.cancel();
                 return Native::Fallback;
+            } else if status == 429 {
+                // A plain rate limit: step aside briefly. Sessions detour meanwhile.
+                acct.cool(Some(&model), chrono::Utc::now() + chrono::Duration::seconds(60), &format!("429: {msg}"));
+                app.broadcast("accounts", Value::Null);
             } else if matches!(status, 401 | 403) {
                 // An error after response.created also invalidates this socket.
                 // Refresh the same subscription before the client's next turn.

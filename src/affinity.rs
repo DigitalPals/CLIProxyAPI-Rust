@@ -539,7 +539,7 @@ mod tests {
             a.exhaust("gpt-6.1-sol", Utc::now() + Duration::minutes(5), "quota exhausted");
             let b = pick();
             assert_ne!(a.id, b.id);
-            a.state.lock().exhausted.clear();
+            a.state.lock().quota_cooldowns.clear();
             a.state.lock().cooldowns.clear();
             assert_eq!(pick().id, b.id);
         }
