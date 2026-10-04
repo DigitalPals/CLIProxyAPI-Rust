@@ -820,24 +820,22 @@ async fn native_websocket_busy_idle_upstream_does_not_starve_next_turn() {
 }
 
 #[tokio::test]
-async fn native_websocket_dropped_connection_reports_transport_failure_without_http_replay() {
+async fn native_websocket_failed_send_is_served_once_over_http() {
     let fixture = Fixture::new(Routing::RoundRobin, true).await;
     *fixture.mock.ws_mode.lock() = WsMode::DropOnHandshake;
     let mut socket = fixture.socket("dropped-upstream").await;
-    // The OS can report this disconnect during send or read, depending on TCP buffering.
-    let body = json!({"type":"response.create", "model":"gpt-6.1-sol", "input":"x".repeat(16 * 1024 * 1024)});
-    socket.send(tungstenite::Message::Text(body.to_string().into())).await.unwrap();
-    let failure = ws_event(&mut socket).await;
-    assert_eq!(failure["type"], "error", "failed submissions must not automatically replay");
-    assert_eq!(failure["status"], 502);
-    assert_eq!(failure["error"]["type"], "upstream_error");
-    assert!(failure["error"]["message"].as_str().unwrap().starts_with("codex websocket "));
-    assert!(fixture.mock.calls.lock().is_empty(), "the request must not reach HTTP fallback");
-    let logs = fixture.logs(1).await;
-    assert_eq!(logs[0].status, 502);
-    assert_eq!(logs[0].attempts, 1);
-    assert_eq!(logs[0].error.as_deref(), failure["error"]["message"].as_str());
+    // Too large for the socket buffers, so the dropped connection fails the send itself.
+    // Upstream never received a complete message, so HTTP serves the turn exactly once.
+    turn(&mut socket, json!({"model":"gpt-6.1-sol", "input":"x".repeat(16 * 1024 * 1024)})).await;
     assert_eq!(fixture.mock.ws_connections.load(Ordering::Relaxed), 1);
+    {
+        let calls = fixture.mock.calls.lock();
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].2, "http");
+    }
+    let logs = fixture.logs(1).await;
+    assert_eq!(logs[0].status, 200);
+    assert_eq!(logs[0].transport, "ws");
 }
 
 #[tokio::test]

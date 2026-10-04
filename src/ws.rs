@@ -27,6 +27,9 @@ type Upstream = tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsSt
 type ClientTx = futures::stream::SplitSink<WebSocket, Message>;
 
 const UPSTREAM_WRITE_TIMEOUT: Duration = Duration::from_secs(10);
+/// A turn upload also gets time for a slow (about 256 kbit/s) uplink, so a long
+/// conversation isn't cut off while it is still moving.
+const SLOW_UPLINK_BYTES_PER_SEC: usize = 32 * 1024;
 const MAX_IDLE_DRAIN: usize = 32;
 
 struct UpstreamFailure {
@@ -72,7 +75,19 @@ async fn upstream_write(
     operation: &'static str,
     write: impl Future<Output = Result<(), tungstenite::Error>>,
 ) -> Result<(), UpstreamFailure> {
-    tokio::time::timeout(UPSTREAM_WRITE_TIMEOUT, write)
+    upstream_write_within(UPSTREAM_WRITE_TIMEOUT, operation, write).await
+}
+
+fn send_deadline(len: usize) -> Duration {
+    UPSTREAM_WRITE_TIMEOUT + Duration::from_secs((len / SLOW_UPLINK_BYTES_PER_SEC) as u64)
+}
+
+async fn upstream_write_within(
+    deadline: Duration,
+    operation: &'static str,
+    write: impl Future<Output = Result<(), tungstenite::Error>>,
+) -> Result<(), UpstreamFailure> {
+    tokio::time::timeout(deadline, write)
         .await
         .map_err(|_| UpstreamFailure::timeout(operation))?
         .map_err(|error| UpstreamFailure::socket(operation, &error))
@@ -459,8 +474,8 @@ async fn native_turn(
                 sess.upstream = Some((acct, ws));
             }
             Err(e) => {
-                tracing::warn!(connection_id = sess.connection_id, phase = "handshake", error = %e,
-                    "codex websocket unavailable, using HTTP");
+                tracing::warn!(connection_id = sess.connection_id, phase = "handshake", account = %acct.label,
+                    error = %e, "codex websocket unavailable, using HTTP");
                 return Native::Fallback;
             }
         }
@@ -491,14 +506,18 @@ async fn native_turn(
     let mut tracker = Tracker::new(app, Format::Responses, true, "ws", &model);
     tracker.session(sess.key.as_deref(), sess.source, &cfg);
     tracker.selected(&selected);
-    if let Err(failure) = upstream_write("send", up.send(tungstenite::Message::Text(payload.to_string().into()))).await
+    let payload = payload.to_string();
+    let deadline = send_deadline(payload.len());
+    if let Err(failure) =
+        upstream_write_within(deadline, "send", up.send(tungstenite::Message::Text(payload.into()))).await
     {
-        failure.log(&sess.connection_id, "turn");
+        tracing::warn!(connection_id = sess.connection_id, phase = "turn", account = %acct.label,
+            error = %failure.message, "codex websocket send failed, using HTTP");
+        // A send only fails or times out with part of the message still unwritten, and the
+        // socket is dropped here, so upstream never received the request: HTTP runs it once.
         sess.discard_upstream();
-        tracker.finish(failure.status, &Usage::default(), Some(failure.message.clone()));
-        // A failed write may have submitted part or all of the request. Do not replay it.
-        let body = json!({"error":{"message":failure.message, "type":"upstream_error"}});
-        return if send(tx, error_event(failure.status, &body)).await.is_ok() { Native::Done } else { Native::Gone };
+        tracker.cancel();
+        return Native::Fallback;
     }
 
     let mut parser = responses::Parser::default();
@@ -717,6 +736,13 @@ mod tests {
         assert_eq!(pong, tungstenite::Message::Pong(vec![b'p'].into()));
         let close = tokio::time::timeout(Duration::from_secs(1), peer.next()).await.unwrap().unwrap().unwrap();
         assert!(matches!(close, tungstenite::Message::Close(_)));
+    }
+
+    #[test]
+    fn turn_uploads_get_time_for_slow_uplinks() {
+        assert_eq!(send_deadline(1024), UPSTREAM_WRITE_TIMEOUT);
+        // A 6 MB turn at 300 KB/s takes about 20 s; the deadline covers a 256 kbit/s uplink.
+        assert_eq!(send_deadline(6 << 20), UPSTREAM_WRITE_TIMEOUT + Duration::from_secs(192));
     }
 
     #[tokio::test]
