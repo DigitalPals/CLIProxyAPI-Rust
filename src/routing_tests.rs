@@ -2,7 +2,7 @@
 
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU8, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering};
 
 use axum::Json;
 use axum::extract::{
@@ -25,6 +25,53 @@ struct Mock {
     mode: AtomicU8,
     sequence: AtomicU64,
     calls: Mutex<Vec<(String, Value, &'static str)>>,
+    ws_connections: AtomicU64,
+    ws_mode: Mutex<WsMode>,
+    ws_rich_output: AtomicBool,
+    ws_control: Mutex<Option<WsControl>>,
+}
+
+#[derive(Clone, Copy, Default)]
+enum WsMode {
+    #[default]
+    Normal,
+    Partial,
+    DropOnHandshake,
+}
+
+enum WsCommand {
+    Ping(Vec<u8>),
+    Data(Value),
+    Flood,
+    Close,
+    Drop,
+}
+
+#[derive(Debug, PartialEq)]
+enum WsObservation {
+    Pong(Vec<u8>),
+    Closed,
+    Dropped,
+    Flooding,
+}
+
+struct WsControl {
+    commands: tokio::sync::mpsc::UnboundedReceiver<WsCommand>,
+    observations: tokio::sync::mpsc::UnboundedSender<WsObservation>,
+}
+
+struct WsPeer {
+    commands: tokio::sync::mpsc::UnboundedSender<WsCommand>,
+    observations: tokio::sync::mpsc::UnboundedReceiver<WsObservation>,
+}
+
+impl WsPeer {
+    async fn observe(&mut self) -> WsObservation {
+        tokio::time::timeout(std::time::Duration::from_secs(3), self.observations.recv())
+            .await
+            .expect("proxy did not service the idle upstream websocket")
+            .expect("mock upstream disconnected before the expected observation")
+    }
 }
 
 fn account(headers: &HeaderMap) -> String {
@@ -51,6 +98,30 @@ fn events(response: &Value, omit_output: bool) -> Vec<Value> {
         json!({"type":"response.output_text.delta", "delta":response["output"][0]["content"][0]["text"], "output_index":0, "content_index":0}),
         json!({"type":"response.completed", "response":terminal}),
     ]
+}
+
+fn rich_events(response: &mut Value) -> Vec<Value> {
+    let message = response["output"][0].clone();
+    response["output"] = json!([
+        {"id":"reasoning_local", "type":"reasoning", "summary":[{"type":"summary_text", "text":"tool planning"}], "encrypted_content":"local-encrypted-reasoning"},
+        {"id":"tool_local", "type":"function_call", "call_id":"call_local", "name":"lookup", "arguments":"{\"query\":\"local\"}"},
+        message
+    ]);
+    let mut out = vec![json!({"type":"response.created", "response":{"id":response["id"], "model":response["model"]}})];
+    for (index, item) in response["output"].as_array().unwrap().iter().enumerate() {
+        out.push(json!({"type":"response.output_item.added", "output_index":index, "item":item}));
+        if item["type"] == "reasoning" {
+            out.push(
+                json!({"type":"response.reasoning_summary_text.delta", "output_index":index, "delta":"tool planning"}),
+            );
+        }
+        out.push(json!({"type":"response.output_item.done", "output_index":index, "item":item}));
+    }
+    let mut terminal = response.clone();
+    // The proxy must rebuild the history from the streamed tool and reasoning items.
+    terminal["output"] = json!([]);
+    out.push(json!({"type":"response.completed", "response":terminal}));
+    out
 }
 
 async fn mock_http(State(mock): State<Arc<Mock>>, headers: HeaderMap, Json(body): Json<Value>) -> Response {
@@ -110,25 +181,113 @@ async fn mock_chat(State(mock): State<Arc<Mock>>, headers: HeaderMap, Json(body)
 
 async fn mock_ws(State(mock): State<Arc<Mock>>, headers: HeaderMap, upgrade: WebSocketUpgrade) -> Response {
     let account = account(&headers);
-    upgrade.on_upgrade(move |mut socket| async move {
+    upgrade.on_upgrade(move |socket| async move {
+        mock.ws_connections.fetch_add(1, Ordering::Relaxed);
+        if matches!(*mock.ws_mode.lock(), WsMode::DropOnHandshake) {
+            return;
+        }
+        let (mut tx, mut rx) = socket.split();
+        let mut control = mock.ws_control.lock().take();
         let mut known = std::collections::HashSet::<String>::new();
-        while let Some(Ok(Message::Text(text))) = socket.next().await {
+        let mut flooding = false;
+        let mut flood_announced = false;
+        loop {
+            let message = tokio::select! {
+                // The provider must still read and answer requests while sending idle frames.
+                biased;
+                message = rx.next() => message,
+                command = async {
+                    match &mut control {
+                        Some(control) => control.commands.recv().await,
+                        None => std::future::pending().await,
+                    }
+                } => {
+                    match command {
+                        Some(WsCommand::Ping(data)) => {
+                            if tx.send(Message::Ping(data.into())).await.is_err() { return; }
+                        }
+                        Some(WsCommand::Data(value)) => {
+                            if tx.send(Message::Text(value.to_string().into())).await.is_err() { return; }
+                        }
+                        Some(WsCommand::Flood) => flooding = true,
+                        Some(WsCommand::Close) => {
+                            if tx.send(Message::Close(None)).await.is_err() { return; }
+                        }
+                        Some(WsCommand::Drop) => {
+                            drop(tx);
+                            drop(rx);
+                            let _ = control.as_ref().unwrap().observations.send(WsObservation::Dropped);
+                            return;
+                        }
+                        None => control = None,
+                    }
+                    continue;
+                }
+                result = async {
+                    for _ in 0..64 {
+                        tx.feed(Message::Pong(vec![0; 16].into())).await?;
+                    }
+                    tx.flush().await
+                }, if flooding => {
+                    if result.is_err() { return; }
+                    if !flood_announced {
+                        let _ = control.as_ref().unwrap().observations.send(WsObservation::Flooding);
+                        flood_announced = true;
+                    }
+                    continue;
+                }
+            };
+            let text = match message {
+                Some(Ok(Message::Text(text))) => text,
+                Some(Ok(Message::Pong(data))) => {
+                    if let Some(control) = &control {
+                        let _ = control.observations.send(WsObservation::Pong(data.to_vec()));
+                    }
+                    continue;
+                }
+                Some(Ok(Message::Close(_))) => {
+                    let _ = tx.flush().await;
+                    if let Some(control) = &control {
+                        let _ = control.observations.send(WsObservation::Closed);
+                    }
+                    return;
+                }
+                Some(Ok(_)) => continue,
+                _ => {
+                    if let Some(control) = &control {
+                        let _ = control.observations.send(WsObservation::Dropped);
+                    }
+                    return;
+                }
+            };
             let body: Value = serde_json::from_str(&text).unwrap();
             mock.calls.lock().push((account.clone(), body.clone(), "ws"));
             if account == "a" && mock.mode.load(Ordering::Relaxed) == 1 {
                 let error = json!({"type":"error", "status":429, "error":{"code":"usage_limit_reached", "message":"mock error", "resets_in_seconds":3600}});
-                if socket.send(Message::Text(error.to_string().into())).await.is_err() { break; }
+                if tx.send(Message::Text(error.to_string().into())).await.is_err() { break; }
                 continue;
             }
             if let Some(prev) = body["previous_response_id"].as_str() && !known.contains(prev) {
                 let error = json!({"type":"error", "status":400, "error":{"code":"previous_response_not_found", "message":"unknown on this socket"}});
-                if socket.send(Message::Text(error.to_string().into())).await.is_err() { break; }
+                if tx.send(Message::Text(error.to_string().into())).await.is_err() { break; }
                 continue;
             }
-            let response = completed(&mock, &account, &body);
+            let mut response = completed(&mock, &account, &body);
             known.insert(response["id"].as_str().unwrap().to_string());
-            for event in events(&response, true) {
-                if socket.send(Message::Text(event.to_string().into())).await.is_err() { return; }
+            let mut output = if mock.ws_rich_output.load(Ordering::Relaxed) {
+                rich_events(&mut response)
+            } else {
+                events(&response, true)
+            };
+            let partial = matches!(*mock.ws_mode.lock(), WsMode::Partial);
+            if partial {
+                output.truncate(2);
+            }
+            for event in output {
+                if tx.send(Message::Text(event.to_string().into())).await.is_err() { return; }
+            }
+            if partial {
+                return;
             }
         }
     }).into_response()
@@ -164,6 +323,13 @@ struct Fixture {
 }
 
 impl Fixture {
+    fn control_ws(&self) -> WsPeer {
+        let (commands, command_rx) = tokio::sync::mpsc::unbounded_channel();
+        let (observation_tx, observations) = tokio::sync::mpsc::unbounded_channel();
+        *self.mock.ws_control.lock() = Some(WsControl { commands: command_rx, observations: observation_tx });
+        WsPeer { commands, observations }
+    }
+
     async fn new(routing: Routing, native: bool) -> Self {
         let mock = Arc::new(Mock::default());
         let provider = serve(
@@ -172,6 +338,7 @@ impl Fixture {
                 .route("/v1/responses/compact", post(mock_http))
                 .route("/v1/messages", post(mock_http))
                 .route("/v1/chat/completions", post(mock_chat))
+                .layer(axum::extract::DefaultBodyLimit::disable())
                 .with_state(mock.clone()),
         )
         .await;
@@ -284,16 +451,38 @@ async fn turn(
     body["type"] = "response.create".into();
     socket.send(tungstenite::Message::Text(body.to_string().into())).await.unwrap();
     loop {
-        let frame =
-            tokio::time::timeout(std::time::Duration::from_secs(10), socket.next()).await.unwrap().unwrap().unwrap();
-        if let tungstenite::Message::Text(text) = frame {
-            let event: Value = serde_json::from_str(&text).unwrap();
-            assert_ne!(event["type"], "error", "{event}");
-            if event["type"] == "response.completed" {
-                return event["response"].clone();
-            }
+        let event = ws_event(socket).await;
+        assert_ne!(event["type"], "error", "{event}");
+        if event["type"] == "response.completed" {
+            return event["response"].clone();
         }
     }
+}
+
+async fn ws_event(
+    socket: &mut tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>,
+) -> Value {
+    loop {
+        let frame = tokio::time::timeout(std::time::Duration::from_secs(10), socket.next())
+            .await
+            .expect("proxy did not finish the websocket turn")
+            .unwrap()
+            .unwrap();
+        match frame {
+            tungstenite::Message::Text(text) => return serde_json::from_str(&text).unwrap(),
+            tungstenite::Message::Close(_) => panic!("proxy closed the client websocket before completing the turn"),
+            _ => {}
+        }
+    }
+}
+
+async fn client_ping(
+    socket: &mut tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>,
+) {
+    let data = b"idle-client-barrier".to_vec();
+    socket.send(tungstenite::Message::Ping(data.clone().into())).await.unwrap();
+    let reply = tokio::time::timeout(std::time::Duration::from_secs(3), socket.next()).await.unwrap().unwrap().unwrap();
+    assert_eq!(reply, tungstenite::Message::Pong(data.into()));
 }
 
 #[tokio::test]
@@ -443,6 +632,212 @@ async fn websocket_fallback_and_reconnect_share_http_assignments_and_history() {
         assert_eq!(log.transport, "ws");
         assert_eq!(log.routing_reason, Some("session_reused"));
     }
+}
+
+#[tokio::test]
+async fn native_websocket_idle_ping_is_answered_before_next_turn_and_reuses_connection() {
+    let fixture = Fixture::new(Routing::RoundRobin, true).await;
+    let mut peer = fixture.control_ws();
+    let mut socket = fixture.socket("idle-ping").await;
+    let first = turn(&mut socket, prompt()).await;
+    client_ping(&mut socket).await;
+    let ping = b"idle-upstream-ping".to_vec();
+    peer.commands.send(WsCommand::Ping(ping.clone())).unwrap();
+    assert_eq!(peer.observe().await, WsObservation::Pong(ping));
+    // No new request has been sent while the provider waits for its Pong.
+    assert_eq!(fixture.mock.calls.lock().len(), 1);
+    turn(&mut socket, json!({"model":"gpt-6.1-sol", "previous_response_id":first["id"], "input":"next"})).await;
+    assert_eq!(fixture.mock.ws_connections.load(Ordering::Relaxed), 1);
+    let calls = fixture.mock.calls.lock();
+    assert_eq!(calls.len(), 2);
+    assert!(calls.iter().all(|(account, _, transport)| account == "a" && *transport == "ws"));
+    assert_eq!(calls[1].1["previous_response_id"], first["id"]);
+    assert_eq!(calls[1].1["input"].as_array().unwrap().len(), 1);
+}
+
+#[tokio::test]
+async fn native_websocket_idle_disconnects_reconnect_and_replay_tool_and_reasoning_history() {
+    for command in [WsCommand::Close, WsCommand::Drop] {
+        let fixture = Fixture::new(Routing::RoundRobin, true).await;
+        fixture.mock.ws_rich_output.store(true, Ordering::Relaxed);
+        let mut peer = fixture.control_ws();
+        let mut socket = fixture.socket("idle-disconnect").await;
+        let first = turn(&mut socket, prompt()).await;
+        client_ping(&mut socket).await;
+        let expected = if matches!(command, WsCommand::Close) { WsObservation::Closed } else { WsObservation::Dropped };
+        peer.commands.send(command).unwrap();
+        assert_eq!(peer.observe().await, expected);
+        // Exercise the client side while the proxy services the dropped upstream.
+        client_ping(&mut socket).await;
+        let input = json!([
+            {"type":"function_call_output", "call_id":"call_local", "output":"tool result"},
+            {"type":"message", "role":"user", "content":[{"type":"input_text", "text":"continue"}]}
+        ]);
+        turn(&mut socket, json!({"model":"gpt-6.1-sol", "previous_response_id":first["id"], "input":input})).await;
+        assert_eq!(fixture.mock.ws_connections.load(Ordering::Relaxed), 2);
+        let calls = fixture.mock.calls.lock();
+        assert_eq!(calls.len(), 2, "the turn must not be retried through HTTP");
+        assert!(calls.iter().all(|(account, _, transport)| account == "a" && *transport == "ws"));
+        let replay = &calls[1].1;
+        assert!(replay["previous_response_id"].is_null());
+        let items = replay["input"].as_array().unwrap();
+        assert_eq!(items.len(), 6, "{items:?}");
+        assert_eq!(items[0]["content"][0]["text"], "question");
+        let reasoning = items.iter().find(|item| item["type"] == "reasoning").unwrap();
+        assert_eq!(reasoning["encrypted_content"], "local-encrypted-reasoning");
+        assert_eq!(reasoning["summary"][0]["text"], "tool planning");
+        let tool = items.iter().find(|item| item["type"] == "function_call").unwrap();
+        assert_eq!(tool["call_id"], "call_local");
+        assert_eq!(tool["name"], "lookup");
+        assert_eq!(tool["arguments"], "{\"query\":\"local\"}");
+        assert!(items.iter().any(|item| item["role"] == "assistant" && item["content"][0]["text"] == "a"));
+        assert_eq!(&items[4..], input.as_array().unwrap());
+        assert!(items.iter().all(|item| item["id"].is_null()));
+    }
+}
+
+#[tokio::test]
+async fn native_websocket_partial_stream_failure_is_reported_without_replay() {
+    let fixture = Fixture::new(Routing::RoundRobin, true).await;
+    let mut socket = fixture.socket("partial-stream").await;
+    let first = turn(&mut socket, prompt()).await;
+    *fixture.mock.ws_mode.lock() = WsMode::Partial;
+    let body = json!({"type":"response.create", "model":"gpt-6.1-sol", "previous_response_id":first["id"], "input":"failed turn"});
+    socket.send(tungstenite::Message::Text(body.to_string().into())).await.unwrap();
+    assert_eq!(ws_event(&mut socket).await["type"], "response.created");
+    let delta = ws_event(&mut socket).await;
+    assert_eq!(delta["type"], "response.output_text.delta");
+    assert_eq!(delta["delta"], "a");
+    let failure = ws_event(&mut socket).await;
+    assert_eq!(failure["type"], "error");
+    assert_eq!(failure["status"], 502);
+    assert_eq!(failure["error"]["type"], "upstream_error");
+    assert_eq!(fixture.mock.calls.lock().len(), 2);
+    assert_eq!(fixture.mock.ws_connections.load(Ordering::Relaxed), 1);
+    let logs = fixture.logs(2).await;
+    assert_eq!(logs[1].status, 502);
+    assert!(logs[1].error.as_ref().unwrap().contains("websocket"));
+    *fixture.mock.ws_mode.lock() = WsMode::Normal;
+    turn(&mut socket, json!({"model":"gpt-6.1-sol", "previous_response_id":first["id"], "input":"retry explicitly"}))
+        .await;
+    assert_eq!(fixture.mock.ws_connections.load(Ordering::Relaxed), 2);
+    let calls = fixture.mock.calls.lock();
+    assert_eq!(calls.len(), 3);
+    assert!(calls.iter().all(|(_, _, transport)| *transport == "ws"));
+    assert!(calls[2].1["previous_response_id"].is_null());
+    assert_eq!(calls[2].1["input"].as_array().unwrap().len(), 3);
+    assert!(!calls[2].1["input"].to_string().contains("failed turn"));
+}
+
+#[tokio::test]
+async fn native_websocket_idle_quota_events_update_routing_without_overwriting_newer_quota() {
+    for newer_epoch in [false, true] {
+        let fixture = Fixture::new(Routing::RoundRobin, true).await;
+        let mut peer = fixture.control_ws();
+        let mut socket = fixture.socket("idle-quota").await;
+        let first = turn(&mut socket, prompt()).await;
+        let log = fixture.logs(1).await.pop().unwrap();
+        let account = fixture.app.pool.all().into_iter().find(|a| a.id == log.routing_attempts[0].account_id).unwrap();
+        if newer_epoch {
+            account.state.lock().quota_epoch += 1;
+        }
+        peer.commands.send(WsCommand::Data(json!({
+            "type":"codex.rate_limits", "rate_limits":{"primary":{"window_minutes":300, "used_percent":100.0, "reset_after_seconds":3600}}
+        }))).unwrap();
+        // A Pong proves the preceding rate-limit frame was serviced during idle.
+        peer.commands.send(WsCommand::Ping(b"quota-barrier".to_vec())).unwrap();
+        assert_eq!(peer.observe().await, WsObservation::Pong(b"quota-barrier".to_vec()));
+        {
+            let state = account.state.lock();
+            if newer_epoch {
+                assert!(state.quota.windows.is_empty());
+            } else {
+                assert_eq!(state.quota.windows[0].used, 100.0);
+            }
+        }
+        turn(&mut socket, json!({"model":"gpt-6.1-sol", "previous_response_id":first["id"], "input":"next"})).await;
+        let calls = fixture.mock.calls.lock();
+        assert_eq!(calls.len(), 2);
+        assert_eq!(calls[1].2, "ws");
+        if newer_epoch {
+            assert_eq!(calls[1].0, "a");
+            assert_eq!(calls[1].1["previous_response_id"], first["id"]);
+        } else {
+            assert_eq!(calls[1].0, "b");
+            assert!(calls[1].1["previous_response_id"].is_null());
+            assert_eq!(calls[1].1["input"].as_array().unwrap().len(), 3);
+        }
+    }
+}
+
+#[tokio::test]
+async fn native_websocket_unexpected_idle_frames_retire_connection_without_rewriting_history() {
+    for kind in ["error", "response.completed"] {
+        let fixture = Fixture::new(Routing::RoundRobin, true).await;
+        let mut peer = fixture.control_ws();
+        let mut socket = fixture.socket("idle-unexpected").await;
+        let first = turn(&mut socket, prompt()).await;
+        peer.commands.send(WsCommand::Data(json!({"type":kind, "response":{"id":"unexpected"}}))).unwrap();
+        assert_eq!(peer.observe().await, WsObservation::Dropped);
+        turn(&mut socket, json!({"model":"gpt-6.1-sol", "previous_response_id":first["id"], "input":"next"})).await;
+        assert_eq!(fixture.mock.ws_connections.load(Ordering::Relaxed), 2);
+        let calls = fixture.mock.calls.lock();
+        assert_eq!(calls.len(), 2);
+        assert!(calls.iter().all(|(_, _, transport)| *transport == "ws"));
+        assert!(calls[1].1["previous_response_id"].is_null());
+        assert_eq!(calls[1].1["input"].as_array().unwrap().len(), 3);
+        assert_eq!(calls[1].1["input"][0]["content"][0]["text"], "question");
+    }
+}
+
+#[tokio::test]
+async fn native_websocket_busy_idle_upstream_does_not_starve_next_turn() {
+    let fixture = Fixture::new(Routing::RoundRobin, true).await;
+    let mut peer = fixture.control_ws();
+    let mut socket = fixture.socket("idle-flood").await;
+    let first = turn(&mut socket, prompt()).await;
+    peer.commands.send(WsCommand::Flood).unwrap();
+    assert_eq!(peer.observe().await, WsObservation::Flooding);
+    tokio::time::timeout(
+        std::time::Duration::from_secs(3),
+        turn(&mut socket, json!({"model":"gpt-6.1-sol", "previous_response_id":first["id"], "input":"next"})),
+    )
+    .await
+    .expect("continuous upstream frames starved a ready client turn");
+    let connections = fixture.mock.ws_connections.load(Ordering::Relaxed);
+    assert!(matches!(connections, 1 | 2));
+    let calls = fixture.mock.calls.lock();
+    assert_eq!(calls.len(), 2);
+    assert!(calls.iter().all(|(account, _, transport)| account == "a" && *transport == "ws"));
+    // TCP may leave fewer than the drain limit ready. Both healthy reuse and retirement are valid.
+    if connections == 1 {
+        assert_eq!(calls[1].1["previous_response_id"], first["id"]);
+        assert_eq!(calls[1].1["input"].as_array().unwrap().len(), 1);
+    } else {
+        assert!(calls[1].1["previous_response_id"].is_null());
+        assert_eq!(calls[1].1["input"].as_array().unwrap().len(), 3);
+    }
+}
+
+#[tokio::test]
+async fn native_websocket_dropped_connection_reports_transport_failure_without_http_replay() {
+    let fixture = Fixture::new(Routing::RoundRobin, true).await;
+    *fixture.mock.ws_mode.lock() = WsMode::DropOnHandshake;
+    let mut socket = fixture.socket("dropped-upstream").await;
+    // The OS can report this disconnect during send or read, depending on TCP buffering.
+    let body = json!({"type":"response.create", "model":"gpt-6.1-sol", "input":"x".repeat(16 * 1024 * 1024)});
+    socket.send(tungstenite::Message::Text(body.to_string().into())).await.unwrap();
+    let failure = ws_event(&mut socket).await;
+    assert_eq!(failure["type"], "error", "failed submissions must not automatically replay");
+    assert_eq!(failure["status"], 502);
+    assert_eq!(failure["error"]["type"], "upstream_error");
+    assert!(failure["error"]["message"].as_str().unwrap().starts_with("codex websocket "));
+    assert!(fixture.mock.calls.lock().is_empty(), "the request must not reach HTTP fallback");
+    let logs = fixture.logs(1).await;
+    assert_eq!(logs[0].status, 502);
+    assert_eq!(logs[0].attempts, 1);
+    assert_eq!(logs[0].error.as_deref(), failure["error"]["message"].as_str());
+    assert_eq!(fixture.mock.ws_connections.load(Ordering::Relaxed), 1);
 }
 
 #[tokio::test]

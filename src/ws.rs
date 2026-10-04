@@ -6,11 +6,13 @@
 //! `previous_response_id` expanded from a small local history.
 
 use std::collections::HashSet;
+use std::future::Future;
 use std::sync::Arc;
+use std::time::Duration;
 
 use axum::extract::ws::{Message, WebSocket};
 use axum::http::HeaderMap;
-use futures::{SinkExt, StreamExt};
+use futures::{FutureExt, SinkExt, StreamExt};
 use serde_json::{Value, json};
 use tokio_tungstenite::tungstenite;
 
@@ -24,10 +26,70 @@ use crate::state::App;
 type Upstream = tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>;
 type ClientTx = futures::stream::SplitSink<WebSocket, Message>;
 
+const UPSTREAM_WRITE_TIMEOUT: Duration = Duration::from_secs(10);
+const MAX_IDLE_DRAIN: usize = 32;
+
+struct UpstreamFailure {
+    operation: &'static str,
+    status: u16,
+    message: String,
+}
+
+impl UpstreamFailure {
+    fn timeout(operation: &'static str) -> Self {
+        Self { operation, status: 504, message: format!("codex websocket {operation} timed out") }
+    }
+
+    fn socket(operation: &'static str, error: &tungstenite::Error) -> Self {
+        Self { operation, status: 502, message: format!("codex websocket {operation} failed: {}", socket_error(error)) }
+    }
+
+    fn log(&self, connection_id: &str, phase: &'static str) {
+        tracing::warn!(connection_id, phase, operation = self.operation, status = self.status, error = %self.message,
+            "codex upstream websocket failure");
+    }
+}
+
+// Some errors contain raw frames, HTTP bodies, or URLs. Keep transport diagnostics safe.
+fn socket_error(error: &tungstenite::Error) -> String {
+    match error {
+        tungstenite::Error::Io(error) => format!("I/O {:?}, OS error {:?}", error.kind(), error.raw_os_error()),
+        tungstenite::Error::Protocol(error) => format!("protocol error: {error}"),
+        tungstenite::Error::Http(response) => format!("handshake rejected: {}", response.status()),
+        tungstenite::Error::ConnectionClosed => "connection closed".into(),
+        tungstenite::Error::AlreadyClosed => "connection already closed".into(),
+        tungstenite::Error::Tls(_) => "TLS error".into(),
+        tungstenite::Error::Capacity(_) => "capacity exceeded".into(),
+        tungstenite::Error::WriteBufferFull(_) => "write buffer full".into(),
+        tungstenite::Error::Utf8(_) => "invalid UTF-8".into(),
+        tungstenite::Error::AttackAttempt => "attack attempt detected".into(),
+        tungstenite::Error::Url(_) => "invalid websocket URL".into(),
+        tungstenite::Error::HttpFormat(_) => "invalid HTTP format".into(),
+    }
+}
+
+async fn upstream_write(
+    operation: &'static str,
+    write: impl Future<Output = Result<(), tungstenite::Error>>,
+) -> Result<(), UpstreamFailure> {
+    tokio::time::timeout(UPSTREAM_WRITE_TIMEOUT, write)
+        .await
+        .map_err(|_| UpstreamFailure::timeout(operation))?
+        .map_err(|error| UpstreamFailure::socket(operation, &error))
+}
+
+async fn close_upstream(up: &mut Upstream, connection_id: &str, phase: &'static str) {
+    if let Err(failure) = upstream_write("close", up.close(None)).await {
+        failure.log(connection_id, phase);
+    }
+}
+
 struct Session {
     upstream: Option<(Arc<Account>, Upstream)>,
     /// Response ids known to the current upstream socket.
     upstream_responses: HashSet<String>,
+    /// Epoch of the last turn, so late quota events cannot undo a newer quota refresh.
+    upstream_quota_epoch: u64,
     key: Option<String>,
     source: Option<&'static str>,
     pending_selection: Option<crate::affinity::Selected>,
@@ -39,12 +101,97 @@ impl Default for Session {
         Self {
             upstream: None,
             upstream_responses: HashSet::new(),
+            upstream_quota_epoch: 0,
             key: None,
             source: None,
             pending_selection: None,
             connection_id: uuid::Uuid::new_v4().to_string(),
         }
     }
+}
+
+impl Session {
+    fn discard_upstream(&mut self) -> Option<(Arc<Account>, Upstream)> {
+        self.upstream_responses.clear();
+        self.upstream_quota_epoch = 0;
+        self.upstream.take()
+    }
+
+    async fn close_upstream(&mut self, phase: &'static str) {
+        if let Some((_, mut up)) = self.discard_upstream() {
+            close_upstream(&mut up, &self.connection_id, phase).await;
+        }
+    }
+}
+
+async fn idle_upstream(sess: &mut Session, event: Option<Result<tungstenite::Message, tungstenite::Error>>) {
+    match event {
+        Some(Ok(tungstenite::Message::Ping(_))) => {
+            // Tungstenite queues its automatic Pong until the next write/flush.
+            let (_, up) = sess.upstream.as_mut().unwrap();
+            if let Err(failure) = upstream_write("flush", up.flush()).await {
+                failure.log(&sess.connection_id, "idle");
+                sess.discard_upstream();
+            }
+        }
+        Some(Ok(tungstenite::Message::Close(frame))) => {
+            tracing::debug!(
+                connection_id = sess.connection_id,
+                phase = "idle",
+                close_code = frame.as_ref().map(|frame| u16::from(frame.code)),
+                "codex upstream websocket closed"
+            );
+            if let Some((_, mut up)) = sess.discard_upstream()
+                && let Err(failure) = upstream_write("flush", up.flush()).await
+            {
+                failure.log(&sess.connection_id, "idle_close");
+            }
+        }
+        Some(Err(error)) => {
+            UpstreamFailure::socket("read", &error).log(&sess.connection_id, "idle");
+            sess.discard_upstream();
+        }
+        None => {
+            tracing::debug!(connection_id = sess.connection_id, phase = "idle", "codex upstream websocket ended");
+            sess.discard_upstream();
+        }
+        Some(Ok(tungstenite::Message::Text(text))) => idle_data(sess, &text),
+        Some(Ok(tungstenite::Message::Binary(data))) => idle_data(sess, &String::from_utf8_lossy(&data)),
+        Some(Ok(_)) => {}
+    }
+}
+
+fn idle_data(sess: &mut Session, data: &str) {
+    if let Ok(value) = serde_json::from_str::<Value>(data)
+        && value["type"] == "codex.rate_limits"
+    {
+        if let Some((acct, _)) = &sess.upstream {
+            crate::quota::observe_codex_event(acct, &value, sess.upstream_quota_epoch);
+        }
+    } else {
+        tracing::warn!(
+            connection_id = sess.connection_id,
+            phase = "idle",
+            "unexpected codex upstream application frame between turns"
+        );
+        sess.discard_upstream();
+    }
+}
+
+async fn drain_idle_upstream(sess: &mut Session) {
+    for _ in 0..MAX_IDLE_DRAIN {
+        let Some((_, up)) = &mut sess.upstream else { return };
+        // The finite drain supplies its own budget; a cooperative yield is not an empty socket.
+        let Some(event) = tokio::task::unconstrained(up.next()).now_or_never() else { return };
+        idle_upstream(sess, event).await;
+    }
+    // A busy upstream must not prevent a ready client from submitting or closing.
+    tracing::warn!(
+        connection_id = sess.connection_id,
+        phase = "idle",
+        "codex upstream idle drain limit reached; reconnecting on the next turn"
+    );
+    sess.discard_upstream();
 }
 
 struct ClientGone;
@@ -69,7 +216,24 @@ fn input_items(body: &Value) -> Vec<Value> {
 pub async fn handle(app: Arc<App>, headers: HeaderMap, socket: WebSocket) {
     let (mut tx, mut rx) = socket.split();
     let mut sess = Session::default();
-    while let Some(msg) = rx.next().await {
+    loop {
+        let msg = tokio::select! {
+            // The client gets priority; queued upstream frames are drained before submission.
+            biased;
+            msg = rx.next() => {
+                let Some(msg) = msg else { break };
+                msg
+            }
+            upstream = async {
+                match &mut sess.upstream {
+                    Some((_, up)) => up.next().await,
+                    None => std::future::pending().await,
+                }
+            } => {
+                idle_upstream(&mut sess, upstream).await;
+                continue;
+            }
+        };
         let text = match msg {
             Ok(Message::Text(t)) => t.to_string(),
             Ok(Message::Binary(b)) => String::from_utf8_lossy(&b).into_owned(),
@@ -95,13 +259,12 @@ pub async fn handle(app: Arc<App>, headers: HeaderMap, socket: WebSocket) {
         if let Some(o) = body.as_object_mut() {
             o.remove("type");
         }
+        drain_idle_upstream(&mut sess).await;
         if turn(&app, &headers, &mut sess, body, &mut tx).await.is_err() {
             break;
         }
     }
-    if let Some((_, mut up)) = sess.upstream.take() {
-        let _ = up.close(None).await;
-    }
+    sess.close_upstream("client_closed").await;
 }
 
 async fn turn(
@@ -127,10 +290,7 @@ async fn turn(
         (crate::affinity::connection_key(headers, &sess.connection_id), "websocket_connection")
     };
     if sess.key.as_ref().is_some_and(|old| old != &key) {
-        if let Some((_, mut up)) = sess.upstream.take() {
-            let _ = up.close(None).await;
-        }
-        sess.upstream_responses.clear();
+        sess.close_upstream("session_changed").await;
     }
     sess.key = Some(key);
     sess.source = Some(source);
@@ -225,7 +385,7 @@ enum Native {
 async fn connect(acct: &Arc<Account>, client_headers: &HeaderMap) -> Result<Upstream, String> {
     let (url, headers) = crate::upstream::codex_ws_url(acct, client_headers);
     let mut req =
-        tungstenite::client::IntoClientRequest::into_client_request(url.as_str()).map_err(|e| e.to_string())?;
+        tungstenite::client::IntoClientRequest::into_client_request(url.as_str()).map_err(|e| socket_error(&e))?;
     for (k, v) in headers {
         if let (Ok(name), Ok(val)) =
             (tungstenite::http::HeaderName::from_bytes(k.as_bytes()), tungstenite::http::HeaderValue::from_str(&v))
@@ -233,13 +393,10 @@ async fn connect(acct: &Arc<Account>, client_headers: &HeaderMap) -> Result<Upst
             req.headers_mut().insert(name, val);
         }
     }
-    let (ws, _) = tokio::time::timeout(std::time::Duration::from_secs(20), tokio_tungstenite::connect_async(req))
+    let (ws, _) = tokio::time::timeout(Duration::from_secs(20), tokio_tungstenite::connect_async(req))
         .await
         .map_err(|_| "websocket handshake timed out".to_string())?
-        .map_err(|e| match e {
-            tungstenite::Error::Http(resp) => format!("websocket handshake rejected: {}", resp.status()),
-            other => other.to_string(),
-        })?;
+        .map_err(|e| socket_error(&e))?;
     Ok(ws)
 }
 
@@ -284,10 +441,7 @@ async fn native_turn(
     }
     let reuse = sess.upstream.as_ref().is_some_and(|(a, _)| a.id == acct.id);
     if !reuse {
-        if let Some((_, mut up)) = sess.upstream.take() {
-            let _ = up.close(None).await;
-        }
-        sess.upstream_responses.clear();
+        sess.close_upstream("account_changed").await;
         if crate::oauth::ensure_fresh(app, &acct, chrono::Duration::minutes(5), false).await.is_err() {
             return Native::Fallback;
         }
@@ -301,10 +455,12 @@ async fn native_turn(
         }
         match connect(&acct, &upstream_headers).await {
             Ok(ws) => {
+                sess.upstream_quota_epoch = acct.quota_epoch();
                 sess.upstream = Some((acct, ws));
             }
             Err(e) => {
-                tracing::warn!(account = %acct.label, "codex websocket unavailable, using HTTP: {e}");
+                tracing::warn!(connection_id = sess.connection_id, phase = "handshake", error = %e,
+                    "codex websocket unavailable, using HTTP");
                 return Native::Fallback;
             }
         }
@@ -331,12 +487,18 @@ async fn native_turn(
     payload["type"] = "response.create".into();
 
     let quota_epoch = acct.quota_epoch();
+    sess.upstream_quota_epoch = quota_epoch;
     let mut tracker = Tracker::new(app, Format::Responses, true, "ws", &model);
     tracker.session(sess.key.as_deref(), sess.source, &cfg);
     tracker.selected(&selected);
-    if up.send(tungstenite::Message::Text(payload.to_string().into())).await.is_err() {
-        tracker.cancel();
-        return Native::Fallback;
+    if let Err(failure) = upstream_write("send", up.send(tungstenite::Message::Text(payload.to_string().into()))).await
+    {
+        failure.log(&sess.connection_id, "turn");
+        sess.discard_upstream();
+        tracker.finish(failure.status, &Usage::default(), Some(failure.message.clone()));
+        // A failed write may have submitted part or all of the request. Do not replay it.
+        let body = json!({"error":{"message":failure.message, "type":"upstream_error"}});
+        return if send(tx, error_event(failure.status, &body)).await.is_ok() { Native::Done } else { Native::Gone };
     }
 
     let mut parser = responses::Parser::default();
@@ -347,21 +509,51 @@ async fn native_turn(
     let mut forwarded = false;
     let mut terminal = false;
     loop {
-        let next = tokio::time::timeout(std::time::Duration::from_secs(600), up.next()).await;
+        let next = tokio::time::timeout(Duration::from_secs(600), up.next()).await;
         let text = match next {
             Ok(Some(Ok(tungstenite::Message::Text(t)))) => t.to_string(),
             Ok(Some(Ok(tungstenite::Message::Binary(b)))) => String::from_utf8_lossy(&b).into_owned(),
-            Ok(Some(Ok(tungstenite::Message::Close(_)))) | Ok(None) => {
+            Ok(Some(Ok(tungstenite::Message::Close(frame)))) => {
+                tracing::warn!(
+                    connection_id = sess.connection_id,
+                    phase = "turn",
+                    close_code = frame.as_ref().map(|frame| u16::from(frame.code)),
+                    "codex upstream websocket closed during turn"
+                );
+                if let Err(failure) = upstream_write("flush", up.flush()).await {
+                    failure.log(&sess.connection_id, "turn_close");
+                }
                 error = Some((502, "codex websocket closed".into()));
                 break;
             }
+            Ok(None) => {
+                tracing::warn!(
+                    connection_id = sess.connection_id,
+                    phase = "turn",
+                    "codex upstream websocket ended during turn"
+                );
+                error = Some((502, "codex websocket closed".into()));
+                break;
+            }
+            Ok(Some(Ok(tungstenite::Message::Ping(_)))) => {
+                if let Err(failure) = upstream_write("flush", up.flush()).await {
+                    failure.log(&sess.connection_id, "turn");
+                    error = Some((failure.status, failure.message));
+                    break;
+                }
+                continue;
+            }
             Ok(Some(Ok(_))) => continue,
             Ok(Some(Err(e))) => {
-                error = Some((502, format!("codex websocket error: {e}")));
+                let failure = UpstreamFailure::socket("read", &e);
+                failure.log(&sess.connection_id, "turn");
+                error = Some((failure.status, failure.message));
                 break;
             }
             Err(_) => {
-                error = Some((504, "codex websocket idle timeout".into()));
+                let failure = UpstreamFailure::timeout("read");
+                failure.log(&sess.connection_id, "turn");
+                error = Some((failure.status, failure.message));
                 break;
             }
         };
@@ -385,15 +577,15 @@ async fn native_turn(
                 proxy::mark_quota_exhausted(&acct, &model, &reqwest::header::HeaderMap::new(), &text);
                 app.broadcast("accounts", Value::Null);
                 if !forwarded {
-                    let _ = up.close(None).await;
-                    sess.upstream_responses.clear();
+                    sess.discard_upstream();
+                    close_upstream(&mut up, &sess.connection_id, "quota_rejected").await;
                     tracker.finish(status, &usage, Some(msg));
                     return Native::Fallback;
                 }
             } else if !forwarded && matches!(status, 401 | 403) {
                 // HTTP fallback refreshes credentials on the same assigned account.
-                let _ = up.close(None).await;
-                sess.upstream_responses.clear();
+                sess.discard_upstream();
+                close_upstream(&mut up, &sess.connection_id, "auth_rejected").await;
                 tracker.cancel();
                 return Native::Fallback;
             } else if status == 429 {
@@ -418,6 +610,7 @@ async fn native_turn(
         terminal = matches!(kind.as_str(), "response.completed" | "response.incomplete" | "response.failed" | "error");
         forwarded = true;
         if send(tx, text).await.is_err() {
+            sess.discard_upstream();
             tracker.finish(499, &usage, Some("client disconnected".into()));
             return Native::Gone;
         }
@@ -427,7 +620,10 @@ async fn native_turn(
     }
     if terminal && !error.as_ref().is_some_and(|(status, _)| matches!(status, 401 | 403)) {
         sess.upstream = Some((acct.clone(), up));
-    } else if !terminal {
+    } else {
+        sess.discard_upstream();
+    }
+    if !terminal {
         // The upstream socket died mid-turn: tell the client and reconnect next turn.
         let (status, msg) = error.clone().unwrap_or((502, "codex websocket closed".into()));
         let body = json!({ "error": { "message": msg, "type": "upstream_error" } });
@@ -444,4 +640,134 @@ async fn native_turn(
         }
     }
     Native::Done
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tokio::io::{DuplexStream, duplex};
+    use tokio_tungstenite::WebSocketStream;
+    use tungstenite::protocol::Role;
+
+    async fn blocked_upstream() -> (WebSocketStream<DuplexStream>, DuplexStream) {
+        let (socket, peer) = duplex(1);
+        (WebSocketStream::from_raw_socket(socket, Role::Client, None).await, peer)
+    }
+
+    async fn buffered_upstream(buffer: Vec<u8>) -> (Session, WebSocketStream<tokio::net::TcpStream>) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let client = tokio::net::TcpStream::connect(listener.local_addr().unwrap()).await.unwrap();
+        let (server, _) = listener.accept().await.unwrap();
+        let peer = WebSocketStream::from_raw_socket(server, Role::Server, None).await;
+        let up = WebSocketStream::from_partially_read(
+            tokio_tungstenite::MaybeTlsStream::Plain(client),
+            buffer,
+            Role::Client,
+            None,
+        )
+        .await;
+        let pool = crate::accounts::Pool::default();
+        pool.reload(&crate::config::Config {
+            auth_dir: "/nonexistent".into(),
+            codex_api_key: vec![crate::config::KeyEntry { api_key: "local-mock".into(), ..Default::default() }],
+            ..Default::default()
+        });
+        let acct = pool.all().pop().unwrap();
+        let sess = Session {
+            upstream: Some((acct, up)),
+            upstream_responses: HashSet::from(["prior-response".into()]),
+            upstream_quota_epoch: 7,
+            key: Some("retained-session".into()),
+            ..Default::default()
+        };
+        (sess, peer)
+    }
+
+    #[tokio::test]
+    async fn ready_upstream_drain_stops_at_frame_budget() {
+        for frames in [MAX_IDLE_DRAIN - 1, MAX_IDLE_DRAIN, MAX_IDLE_DRAIN + 1] {
+            // Every Pong is already buffered, so TCP batching cannot change the ready-frame count.
+            let (mut sess, _peer) = buffered_upstream([0x8a, 0].repeat(frames)).await;
+            tokio::time::timeout(Duration::from_secs(1), drain_idle_upstream(&mut sess))
+                .await
+                .expect("a ready upstream drain must return within its frame budget");
+            if frames < MAX_IDLE_DRAIN {
+                assert!(sess.upstream.is_some());
+                assert!(sess.upstream_responses.contains("prior-response"));
+                assert_eq!(sess.upstream_quota_epoch, 7);
+            } else {
+                assert!(sess.upstream.is_none());
+                assert!(sess.upstream_responses.is_empty());
+                assert_eq!(sess.upstream_quota_epoch, 0);
+            }
+            assert_eq!(sess.key.as_deref(), Some("retained-session"));
+        }
+    }
+
+    #[tokio::test]
+    async fn ready_upstream_close_is_drained_before_submitting_next_turn() {
+        // Buffered server Ping and normal Close make readiness independent of network scheduling.
+        let (mut sess, mut peer) = buffered_upstream(vec![0x89, 1, b'p', 0x88, 2, 0x03, 0xe8]).await;
+        tokio::time::timeout(Duration::from_secs(1), drain_idle_upstream(&mut sess)).await.unwrap();
+        assert!(sess.upstream.is_none());
+        assert!(sess.upstream_responses.is_empty());
+        assert_eq!(sess.upstream_quota_epoch, 0);
+        assert_eq!(sess.key.as_deref(), Some("retained-session"));
+        let pong = tokio::time::timeout(Duration::from_secs(1), peer.next()).await.unwrap().unwrap().unwrap();
+        assert_eq!(pong, tungstenite::Message::Pong(vec![b'p'].into()));
+        let close = tokio::time::timeout(Duration::from_secs(1), peer.next()).await.unwrap().unwrap().unwrap();
+        assert!(matches!(close, tungstenite::Message::Close(_)));
+    }
+
+    #[tokio::test]
+    async fn upstream_send_flush_and_close_stop_at_write_deadline() {
+        let (mut sender, _sender_peer) = blocked_upstream().await;
+        let (mut flusher, _flusher_peer) = blocked_upstream().await;
+        let (mut closer, _closer_peer) = blocked_upstream().await;
+        // Feed queues a frame; the unread one-byte transport blocks its flush.
+        flusher.feed(tungstenite::Message::Text("queued request".into())).await.unwrap();
+        let started = tokio::time::Instant::now();
+        let failures = tokio::time::timeout(UPSTREAM_WRITE_TIMEOUT + Duration::from_secs(3), async {
+            futures::join!(
+                upstream_write("send", sender.send(tungstenite::Message::Text("submitted request".into()))),
+                upstream_write("flush", flusher.flush()),
+                upstream_write("close", closer.close(None)),
+            )
+        })
+        .await
+        .expect("blocked websocket writes outlived their deadline");
+        assert!(started.elapsed() >= UPSTREAM_WRITE_TIMEOUT);
+        for (operation, result) in [("send", failures.0), ("flush", failures.1), ("close", failures.2)] {
+            let failure = result.expect_err("an unread duplex transport must block");
+            assert_eq!(failure.status, 504);
+            assert_eq!(failure.operation, operation);
+            assert_eq!(failure.message, format!("codex websocket {operation} timed out"));
+        }
+    }
+
+    #[test]
+    fn upstream_failure_diagnostics_exclude_frames_credentials_bodies_and_urls() {
+        let secret = "private-prompt-token-account";
+        let errors = [
+            tungstenite::Error::WriteBufferFull(tungstenite::Message::Text(secret.into())),
+            tungstenite::Error::Utf8(secret.into()),
+            tungstenite::Error::Url(tungstenite::error::UrlError::UnableToConnect(secret.into())),
+            tungstenite::Error::Io(std::io::Error::other(secret)),
+            tungstenite::Error::Http(
+                tungstenite::http::Response::builder()
+                    .status(403)
+                    .header("authorization", secret)
+                    .body(Some(secret.as_bytes().to_vec()))
+                    .unwrap(),
+            ),
+        ];
+        for error in errors {
+            let failure = UpstreamFailure::socket("send", &error);
+            assert_eq!(failure.status, 502);
+            assert!(!failure.message.contains(secret));
+            assert!(failure.message.starts_with("codex websocket send failed:"));
+        }
+        let error = tungstenite::Error::Protocol(tungstenite::error::ProtocolError::ResetWithoutClosingHandshake);
+        assert!(UpstreamFailure::socket("read", &error).message.contains("Connection reset without closing handshake"));
+    }
 }
