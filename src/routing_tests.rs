@@ -935,21 +935,39 @@ async fn native_websocket_busy_idle_upstream_does_not_starve_next_turn() {
 }
 
 #[tokio::test]
-async fn native_websocket_failed_send_is_served_once_over_http() {
+async fn native_websocket_dropped_connection_never_runs_a_turn_twice() {
     let fixture = Fixture::new(Routing::RoundRobin, true).await;
     *fixture.mock.ws_mode.lock() = WsMode::DropOnHandshake;
     let mut socket = fixture.socket("dropped-upstream").await;
-    // Too large for the socket buffers, so the dropped connection fails the send itself.
-    // Upstream never received a complete message, so HTTP serves the turn exactly once.
-    turn(&mut socket, json!({"model":"gpt-6.1-sol", "input":"x".repeat(16 * 1024 * 1024)})).await;
+    // TCP buffering decides whether the drop fails the send (macOS and Linux, usually) or is
+    // only seen on the next read (Windows can buffer the whole message). A failed send never
+    // reached upstream, so HTTP serves the turn once; after a complete send the turn may have
+    // run, so it is reported and never replayed.
+    let body = json!({"type":"response.create", "model":"gpt-6.1-sol", "input":"x".repeat(16 * 1024 * 1024)});
+    socket.send(tungstenite::Message::Text(body.to_string().into())).await.unwrap();
+    let served = loop {
+        let event = ws_event(&mut socket).await;
+        if event["type"] == "error" {
+            assert_eq!(event["status"], 502, "{event}");
+            assert_eq!(event["error"]["type"], "upstream_error");
+            break false;
+        }
+        if event["type"] == "response.completed" {
+            break true;
+        }
+    };
     assert_eq!(fixture.mock.ws_connections.load(Ordering::Relaxed), 1);
     {
         let calls = fixture.mock.calls.lock();
-        assert_eq!(calls.len(), 1);
-        assert_eq!(calls[0].2, "http");
+        if served {
+            assert_eq!(calls.len(), 1);
+            assert_eq!(calls[0].2, "http");
+        } else {
+            assert!(calls.is_empty(), "a completed send must not be replayed over HTTP");
+        }
     }
     let logs = fixture.logs(1).await;
-    assert_eq!(logs[0].status, 200);
+    assert_eq!(logs[0].status, if served { 200 } else { 502 });
     assert_eq!(logs[0].transport, "ws");
 }
 
