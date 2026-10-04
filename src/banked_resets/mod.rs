@@ -454,6 +454,7 @@ impl QuotaGuard {
             }
             st.quota.windows.retain(|w| !affected(w));
             st.quota.updated_at = None;
+            st.quota.refreshed_at = None;
             // Keep cooldowns whose scope cannot be proven to match this grant.
         }
     }

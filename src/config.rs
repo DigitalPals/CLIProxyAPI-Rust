@@ -27,8 +27,11 @@ pub struct Config {
     /// How many different accounts to try before giving up on a request.
     #[serde(deserialize_with = "lenient_u32")]
     pub request_retry: u32,
-    /// least-used, round-robin or fill-first.
+    /// How new sessions choose an account.
     pub routing: Routing,
+    /// Smart routing prefers other accounts below this 5-hour remaining percentage.
+    #[serde(deserialize_with = "percentage")]
+    pub five_hour_reserve_percent: u8,
     /// Keep each coding session on its account until subscription quota is exhausted.
     pub session_affinity: bool,
     /// Forget inactive sessions after this many seconds (default one day).
@@ -74,6 +77,8 @@ pub enum Routing {
     /// The account with the most subscription quota left (falls back to round-robin).
     #[default]
     LeastUsed,
+    /// Balance weekly renewal priority, 5-hour headroom and current account load.
+    SmartQuota,
     RoundRobin,
     FillFirst,
 }
@@ -89,6 +94,7 @@ impl<'de> Deserialize<'de> for Routing {
             _ => "",
         };
         Ok(match s.trim().to_ascii_lowercase().as_str() {
+            "smart-quota" | "soonest-reset" => Routing::SmartQuota,
             "fill-first" => Routing::FillFirst,
             "round-robin" | "weighted-round-robin" => Routing::RoundRobin,
             _ => Routing::LeastUsed,
@@ -99,6 +105,14 @@ impl<'de> Deserialize<'de> for Routing {
 fn lenient_u32<'de, D: Deserializer<'de>>(d: D) -> Result<u32, D::Error> {
     let v = Yaml::deserialize(d)?;
     Ok(v.as_i64().map(|n| n.clamp(0, u32::MAX as i64) as u32).unwrap_or(3))
+}
+
+fn percentage<'de, D: Deserializer<'de>>(d: D) -> Result<u8, D::Error> {
+    let n = u8::deserialize(d)?;
+    if n > 100 {
+        return Err(serde::de::Error::custom("5-hour reserve must be a whole percentage between 0 and 100"));
+    }
+    Ok(n)
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -197,6 +211,7 @@ impl Default for Config {
             proxy_url: String::new(),
             request_retry: 3,
             routing: Routing::LeastUsed,
+            five_hour_reserve_percent: 30,
             session_affinity: true,
             session_affinity_idle_seconds: 86_400,
             codex_websockets: true,
@@ -234,7 +249,8 @@ management-key: ""
 
 proxy-url: ""               # optional upstream proxy, e.g. socks5://127.0.0.1:1080
 request-retry: 3            # accounts to try before failing a request
-routing: least-used         # chooses accounts for new sessions: least-used | round-robin | fill-first
+routing: least-used         # new sessions: least-used | smart-quota | round-robin | fill-first
+five-hour-reserve-percent: 30 # smart-quota: prefer other accounts below this remaining percentage
 session-affinity: true      # keep a session on its subscription until quota is exhausted
 session-affinity-idle-seconds: 86400 # expire assignments after a day without requests
 codex-websockets: true      # native upstream websocket for Codex websocket clients

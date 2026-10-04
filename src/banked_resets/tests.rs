@@ -390,6 +390,7 @@ async fn applied_reset_survives_refresh_failure_and_preserves_other_cooldowns() 
     for a in app.pool.all() {
         let st = a.state.lock();
         assert!(!st.quota.windows.iter().any(|w| w.name == "5h"));
+        assert!(st.quota.refreshed_at.is_none()); // failed reconciliation must not delay the next poll
         assert!(!st.quota_refreshing);
         assert!(st.quota_cooldowns.is_empty());
         assert!(!st.cooldowns.is_empty());
@@ -777,6 +778,7 @@ fn replacing_credential_identity_discards_old_quota_and_reset_state() {
     assert!(Arc::ptr_eq(&app.pool.get(&acct.id).unwrap(), &acct));
     let st = acct.state.lock();
     assert!(st.quota.windows.is_empty());
+    assert!(st.quota.refreshed_at.is_none());
     assert!(!st.quota_refreshing);
     assert!(st.banked_resets.is_none());
 }

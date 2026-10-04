@@ -56,6 +56,7 @@ pub struct Tracker {
     stream_usage: Usage,
     stream_error: Option<(u16, String)>,
     stream_finished: bool,
+    load: Option<crate::accounts::RequestLoad>,
     done: bool,
 }
 
@@ -69,6 +70,7 @@ impl Tracker {
             stream_usage: Usage::default(),
             stream_error: None,
             stream_finished: false,
+            load: None,
             done: false,
             log: RequestLog {
                 id: app.stats.next_id(),
@@ -98,6 +100,7 @@ impl Tracker {
     }
 
     pub fn attempt(&mut self, acct: &Arc<Account>) {
+        self.load = Some(crate::accounts::RequestLoad::new(acct));
         self.log.attempts += 1;
         self.log.provider = acct.provider.as_str().to_string();
         self.log.account = acct.label.clone();
@@ -148,6 +151,7 @@ impl Tracker {
     pub fn cancel(&mut self) {
         if !self.done {
             self.done = true;
+            self.load = None;
             self.app.stats.active.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
         }
     }
@@ -189,6 +193,7 @@ impl Tracker {
             return;
         }
         self.done = true;
+        self.load = None;
         self.app.stats.active.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
         let (input, output, cache) = crate::state::usage_tokens(usage);
         self.log.status = status;
@@ -581,7 +586,7 @@ async fn execute_inner(app: Arc<App>, call: Call) -> Reply {
             if cfg.session_affinity && call.session.is_some() && call.session_source != Some("generated_response") {
                 app.sessions.pick_with_reason(&app.pool, &cfg, &model, call.session.as_deref(), &tried, only.as_ref())
             } else {
-                match app.pool.pick(&model, &tried, cfg.routing, pin.as_deref(), only.as_ref()) {
+                match app.sessions.pick_unbound(&app.pool, &cfg, &model, &tried, pin.as_deref(), only.as_ref()) {
                     Pick::Ok(a, m) => Ok(crate::affinity::Selected {
                         reason: if pin.as_deref() == Some(a.id.as_str()) {
                             "retry_same"

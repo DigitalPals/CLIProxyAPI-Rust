@@ -1,7 +1,7 @@
 //! Shared coding-session assignments. Only identifiers and account ids are persisted;
 //! conversation input stays in a bounded, process-local continuation cache.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -19,6 +19,8 @@ const MAX_SESSIONS: usize = 10_000;
 const MAX_HISTORY_BYTES: usize = 64 * 1024 * 1024;
 const MAX_RESPONSE_BYTES: usize = 8 * 1024 * 1024;
 const MAX_RESPONSES: usize = 1_000;
+/// Recent assignments count immediately, including the gaps between coding turns.
+const LOAD_IDLE_SECONDS: i64 = 5 * 60;
 
 fn digest(parts: &[&str]) -> String {
     let mut h = Sha256::new();
@@ -151,6 +153,25 @@ struct Registry {
     active: HashMap<String, usize>,
 }
 
+impl Registry {
+    fn account_load(&self, cfg: &Config) -> HashMap<String, usize> {
+        let mut load = HashMap::new();
+        if cfg.routing != Routing::SmartQuota || !cfg.session_affinity {
+            return load;
+        }
+        let cutoff = Utc::now().timestamp()
+            - LOAD_IDLE_SECONDS.min(cfg.session_affinity_idle_seconds.min(i64::MAX as u64) as i64);
+        let mut seen = HashSet::new();
+        for (key, b) in &self.bindings {
+            let session = if b.session.is_empty() { key.as_str() } else { b.session.as_str() };
+            if (b.last_seen > cutoff || self.active.contains_key(session)) && seen.insert((&b.account, session)) {
+                *load.entry(b.account.clone()).or_insert(0) += 1;
+            }
+        }
+        load
+    }
+}
+
 pub struct Sessions {
     registry: Mutex<Registry>,
     path: Option<PathBuf>,
@@ -267,7 +288,7 @@ impl Sessions {
         only: Option<&Only>,
     ) -> Result<Selected, (u16, String)> {
         let Some(session) = session.filter(|_| cfg.session_affinity) else {
-            let (account, model) = selection(pool.pick(model, exclude, cfg.routing, None, only), model)?;
+            let (account, model) = selection(self.pick_unbound(pool, cfg, model, exclude, None, only), model)?;
             return Ok(Selected {
                 account,
                 model,
@@ -306,11 +327,11 @@ impl Sessions {
                     // another account but keep the assignment, so the session comes back
                     // (and finds its prompt cache) once its subscription recovers.
                     let assigned_id = acct.id.clone();
-                    drop(registry);
                     if !excluded.contains(&assigned_id) {
                         excluded.push(assigned_id.clone());
                     }
-                    let (account, model) = selection(pool.pick(model, &excluded, cfg.routing, None, only), model)?;
+                    let (account, model) =
+                        selection(pool.pick(model, &excluded, cfg, None, only, &registry.account_load(cfg)), model)?;
                     return Ok(Selected {
                         account,
                         model,
@@ -339,8 +360,8 @@ impl Sessions {
                 }
                 // Every assignment is in use: route this request on its own rather than fail it.
                 None => {
-                    drop(registry);
-                    let (account, model) = selection(pool.pick(model, exclude, cfg.routing, None, only), model)?;
+                    let (account, model) =
+                        selection(pool.pick(model, exclude, cfg, None, only, &registry.account_load(cfg)), model)?;
                     return Ok(Selected {
                         account,
                         model,
@@ -351,7 +372,8 @@ impl Sessions {
                 }
             }
         }
-        let (acct, upstream) = selection(pool.pick(model, &excluded, cfg.routing, None, only), model)?;
+        let (acct, upstream) =
+            selection(pool.pick(model, &excluded, cfg, None, only, &registry.account_load(cfg)), model)?;
         let previous = registry.bindings.insert(
             key,
             Binding {
@@ -377,6 +399,20 @@ impl Sessions {
     pub fn prune(&self, idle: u64) {
         let mut registry = self.registry.lock();
         Self::prune_locked(&mut registry, idle);
+    }
+
+    /// Retries and requests without affinity still respect the reserve and current load.
+    pub fn pick_unbound(
+        &self,
+        pool: &Pool,
+        cfg: &Config,
+        model: &str,
+        exclude: &[String],
+        pinned: Option<&str>,
+        only: Option<&Only>,
+    ) -> Pick {
+        let registry = self.registry.lock();
+        pool.pick(model, exclude, cfg, pinned, only, &registry.account_load(cfg))
     }
 
     fn prune_locked(registry: &mut Registry, idle: u64) {
@@ -522,9 +558,174 @@ mod tests {
         }
     }
 
+    fn smart_pool() -> (Config, Pool) {
+        let cfg = config(Routing::SmartQuota);
+        let pool = Pool::default();
+        pool.reload(&cfg);
+        let now = Utc::now();
+        for (a, days) in pool.all().iter().zip([3, 5]) {
+            a.state.lock().quota = crate::quota::Quota {
+                windows: vec![
+                    crate::quota::Window {
+                        name: "5h".into(),
+                        used: 0.0,
+                        resets_at: Some(now + Duration::hours(4)),
+                        model: None,
+                    },
+                    crate::quota::Window {
+                        name: "week".into(),
+                        used: 30.0,
+                        resets_at: Some(now + Duration::days(days)),
+                        model: None,
+                    },
+                ],
+                updated_at: Some(now),
+                ..Default::default()
+            };
+        }
+        (cfg, pool)
+    }
+
+    #[test]
+    fn smart_reserve_protects_existing_sessions_and_never_blocks_available_quota() {
+        let (cfg, pool) = smart_pool();
+        let sessions = Sessions::memory();
+        let pick = |task| sessions.pick(&pool, &cfg, "gpt-6.1-sol", Some(task), &[], None).unwrap().0;
+        let accounts = pool.all();
+        let a = pick("first");
+        assert_eq!(a.id, accounts[0].id);
+        a.state.lock().quota.windows[0].used = 71.0; // 29% left
+        let b = pick("second");
+        assert_eq!(b.id, accounts[1].id);
+        assert_eq!(pick("first").id, a.id); // reserve never evicts a pinned session
+        b.state.lock().quota.windows[0].used = 90.0;
+        assert_eq!(pick("third").id, a.id); // all below reserve: use the best available account
+        a.state.lock().quota.windows[0].used = 100.0;
+        assert_eq!(pick("first").id, b.id); // genuine exhaustion migrates
+        a.state.lock().quota.windows[0].used = 0.0;
+        assert_eq!(pick("first").id, b.id); // recovery does not disrupt the replacement
+    }
+
+    #[test]
+    fn smart_reserve_boundaries_unknown_quota_and_expired_windows() {
+        let (mut cfg, pool) = smart_pool();
+        let accounts = pool.all();
+        let pick = |cfg: &Config| {
+            Sessions::memory().pick(&pool, cfg, "gpt-6.1-sol", Some("new"), &[], None).unwrap().0.id.clone()
+        };
+        accounts[0].state.lock().quota.windows[0].used = 61.0;
+        accounts[1].state.lock().quota.windows[0].used = 60.0;
+        cfg.five_hour_reserve_percent = 40;
+        assert_eq!(pick(&cfg), accounts[1].id);
+        cfg.five_hour_reserve_percent = 0;
+        assert_eq!(pick(&cfg), accounts[0].id);
+        cfg.five_hour_reserve_percent = 30;
+        accounts[0].state.lock().quota.windows[0].used = 70.0;
+        accounts[1].state.lock().quota.windows[0].used = 70.0;
+        assert_eq!(pick(&cfg), accounts[0].id); // exactly the reserve remains eligible
+        accounts[0].state.lock().quota.windows.remove(0);
+        assert_eq!(pick(&cfg), accounts[1].id); // known healthy quota beats unknown
+        accounts[1].state.lock().quota.windows.remove(0);
+        assert_eq!(pick(&cfg), accounts[0].id); // both unknown: renewal priority still works
+        accounts[0].state.lock().quota.windows.push(crate::quota::Window {
+            name: "5h".into(),
+            used: 100.0,
+            resets_at: Some(Utc::now() - Duration::seconds(1)),
+            model: None,
+        });
+        assert_eq!(pick(&cfg), accounts[0].id); // elapsed window is available again
+        cfg.five_hour_reserve_percent = 100;
+        assert_eq!(pick(&cfg), accounts[0].id);
+    }
+
+    #[test]
+    fn simultaneous_smart_assignments_spread_before_quota_changes() {
+        let (cfg, pool) = smart_pool();
+        let sessions = Sessions::memory();
+        let barrier = std::sync::Barrier::new(24);
+        let assignments = std::thread::scope(|scope| {
+            let handles: Vec<_> = (0..24)
+                .map(|i| {
+                    let (cfg, pool, sessions, barrier) = (&cfg, &pool, &sessions, &barrier);
+                    scope.spawn(move || {
+                        let task = format!("parallel-{i}");
+                        barrier.wait();
+                        let account = sessions.pick(pool, cfg, "gpt-6.1-sol", Some(&task), &[], None).unwrap().0;
+                        (task, account.id.clone())
+                    })
+                })
+                .collect();
+            handles.into_iter().map(|h| h.join().unwrap()).collect::<Vec<_>>()
+        });
+        let accounts = pool.all();
+        let early = assignments.iter().filter(|(_, id)| *id == accounts[0].id).count();
+        let later = assignments.len() - early;
+        assert!(early > later, "earlier renewal should receive more sessions: {early}/{later}");
+        assert!(later >= 8, "new sessions must spread before quota updates: {early}/{later}");
+        for (task, id) in assignments {
+            assert_eq!(sessions.pick(&pool, &cfg, "gpt-6.1-sol", Some(&task), &[], None).unwrap().0.id, id);
+        }
+    }
+
+    #[test]
+    fn smart_routing_respects_model_specific_quota_through_an_alias() {
+        let cfg = Config {
+            routing: Routing::SmartQuota,
+            auth_dir: "/nonexistent".into(),
+            claude_api_key: ["a", "b"]
+                .map(|key| KeyEntry {
+                    api_key: key.into(),
+                    models: vec![crate::config::ModelAlias {
+                        name: "claude-opus-5-5".into(),
+                        alias: Some("coding".into()),
+                    }],
+                    ..Default::default()
+                })
+                .to_vec(),
+            ..Default::default()
+        };
+        let pool = Pool::default();
+        pool.reload(&cfg);
+        let sessions = Sessions::memory();
+        let pick = |task| sessions.pick(&pool, &cfg, "coding", Some(task), &[], None).unwrap().0;
+        let a = pick("existing");
+        a.state.lock().quota.windows.push(crate::quota::Window {
+            name: "week opus".into(),
+            used: 100.0,
+            resets_at: Some(Utc::now() + Duration::days(1)),
+            model: Some("opus".into()),
+        });
+        assert_ne!(pick("new").id, a.id);
+        assert_ne!(pick("existing").id, a.id);
+    }
+
+    #[test]
+    fn smart_session_load_deduplicates_scopes_and_releases_idle_or_ended_work() {
+        let (mut cfg, pool) = smart_pool();
+        let sessions = Arc::new(Sessions::memory());
+        let a = sessions.pick(&pool, &cfg, "gpt-6.1-sol", Some("task"), &[], None).unwrap().0;
+        {
+            let mut registry = sessions.registry.lock();
+            let binding = registry.bindings.values().next().unwrap().clone();
+            registry.bindings.insert("another-route-scope".into(), binding);
+            assert_eq!(registry.account_load(&cfg)[&a.id], 1);
+            registry.bindings.values_mut().for_each(|b| b.last_seen -= LOAD_IDLE_SECONDS + 1);
+            assert!(registry.account_load(&cfg).is_empty());
+        }
+        let lease = sessions.hold("task", cfg.session_affinity_idle_seconds);
+        assert_eq!(sessions.registry.lock().account_load(&cfg)[&a.id], 1); // long-running stream
+        cfg.session_affinity = false;
+        assert!(sessions.registry.lock().account_load(&cfg).is_empty());
+        cfg.session_affinity = true;
+        drop(lease);
+        assert_eq!(sessions.registry.lock().account_load(&cfg)[&a.id], 1); // recent after completion
+        sessions.end("task");
+        assert!(sessions.registry.lock().account_load(&cfg).is_empty());
+    }
+
     #[test]
     fn all_strategies_pin_and_keep_the_replacement_after_recovery() {
-        for routing in [Routing::LeastUsed, Routing::RoundRobin, Routing::FillFirst] {
+        for routing in [Routing::LeastUsed, Routing::SmartQuota, Routing::RoundRobin, Routing::FillFirst] {
             let cfg = config(routing);
             let pool = Pool::default();
             pool.reload(&cfg);
@@ -547,7 +748,7 @@ mod tests {
 
     #[test]
     fn routing_metadata_distinguishes_assignment_reuse_and_quota_migration() {
-        for routing in [Routing::LeastUsed, Routing::RoundRobin, Routing::FillFirst] {
+        for routing in [Routing::LeastUsed, Routing::SmartQuota, Routing::RoundRobin, Routing::FillFirst] {
             let cfg = config(routing);
             let pool = Pool::default();
             pool.reload(&cfg);

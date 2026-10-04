@@ -86,6 +86,10 @@ pub fn normalize(doc: &mut Yaml) -> Vec<String> {
     lift(doc, &["routing", "retry", "request-retry"], "request-retry", true);
     lift(doc, &["routing", "force-model-prefix"], "force-model-prefix", true);
     lift(doc, &["routing", "session-affinity"], "session-affinity", true);
+    // Preserve even an explicit null here so the percentage validator rejects it.
+    if let Some(reserve) = doc.get("routing").and_then(|r| r.get("five-hour-reserve-percent")).cloned() {
+        doc.as_mapping_mut().unwrap().insert(key("five-hour-reserve-percent"), reserve);
+    }
     lift(doc, &["requests", "proxy-url"], "proxy-url", true);
     lift(doc, &["oauth", "auth-dir"], "auth-dir", true);
     lift(doc, &["oauth", "model-alias"], "oauth-model-alias", true);
