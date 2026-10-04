@@ -128,6 +128,7 @@ fn claude(t: &Target, mut body: Value) -> Prepared {
     let url = if oauth { format!("{base}{path}?beta=true") } else { format!("{base}{path}") };
     body["model"] = t.model.into();
     strip_foreign_thinking(&mut body);
+    crate::formats::claude::normalize_disabled_thinking(&mut body, t.model);
 
     let native_cc = t.passthrough && is_claude_code(t.client_headers);
     let mut headers: Vec<(String, String)> = Vec::new();
