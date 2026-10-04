@@ -297,8 +297,123 @@ async fn turn(
 }
 
 #[tokio::test]
+async fn smart_balancing_uses_reserve_and_session_load_over_http_and_websockets() {
+    for native in [false, true] {
+        let fixture = Fixture::new(Routing::SmartQuota, native).await;
+        let accounts = fixture.app.pool.all();
+        let now = chrono::Utc::now();
+        for (account, days) in accounts.iter().zip([3, 5]) {
+            account.state.lock().quota = crate::quota::Quota {
+                windows: vec![
+                    crate::quota::Window {
+                        name: "5h".into(),
+                        used: 0.0,
+                        resets_at: Some(now + chrono::Duration::hours(4)),
+                        model: None,
+                    },
+                    crate::quota::Window {
+                        name: "week".into(),
+                        used: 20.0,
+                        resets_at: Some(now + chrono::Duration::days(days)),
+                        model: None,
+                    },
+                ],
+                updated_at: Some(now),
+                ..Default::default()
+            };
+        }
+        let first = fixture.request(Some("http-first"), prompt()).await;
+        assert_eq!(first.0, 200);
+        assert_eq!(answer(&first.1), "a");
+        let mut socket = fixture.socket("ws-second").await;
+        turn(&mut socket, prompt()).await;
+        assert_eq!(fixture.mock.calls.lock().last().unwrap().0, "b"); // new load counts before quota moves
+        assert_eq!(answer(&fixture.request(Some("http-first"), prompt()).await.1), "a");
+
+        // Change the reserve at runtime without disturbing either existing assignment.
+        let mut cfg = fixture.cfg.clone();
+        cfg.five_hour_reserve_percent = 60;
+        fixture.app.set_config(cfg);
+        accounts[0].state.lock().quota.windows[0].used = 41.0;
+        assert_eq!(answer(&fixture.request(Some("new-after-reserve"), prompt()).await.1), "b");
+        assert_eq!(answer(&fixture.request(Some("http-first"), prompt()).await.1), "a");
+        turn(&mut socket, prompt()).await;
+        assert_eq!(fixture.mock.calls.lock().last().unwrap().0, "b");
+
+        let logs = fixture.logs(6).await;
+        assert!(logs.iter().all(|log| log.routing_strategy == Routing::SmartQuota));
+        assert!(accounts.iter().all(|a| a.state.lock().active_requests.load(Ordering::Relaxed) == 0));
+        socket.close(None).await.unwrap();
+    }
+}
+
+#[tokio::test]
+async fn smart_balancing_uses_weekly_headroom_without_inventing_a_five_hour_reserve() {
+    for native in [false, true] {
+        let fixture = Fixture::new(Routing::SmartQuota, native).await;
+        let accounts = fixture.app.pool.all();
+        let reset = chrono::Utc::now() + chrono::Duration::days(3);
+        for (account, used) in accounts.iter().zip([80.0, 20.0]) {
+            crate::quota::authoritative(
+                &mut account.state.lock(),
+                vec![crate::quota::Window { name: "week".into(), used, resets_at: Some(reset), model: None }],
+                None,
+            );
+        }
+        // Identical renewals: known weekly headroom beats the old equal 50% fallback.
+        assert_eq!(answer(&fixture.request(Some("weekly-http"), prompt()).await.1), "b");
+        let mut socket = fixture.socket("weekly-ws").await;
+        turn(&mut socket, prompt()).await;
+        assert_eq!(fixture.mock.calls.lock().last().unwrap().0, "b");
+
+        // A real 5-hour window at the reserve takes precedence over weekly-only headroom.
+        accounts[0].state.lock().quota.windows.push(crate::quota::Window {
+            name: "5h".into(),
+            used: 70.0,
+            resets_at: Some(reset),
+            model: None,
+        });
+        assert_eq!(answer(&fixture.request(Some("real-reserve"), prompt()).await.1), "a");
+        assert_eq!(answer(&fixture.request(Some("weekly-http"), prompt()).await.1), "b");
+        turn(&mut socket, prompt()).await;
+        assert_eq!(fixture.mock.calls.lock().last().unwrap().0, "b"); // existing assignment stays pinned
+        socket.close(None).await.unwrap();
+    }
+}
+
+#[tokio::test]
+async fn request_load_releases_on_retry_finish_cancel_and_drop() {
+    let fixture = Fixture::new(Routing::SmartQuota, false).await;
+    let accounts = fixture.app.pool.all();
+    let count = |i: usize| accounts[i].state.lock().active_requests.load(Ordering::Relaxed);
+    let new_tracker =
+        || crate::proxy::Tracker::new(&fixture.app, crate::ir::Format::Responses, true, "http", "gpt-6.1-sol");
+    let mut tracker = new_tracker();
+    tracker.attempt(&accounts[0]);
+    assert_eq!(count(0), 1);
+    tracker.attempt(&accounts[0]); // retry on same account must not accumulate
+    assert_eq!(count(0), 1);
+    assert_eq!(answer(&fixture.request(None, prompt()).await.1), "b"); // unbound requests see in-flight work
+    tracker.attempt(&accounts[1]);
+    assert_eq!((count(0), count(1)), (0, 1));
+    tracker.finish(200, &crate::ir::Usage::default(), None);
+    assert_eq!((count(0), count(1)), (0, 0));
+    drop(tracker);
+    let mut tracker = new_tracker();
+    tracker.attempt(&accounts[0]);
+    tracker.cancel();
+    tracker.cancel();
+    assert_eq!(count(0), 0);
+    drop(tracker);
+    let mut tracker = new_tracker();
+    tracker.attempt(&accounts[0]);
+    drop(tracker); // client disconnects mid-stream
+    assert_eq!(count(0), 0);
+}
+
+#[tokio::test]
 async fn http_tasks_stay_pinned_and_migrate_only_when_quota_runs_out() {
-    for routing in [Routing::LeastUsed, Routing::RoundRobin, Routing::FillFirst] {
+    for routing in [Routing::LeastUsed, Routing::SmartQuota, Routing::RoundRobin, Routing::FillFirst] {
         let fixture = Fixture::new(routing, false).await;
         let task = "private-coding-thread-identifier";
         for _ in 0..3 {
@@ -447,7 +562,7 @@ async fn websocket_fallback_and_reconnect_share_http_assignments_and_history() {
 
 #[tokio::test]
 async fn native_websocket_reconnect_replays_history_and_quota_failover_stays_on_replacement() {
-    for routing in [Routing::LeastUsed, Routing::RoundRobin, Routing::FillFirst] {
+    for routing in [Routing::LeastUsed, Routing::SmartQuota, Routing::RoundRobin, Routing::FillFirst] {
         let fixture = Fixture::new(routing, true).await;
         let mut socket = fixture.socket("task").await;
         let first = turn(&mut socket, prompt()).await;

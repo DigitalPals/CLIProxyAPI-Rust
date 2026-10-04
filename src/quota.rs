@@ -37,6 +37,9 @@ pub struct Window {
 pub struct Quota {
     pub windows: Vec<Window>,
     pub updated_at: Option<DateTime<Utc>>,
+    /// Last accepted usage-endpoint refresh; partial observations do not advance this.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub refreshed_at: Option<DateTime<Utc>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub plan: Option<String>,
 }
@@ -61,6 +64,35 @@ impl Quota {
         self.live(model).any(|w| w.used >= 100.0)
     }
 
+    /// The general weekly renewal, ignoring expired, short and model-specific windows.
+    pub fn weekly_reset(&self, model: &str) -> Option<DateTime<Utc>> {
+        self.live(model).filter(|w| w.name == "week" && w.model.is_none()).filter_map(|w| w.resets_at).min()
+    }
+
+    /// Missing data is unknown; an elapsed window has its allowance available again.
+    pub fn five_hour_remaining(&self, model: &str) -> Option<f64> {
+        let lower = model.to_ascii_lowercase();
+        if !self.windows.iter().any(|w| w.name == "5h" && w.model.as_ref().is_none_or(|m| lower.contains(m))) {
+            return None;
+        }
+        let used = self.live(model).filter(|w| w.name == "5h").map(|w| w.used).fold(0.0, f64::max);
+        Some(100.0 - used.clamp(0.0, 100.0))
+    }
+
+    /// Headroom in the tightest known applicable window, for accounts without 5-hour data.
+    pub fn remaining(&self, model: &str) -> Option<f64> {
+        let lower = model.to_ascii_lowercase();
+        if !self.windows.iter().any(|w| w.model.as_ref().is_none_or(|m| lower.contains(m))) {
+            return None;
+        }
+        let used = self.live(model).map(|w| w.used).fold(0.0, f64::max);
+        Some(100.0 - used.clamp(0.0, 100.0))
+    }
+
+    fn needs_refresh(&self, now: DateTime<Utc>) -> bool {
+        self.refreshed_at.is_none_or(|t| (now - t).num_seconds() >= POLL_EVERY)
+    }
+
     /// A window that is used up, and when it resets.
     pub fn exhausted_until(&self, model: &str) -> Option<DateTime<Utc>> {
         self.live(model).filter(|w| w.used >= 100.0).filter_map(|w| w.resets_at).max()
@@ -70,15 +102,16 @@ impl Quota {
         if windows.is_empty() {
             return;
         }
-        // Headers only carry the general windows; keep model-scoped ones from the last poll.
-        let scoped: Vec<Window> = self
+        // Observations can omit any window. Only replace the same window and model scope;
+        // missing data must not erase exhaustion or renewal dates learned earlier.
+        let retained: Vec<Window> = self
             .windows
             .iter()
-            .filter(|w| w.model.is_some() && !windows.iter().any(|n| n.name == w.name))
+            .filter(|w| !windows.iter().any(|n| n.name == w.name && n.model == w.model))
             .cloned()
             .collect();
         self.windows = windows;
-        self.windows.extend(scoped);
+        self.windows.extend(retained);
         self.updated_at = Some(Utc::now());
         if plan.is_some() {
             self.plan = plan;
@@ -262,21 +295,12 @@ pub fn authoritative(st: &mut crate::accounts::AccountState, windows: Vec<Window
                 .windows
                 .iter()
                 .filter(|old| old.model.as_ref().is_none_or(|m| model.contains(m)))
-                .all(|old| windows.iter().any(|new| new.name == old.name))
+                .all(|old| windows.iter().any(|new| new.name == old.name && new.model == old.model))
         })
         .cloned()
         .collect();
-    // An absent field is unknown; retain its old window until it expires.
-    let mut merged = windows;
-    merged.extend(
-        st.quota
-            .windows
-            .iter()
-            .filter(|old| !merged.iter().any(|new| new.name == old.name))
-            .cloned()
-            .collect::<Vec<_>>(),
-    );
-    st.quota.set(merged, plan);
+    st.quota.set(windows, plan);
+    st.quota.refreshed_at = st.quota.updated_at;
     let quota = &st.quota;
     st.quota_cooldowns.retain(|model, _| {
         !covered.contains(model) || quota.pressure(if model == "*" { "" } else { model }).is_none_or(|u| u >= 100.0)
@@ -326,7 +350,7 @@ pub async fn poller(app: Arc<App>) {
             }
             let stale = {
                 let st = acct.state.lock();
-                !st.disabled && st.quota.updated_at.is_none_or(|t| (Utc::now() - t).num_seconds() >= POLL_EVERY)
+                !st.disabled && st.quota.needs_refresh(Utc::now())
             };
             if !stale || crate::oauth::ensure_fresh(&app, &acct, chrono::Duration::minutes(5), false).await.is_err() {
                 continue;
@@ -347,6 +371,153 @@ pub async fn poller(app: Arc<App>) {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn partial_headers_preserve_known_five_hour_exhaustion() {
+        let reset = Utc::now() + chrono::Duration::hours(4);
+        let mut q = Quota::default();
+        q.set(vec![Window { name: "5h".into(), used: 100.0, resets_at: Some(reset), model: None }], None);
+        q.set(
+            vec![Window {
+                name: "week".into(),
+                used: 20.0,
+                resets_at: Some(reset + chrono::Duration::days(3)),
+                model: None,
+            }],
+            None,
+        );
+        assert!(q.exhausted("gpt-6.1-sol"));
+        assert_eq!(q.five_hour_remaining("gpt-6.1-sol"), Some(0.0));
+    }
+
+    #[test]
+    fn partial_headers_preserve_weekly_priority() {
+        let reset = Utc::now() + chrono::Duration::days(3);
+        let mut q = Quota::default();
+        q.set(vec![Window { name: "week".into(), used: 33.0, resets_at: Some(reset), model: None }], None);
+        q.set(
+            vec![Window {
+                name: "5h".into(),
+                used: 0.0,
+                resets_at: Some(reset - chrono::Duration::days(2)),
+                model: None,
+            }],
+            None,
+        );
+        assert_eq!(q.weekly_reset("claude-sonnet-5-5"), Some(reset));
+    }
+
+    #[test]
+    fn partial_observations_do_not_postpone_usage_refresh() {
+        let cfg = crate::config::Config {
+            auth_dir: "/nonexistent".into(),
+            codex_api_key: vec![crate::config::KeyEntry { api_key: "a".into(), ..Default::default() }],
+            ..Default::default()
+        };
+        let pool = crate::accounts::Pool::default();
+        pool.reload(&cfg);
+        let acct = &pool.all()[0];
+        let headers = reqwest::header::HeaderMap::from_iter([
+            (reqwest::header::HeaderName::from_static("x-codex-primary-window-minutes"), "10080".parse().unwrap()),
+            (reqwest::header::HeaderName::from_static("x-codex-primary-used-percent"), "20".parse().unwrap()),
+        ]);
+        observe(acct, &headers, acct.quota_epoch());
+        assert!(acct.state.lock().quota.needs_refresh(Utc::now())); // headers cannot replace the first poll
+        let usage_value = json!({"rate_limit":{"primary_window":{"limit_window_seconds":604800,"used_percent":20}}});
+        let refreshed;
+        {
+            let mut st = acct.state.lock();
+            usage(&mut st, Provider::Codex, &usage_value);
+            refreshed = st.quota.refreshed_at.unwrap();
+            assert!(!st.quota.needs_refresh(refreshed + chrono::Duration::seconds(POLL_EVERY - 1)));
+            assert!(st.quota.needs_refresh(refreshed + chrono::Duration::seconds(POLL_EVERY)));
+        }
+        observe(acct, &headers, acct.quota_epoch());
+        let event = json!({"type":"codex.rate_limits","primary":{"window_minutes":300,"used_percent":95,"reset_after_seconds":3600}});
+        observe_codex_event(acct, &event, acct.quota_epoch());
+        {
+            let st = acct.state.lock();
+            assert_eq!(st.quota.refreshed_at, Some(refreshed));
+            assert!(st.quota.needs_refresh(refreshed + chrono::Duration::seconds(POLL_EVERY)));
+            assert_eq!(st.quota.windows.len(), 2); // WebSocket update also retains the weekly window
+            assert_eq!(st.quota.five_hour_remaining("gpt-6.1-sol"), Some(5.0));
+        }
+        let mut st = acct.state.lock();
+        usage(&mut st, Provider::Codex, &json!({}));
+        assert_eq!(st.quota.refreshed_at, Some(refreshed)); // empty data does not claim a refresh
+        st.quota.refreshed_at = Some(refreshed - chrono::Duration::seconds(POLL_EVERY));
+        usage(&mut st, Provider::Codex, &usage_value);
+        assert!(!st.quota.needs_refresh(Utc::now()));
+        assert_eq!(st.quota.five_hour_remaining("gpt-6.1-sol"), Some(5.0));
+    }
+
+    #[test]
+    fn partial_updates_keep_model_scopes_and_expired_limits_stop_applying() {
+        let now = Utc::now();
+        let week =
+            Window { name: "week".into(), used: 40.0, resets_at: Some(now + chrono::Duration::days(3)), model: None };
+        let mut st = crate::accounts::AccountState::default();
+        authoritative(
+            &mut st,
+            vec![
+                week.clone(),
+                Window { model: Some("opus".into()), used: 100.0, ..week.clone() },
+                Window {
+                    name: "5h".into(),
+                    used: 100.0,
+                    resets_at: Some(now - chrono::Duration::seconds(1)),
+                    model: None,
+                },
+            ],
+            None,
+        );
+        st.quota_cooldowns.insert("claude-opus-5-5".into(), now + chrono::Duration::hours(1));
+        authoritative(&mut st, vec![Window { used: 20.0, ..week }], None);
+        assert_eq!(st.quota.windows.len(), 3);
+        assert!(st.quota_cooldowns.contains_key("claude-opus-5-5"));
+        assert_eq!(st.quota.remaining("claude-opus-5-5"), Some(0.0));
+        assert_eq!(st.quota.remaining("claude-sonnet-5-5"), Some(80.0));
+        assert_eq!(st.quota.five_hour_remaining("claude-sonnet-5-5"), Some(100.0));
+        assert!(!st.quota.exhausted("claude-sonnet-5-5"));
+    }
+
+    #[test]
+    fn remaining_requires_applicable_data_and_recognizes_elapsed_windows() {
+        let mut q = Quota::default();
+        assert_eq!(q.remaining("claude-sonnet-5-5"), None);
+        q.set(vec![Window { name: "week opus".into(), used: 80.0, resets_at: None, model: Some("opus".into()) }], None);
+        assert_eq!(q.remaining("claude-sonnet-5-5"), None);
+        assert_eq!(q.remaining("CLAUDE-OPUS-5-5"), Some(20.0));
+        q.windows[0].resets_at = Some(Utc::now() - chrono::Duration::seconds(1));
+        assert_eq!(q.remaining("claude-opus-5-5"), Some(100.0));
+        assert_eq!(q.five_hour_remaining("claude-opus-5-5"), None);
+    }
+
+    #[test]
+    fn weekly_reset_ignores_other_windows_and_expired_dates() {
+        let now = Utc::now();
+        let weekly = now + chrono::Duration::days(3);
+        let mut q = Quota::default();
+        assert_eq!(q.weekly_reset("claude-opus-5-5"), None);
+        q.set(
+            vec![
+                Window { name: "5h".into(), used: 5.0, resets_at: Some(now + chrono::Duration::hours(1)), model: None },
+                Window {
+                    name: "week opus".into(),
+                    used: 5.0,
+                    resets_at: Some(now + chrono::Duration::days(1)),
+                    model: Some("opus".into()),
+                },
+                Window { name: "week".into(), used: 33.0, resets_at: Some(weekly), model: None },
+            ],
+            None,
+        );
+        assert_eq!(q.weekly_reset("claude-opus-5-5"), Some(weekly));
+        q.windows[2].resets_at = Some(now - chrono::Duration::seconds(1));
+        assert_eq!(q.weekly_reset("claude-opus-5-5"), None);
+        q.windows[2].resets_at = None;
+        assert_eq!(q.weekly_reset("claude-opus-5-5"), None);
+    }
 
     #[test]
     fn usage_endpoints_parse() {

@@ -138,9 +138,12 @@ function configRoutingHTML() {
   const strategy = configGet(['routing']);
   const what = configGet(['session-affinity']) ? 'new sessions' : 'requests';
   const help = { 'least-used': `Send ${what} to the account with the most subscription quota remaining. Falls back to round robin when quota is unavailable.`,
+    'smart-quota': `Prefer accounts whose weekly quota resets sooner, while considering 5-hour quota remaining and ${configGet(['session-affinity']) ? 'recently active sessions and requests in progress. Existing sessions stay on their account while it remains available.' : 'requests in progress. With session affinity off, each request is balanced independently.'}`,
     'round-robin': `Rotate ${what} across available accounts.`, 'fill-first': `Send ${what} to the first available account until it cannot serve them, then the next.` }[strategy];
   return `<h2>Routing</h2><div class="cfg-grid">
-    ${configSelect(['routing'], 'Account selection', [['least-used', 'Most quota remaining'], ['round-robin', 'Round robin'], ['fill-first', 'Fill first']], { help })}
+    ${configSelect(['routing'], 'Account selection', [['least-used', 'Most quota remaining'], ['smart-quota', 'Smart quota balancing'], ['round-robin', 'Round robin'], ['fill-first', 'Fill first']], { help })}
+    ${strategy === 'smart-quota' ? configField(['five-hour-reserve-percent'], '5-hour reserve for existing sessions (%)', { type: 'number', min: 0, max: 100, required: true,
+      help: `Below this level, prefer other accounts for ${what}. Remaining quota can still be used when all accounts are below their reserve. Default: 30%. Set 0 to turn off the reserve.` }) : ''}
     ${configField(['request-retry'], 'Account attempts', { type: 'number', min: 0, max: 4294967295, required: true,
       help: 'Maximum accounts to try before a request fails. Zero still tries one account.' })}</div>
     <div class="cfg-divider"></div>${configSwitch(['session-affinity'], 'Keep sessions on one account', 'A coding session stays on the account it started on, so its prompt cache keeps working. It moves when that subscription runs out or the account is disabled; while an account is busy, its requests briefly use another.')}
@@ -346,6 +349,7 @@ function configValidate() {
   }
   if ('auth-dir' in changed && !v['auth-dir']?.trim()) invalid(['auth-dir'], 'Enter a credentials directory.');
   if ('request-retry' in changed && (!Number.isInteger(v['request-retry']) || v['request-retry'] < 0 || v['request-retry'] > 4294967295)) invalid(['request-retry'], 'Enter a nonnegative whole number.');
+  if ('five-hour-reserve-percent' in changed && (!Number.isInteger(v['five-hour-reserve-percent']) || v['five-hour-reserve-percent'] < 0 || v['five-hour-reserve-percent'] > 100)) invalid(['five-hour-reserve-percent'], 'Enter a whole percentage between 0 and 100.');
   if ('session-affinity-idle-seconds' in changed && (!Number.isInteger(v['session-affinity-idle-seconds']) || v['session-affinity-idle-seconds'] < 60)) invalid(['session-affinity-idle-seconds'], 'Enter at least 60 seconds.');
   const checkURL = (path, proxy = false, required = false) => {
     const value = configGet(path);
@@ -391,7 +395,7 @@ function configValidate() {
       if (provider) { c.section = 'providers'; c.provider = provider[0];
         for (let i = 0; i < v[provider[2]].length; i++) { c.opens[`${provider[2]}:${i}`] = true; c.opens[`${provider[2]}:${i}:advanced`] = true; }
       } else if (path[0] === 'api-keys') c.section = 'access';
-      else if (['request-retry', 'session-affinity-idle-seconds'].includes(path[0])) c.section = 'routing';
+      else if (['request-retry', 'session-affinity-idle-seconds', 'five-hour-reserve-percent'].includes(path[0])) c.section = 'routing';
       else if (path[0] === 'proxy-url') c.section = 'connections';
       else c.section = 'server';
     }

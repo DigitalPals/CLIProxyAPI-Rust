@@ -4,6 +4,7 @@
 use std::collections::{BTreeMap, HashMap};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 use chrono::{DateTime, Utc};
 use parking_lot::{Mutex, RwLock};
@@ -293,6 +294,8 @@ pub struct Counters {
 
 #[derive(Debug, Default)]
 pub struct AccountState {
+    /// Shared across account reloads so in-flight requests remain counted.
+    pub active_requests: Arc<AtomicUsize>,
     pub disabled: bool,
     /// Cooldowns keyed by model ("*" = whole account).
     pub cooldowns: HashMap<String, DateTime<Utc>>,
@@ -308,6 +311,23 @@ pub struct AccountState {
     pub counters: Counters,
     /// Subscription usage windows (Claude, ChatGPT).
     pub quota: crate::quota::Quota,
+}
+
+/// Counts an actual request attempt, including streaming, until completion or cancellation.
+pub struct RequestLoad(Arc<AtomicUsize>);
+
+impl RequestLoad {
+    pub fn new(account: &Account) -> Self {
+        let active = account.state.lock().active_requests.clone();
+        active.fetch_add(1, Ordering::Relaxed);
+        Self(active)
+    }
+}
+
+impl Drop for RequestLoad {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::Relaxed);
+    }
 }
 
 pub struct Account {
@@ -462,6 +482,7 @@ impl Account {
     }
 
     pub fn cooling_until(&self, model: &str) -> Option<DateTime<Utc>> {
+        let quota_model = self.resolve(model).unwrap_or_else(|| model.to_string());
         let st = self.state.lock();
         let now = Utc::now();
         if st.quota_refreshing {
@@ -470,8 +491,8 @@ impl Account {
         // A used-up quota window counts as a cooldown, so we don't wait for the 429.
         let spent = st
             .quota
-            .exhausted_until(model)
-            .or_else(|| st.quota.exhausted(model).then(|| Utc::now() + chrono::Duration::minutes(5)));
+            .exhausted_until(&quota_model)
+            .or_else(|| st.quota.exhausted(&quota_model).then(|| Utc::now() + chrono::Duration::minutes(5)));
         [
             st.cooldowns.get("*"),
             st.cooldowns.get(model),
@@ -487,11 +508,12 @@ impl Account {
     }
 
     pub fn exhausted_until(&self, model: &str) -> Option<DateTime<Utc>> {
+        let quota_model = self.resolve(model).unwrap_or_else(|| model.to_string());
         let st = self.state.lock();
         let spent = st
             .quota
-            .exhausted_until(model)
-            .or_else(|| st.quota.exhausted(model).then(|| Utc::now() + chrono::Duration::minutes(5)));
+            .exhausted_until(&quota_model)
+            .or_else(|| st.quota.exhausted(&quota_model).then(|| Utc::now() + chrono::Duration::minutes(5)));
         [st.quota_cooldowns.get("*"), st.quota_cooldowns.get(model), spent.as_ref()]
             .into_iter()
             .flatten()
@@ -946,6 +968,7 @@ impl Pool {
                 .map(|p| {
                     let st = p.state.lock();
                     AccountState {
+                        active_requests: st.active_requests.clone(),
                         cooldowns: st.cooldowns.clone(),
                         quota_cooldowns: st.quota_cooldowns.clone(),
                         strikes: st.strikes,
@@ -1092,9 +1115,10 @@ impl Pool {
         &self,
         model: &str,
         exclude: &[String],
-        routing: Routing,
+        cfg: &Config,
         pinned: Option<&str>,
         only: Option<&Only>,
+        session_load: &HashMap<String, usize>,
     ) -> Pick {
         let force = self.force_prefix.load(std::sync::atomic::Ordering::Relaxed);
         let accounts = self.accounts.read();
@@ -1129,8 +1153,48 @@ impl Pool {
         if candidates.iter().any(|(a, _)| a.first_party(model)) {
             candidates.retain(|(a, _)| a.first_party(model));
         }
-        let idx = match routing {
+        let idx = match cfg.routing {
             Routing::FillFirst => 0,
+            Routing::SmartQuota => {
+                let now = Utc::now();
+                let scores: Vec<_> = candidates
+                    .iter()
+                    .map(|(a, upstream)| {
+                        let st = a.state.lock();
+                        let remaining = st.quota.five_hour_remaining(upstream);
+                        // Earlier weekly renewals get up to twice the weight, never unlimited
+                        // priority. Missing/expired weekly dates receive the neutral weight.
+                        let renewal = st.quota.weekly_reset(upstream).map_or(1.0, |reset| {
+                            2.0 - ((reset - now).num_seconds() as f64 / (7.0 * 86_400.0)).clamp(0.0, 1.0)
+                        });
+                        // A busy session is already represented by its in-flight request;
+                        // take the larger count instead of charging that work twice.
+                        let load = session_load
+                            .get(&a.id)
+                            .copied()
+                            .unwrap_or(0)
+                            .max(st.active_requests.load(Ordering::Relaxed));
+                        // Use known weekly/model-specific headroom when no 5-hour window is
+                        // reported. The reserve below still applies only to real 5-hour data.
+                        let headroom =
+                            remaining.or_else(|| st.quota.remaining(upstream)).unwrap_or(crate::quota::UNKNOWN);
+                        let weight = headroom * renewal / (1.0 + load as f64);
+                        (remaining, weight)
+                    })
+                    .collect();
+                let reserve = f64::from(cfg.five_hour_reserve_percent);
+                let protect = reserve > 0.0 && scores.iter().any(|(left, _)| left.is_some_and(|v| v >= reserve));
+                // This is an admission preference, not a cooldown: never refuse usable
+                // accounts merely because all are below the reserve (or quota is unknown).
+                let eligible = |i: usize| !protect || scores[i].0.is_some_and(|left| left >= reserve);
+                let best = (0..scores.len()).filter(|&i| eligible(i)).map(|i| scores[i].1).fold(0.0, f64::max);
+                let tied: Vec<_> = (0..scores.len()).filter(|&i| eligible(i) && scores[i].1 >= best - 1e-9).collect();
+                let mut cur = self.cursor.lock();
+                let c = cur.entry(model.to_ascii_lowercase()).or_insert(0);
+                let i = tied[*c % tied.len()];
+                *c = c.wrapping_add(1);
+                i
+            }
             Routing::LeastUsed => {
                 // Most headroom in its tightest usage window; near-ties take turns.
                 let scores: Vec<f64> = candidates
@@ -1163,6 +1227,95 @@ mod tests {
     use super::*;
 
     #[test]
+    fn smart_quota_prefers_earlier_renewals_and_respects_availability() {
+        use crate::quota::{Quota, Window};
+        use chrono::Duration;
+        let cfg = Config {
+            auth_dir: "/nonexistent".into(),
+            claude_api_key: ["cybex", "itpals", "digitalbrain"]
+                .map(|key| crate::config::KeyEntry { api_key: key.into(), ..Default::default() })
+                .to_vec(),
+            ..Default::default()
+        };
+        let pool = Pool::default();
+        pool.reload(&cfg);
+        let accounts = pool.accounts.read().clone();
+        let now = Utc::now();
+        for (account, (hours, used)) in accounts.iter().zip([(82, 33.0), (104, 71.0), (129, 16.0)]) {
+            account.state.lock().quota = Quota {
+                windows: vec![
+                    Window { name: "week".into(), used, resets_at: Some(now + Duration::hours(hours)), model: None },
+                    Window { name: "5h".into(), used: 0.0, resets_at: Some(now + Duration::hours(1)), model: None },
+                ],
+                updated_at: Some(now),
+                ..Default::default()
+            };
+        }
+        let pick = |routing, exclude: &[String], pinned| match pool.pick(
+            "claude-sonnet-4-6",
+            exclude,
+            &Config { routing, ..cfg.clone() },
+            pinned,
+            None,
+            &HashMap::new(),
+        ) {
+            Pick::Ok(a, _) => a.id.clone(),
+            _ => panic!("expected available account"),
+        };
+        let strategy = Routing::SmartQuota;
+        assert_eq!(pick(Routing::LeastUsed, &[], None), accounts[2].id);
+        for _ in 0..4 {
+            assert_eq!(pick(strategy, &[], None), accounts[0].id);
+        }
+        assert_eq!(pick(strategy, &[], Some(accounts[2].id.as_str())), accounts[2].id);
+        assert_eq!(pick(strategy, &[accounts[0].id.clone()], None), accounts[1].id);
+        accounts[0].state.lock().disabled = true;
+        assert_eq!(pick(strategy, &[], None), accounts[1].id);
+        accounts[0].state.lock().disabled = false;
+        // A 5-hour limit blocks selection even when the weekly reset is earliest.
+        accounts[0].state.lock().quota.windows[1].used = 100.0;
+        assert_eq!(pick(strategy, &[], None), accounts[1].id);
+        accounts[0].state.lock().quota.windows[1].used = 0.0;
+        accounts[0].state.lock().quota.windows[0].used = 100.0;
+        assert_eq!(pick(strategy, &[], None), accounts[1].id);
+        accounts[0].state.lock().quota.windows[0].used = 33.0;
+        // Past and unknown weekly resets must not beat a known future reset.
+        accounts[0].state.lock().quota.windows[0].resets_at = Some(now - Duration::hours(1));
+        accounts[2].state.lock().quota.windows[0].resets_at = None;
+        assert_eq!(pick(strategy, &[], None), accounts[1].id);
+        // Equal dates break ties by 5-hour headroom.
+        accounts[1].state.lock().quota.windows[1].used = 10.0;
+        accounts[0].state.lock().quota.windows[0].resets_at = Some(now + Duration::hours(104));
+        assert_eq!(pick(strategy, &[], None), accounts[0].id);
+        // Without weekly dates, use 5-hour headroom instead.
+        accounts[0].state.lock().quota.windows[1].used = 20.0;
+        for account in &accounts {
+            account.state.lock().quota.windows[0].resets_at = None;
+        }
+        assert_eq!(pick(strategy, &[], None), accounts[2].id);
+    }
+
+    #[test]
+    fn request_load_survives_account_reload_and_is_released() {
+        let mut cfg = Config {
+            auth_dir: "/nonexistent".into(),
+            codex_api_key: vec![crate::config::KeyEntry { api_key: "a".into(), ..Default::default() }],
+            ..Default::default()
+        };
+        let pool = Pool::default();
+        pool.reload(&cfg);
+        let old = pool.all()[0].clone();
+        let request = RequestLoad::new(&old);
+        cfg.codex_api_key[0].headers.insert("test-header".into(), "value".into());
+        pool.reload(&cfg); // changed shape replaces the Arc<Account>
+        let new = pool.all()[0].clone();
+        assert!(!Arc::ptr_eq(&old, &new));
+        assert_eq!(new.state.lock().active_requests.load(Ordering::Relaxed), 1);
+        drop(request);
+        assert_eq!(new.state.lock().active_requests.load(Ordering::Relaxed), 0);
+    }
+
+    #[test]
     fn aggregator_names_stay_with_aggregators() {
         assert!(Provider::Gemini.serves("gemini-3.8-flash"));
         assert!(!Provider::Gemini.serves("gemini-3.8-flash-high"));
@@ -1189,9 +1342,9 @@ mod tests {
         let claude = Only::Provider(Provider::Claude);
         assert_eq!(pool.route("claude/claude-opus-5-5"), (Some(claude.clone()), "claude-opus-5-5".into()));
         assert_eq!(pool.route("moonshotai/kimi-k3"), (None, "moonshotai/kimi-k3".into()));
-        assert!(matches!(pool.pick("claude-opus-5-5", &[], Routing::RoundRobin, None, Some(&claude)), Pick::Ok(..)));
+        assert!(matches!(pool.pick("claude-opus-5-5", &[], &cfg, None, Some(&claude), &HashMap::new()), Pick::Ok(..)));
         let codex = Only::Provider(Provider::Codex);
-        assert!(matches!(pool.pick("claude-opus-5-5", &[], Routing::RoundRobin, None, Some(&codex)), Pick::None));
+        assert!(matches!(pool.pick("claude-opus-5-5", &[], &cfg, None, Some(&codex), &HashMap::new()), Pick::None));
     }
 
     #[test]
@@ -1234,13 +1387,13 @@ claude-api-key:
         pool.reload(&cfg);
         let team = Only::Prefix("team".into());
         assert_eq!(pool.route("team/claude-opus-5-5"), (Some(team.clone()), "claude-opus-5-5".into()));
-        let Pick::Ok(a, _) = pool.pick("claude-opus-5-5", &[], Routing::RoundRobin, None, Some(&team)) else {
+        let Pick::Ok(a, _) = pool.pick("claude-opus-5-5", &[], &cfg, None, Some(&team), &HashMap::new()) else {
             panic!()
         };
         assert_eq!(a.prefix.as_deref(), Some("team"));
         // Unprefixed: the team key is reserved and the plain key excludes opus.
-        assert!(matches!(pool.pick("claude-opus-5-5", &[], Routing::RoundRobin, None, None), Pick::None));
-        assert!(matches!(pool.pick("claude-sonnet-5-5", &[], Routing::RoundRobin, None, None), Pick::Ok(..)));
+        assert!(matches!(pool.pick("claude-opus-5-5", &[], &cfg, None, None, &HashMap::new()), Pick::None));
+        assert!(matches!(pool.pick("claude-sonnet-5-5", &[], &cfg, None, None, &HashMap::new()), Pick::Ok(..)));
         let models: Vec<String> = pool.models().into_iter().map(|(m, _)| m).collect();
         assert!(models.contains(&"team/claude-opus-5-5".to_string()));
         assert!(!models.contains(&"claude-opus-5-5".to_string()));

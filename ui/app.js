@@ -489,6 +489,7 @@ function meterHTML(w, label) {
 }
 
 const ROUTING = {
+  'smart-quota': 'New sessions balance weekly resets, 5-hour quota and account load',
   'least-used': 'New sessions use the account with the most quota left',
   'round-robin': 'New sessions take turns across accounts',
   'fill-first': 'New sessions use the first available account',
@@ -622,7 +623,7 @@ function codeClass(s) {
   return 'code-200';
 }
 
-const ROUTING_LABEL = { 'least-used': 'Least-used', 'round-robin': 'Round-robin', 'fill-first': 'Fill-first' };
+const ROUTING_LABEL = { 'least-used': 'Least-used', 'smart-quota': 'Smart quota balancing', 'soonest-reset': 'Soonest weekly reset', 'round-robin': 'Round-robin', 'fill-first': 'Fill-first' };
 const ROUTING_REASON = {
   new_session: 'New session',
   session_reused: 'Same session',

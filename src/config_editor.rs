@@ -152,6 +152,7 @@ fn setting_path(doc: &Yaml, field: &str) -> (Vec<Value>, bool) {
         "request-retry" => &["routing", "retry", "request-retry"],
         "force-model-prefix" => &["routing", "force-model-prefix"],
         "session-affinity" => &["routing", "session-affinity"],
+        "five-hour-reserve-percent" => &["routing", "five-hour-reserve-percent"],
         "proxy-url" => &["requests", "proxy-url"],
         "oauth-model-alias" => &["oauth", "model-alias"],
         "oauth-excluded-models" => &["oauth", "excluded-models"],
@@ -450,8 +451,15 @@ fn validate(values: &Value, changes: &Map<String, Value>) -> Result<()> {
                 "Account attempts must be a nonnegative whole number"
             ),
             "routing" => ensure!(
-                matches!(value.as_str(), Some("least-used" | "round-robin" | "fill-first")),
+                matches!(
+                    value.as_str(),
+                    Some("least-used" | "smart-quota" | "soonest-reset" | "round-robin" | "fill-first")
+                ),
                 "Choose a valid routing strategy"
+            ),
+            "five-hour-reserve-percent" => ensure!(
+                value.as_u64().is_some_and(|n| n <= 100),
+                "5-hour reserve must be a whole percentage between 0 and 100"
             ),
             "host" => ensure!(
                 value.as_str().is_some_and(|h| h.is_empty() || h.parse::<std::net::IpAddr>().is_ok()),
@@ -743,6 +751,46 @@ mod tests {
             assert_eq!(cfg.port, 9000);
             assert_eq!(cfg.claude_api_key.len(), 2);
             assert_eq!(Config::parse(&out).unwrap().claude_api_key[1].api_key, "second");
+        }
+    }
+
+    #[test]
+    fn smart_quota_round_trips_in_both_config_layouts() {
+        for source in
+            ["routing: least-used\n", "config-version: 8\nrouting:\n  strategy: least-used\n  session-affinity: true\n"]
+        {
+            let (out, cfg) = edit(source, json!({"routing": "smart-quota", "five-hour-reserve-percent": 40}));
+            assert_eq!(cfg.routing, crate::config::Routing::SmartQuota);
+            assert_eq!(cfg.five_hour_reserve_percent, 40);
+            assert_eq!(Config::parse(&out).unwrap().five_hour_reserve_percent, 40);
+            if source.contains("config-version") {
+                assert_eq!(yaml(&out).unwrap()["routing"]["five-hour-reserve-percent"].as_u64(), Some(40));
+            }
+            assert_eq!(Config::parse(&out).unwrap().routing, cfg.routing);
+            assert_eq!(values(&out).unwrap()["routing"], "smart-quota");
+            assert!(cfg.session_affinity);
+        }
+    }
+
+    #[test]
+    fn smart_quota_alias_defaults_and_reserve_validation() {
+        assert_eq!(Config::default().five_hour_reserve_percent, 30);
+        for source in ["routing: soonest-reset\n", "routing:\n  strategy: soonest-reset\n"] {
+            let cfg = Config::parse(source).unwrap();
+            assert_eq!(cfg.routing, crate::config::Routing::SmartQuota);
+            assert_eq!(values(source).unwrap()["routing"], "smart-quota");
+        }
+        for invalid in [json!(-1), json!(101), json!(30.5), json!("30"), Value::Null] {
+            assert!(apply("", json!({"five-hour-reserve-percent": invalid}).as_object().unwrap()).is_err());
+            assert!(Config::parse(&format!("five-hour-reserve-percent: {invalid}\n")).is_err());
+            assert!(
+                Config::parse(&format!("routing:\n  strategy: smart-quota\n  five-hour-reserve-percent: {invalid}\n"))
+                    .is_err()
+            );
+        }
+        for value in [0, 30, 100] {
+            let (_, cfg) = edit("", json!({"five-hour-reserve-percent": value}));
+            assert_eq!(cfg.five_hour_reserve_percent, value);
         }
     }
 
