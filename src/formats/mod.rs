@@ -651,6 +651,39 @@ mod tests {
     }
 
     #[test]
+    fn claude_drops_sampling_and_forced_tools_the_model_rejects() {
+        let body = json!({
+            "model": "x", "temperature": 0.2, "parallel_tool_calls": false,
+            "tool_choice": { "type": "function", "function": { "name": "read_file" } },
+            "tools": [{ "type": "function", "function": { "name": "read_file", "parameters": { "type": "object" } } }],
+            "messages": [{ "role": "user", "content": "hi" }]
+        });
+        let req = parse_request(Format::Chat, &body).unwrap();
+        for model in ["claude-opus-5-5", "claude-sonnet-5-5", "claude-fable-5-1"] {
+            let out = claude::build_request(&req, model);
+            assert!(out["temperature"].is_null(), "{model}");
+            assert_eq!(out["tool_choice"], json!({ "type": "auto", "disable_parallel_tool_use": true }), "{model}");
+        }
+        // Opus 4.8 keeps forced tools but rejects sampling; Sonnet 4.6 accepts both.
+        let opus = claude::build_request(&req, "claude-opus-4-8");
+        assert!(opus["temperature"].is_null());
+        assert_eq!(opus["tool_choice"]["name"], "read_file");
+        let sonnet = claude::build_request(&req, "claude-sonnet-4-6");
+        assert_eq!(sonnet["temperature"], 0.2);
+        assert_eq!(sonnet["tool_choice"]["type"], "tool");
+        assert_eq!(sonnet["tool_choice"]["disable_parallel_tool_use"], true);
+
+        // With thinking on, a forced choice becomes auto but keeps the parallel-call limit.
+        let mut thinking = body.clone();
+        thinking["reasoning_effort"] = "high".into();
+        let req = parse_request(Format::Chat, &thinking).unwrap();
+        let out = claude::build_request(&req, "claude-sonnet-4-6");
+        assert_eq!(out["thinking"]["type"], "adaptive");
+        assert!(out["temperature"].is_null());
+        assert_eq!(out["tool_choice"], json!({ "type": "auto", "disable_parallel_tool_use": true }));
+    }
+
+    #[test]
     fn codex_stream_aggregates_reasoning_text_and_tools() {
         let mut p = parser(Format::Responses);
         let mut evs = Vec::new();

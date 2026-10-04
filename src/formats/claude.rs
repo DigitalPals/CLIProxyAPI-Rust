@@ -185,6 +185,19 @@ pub fn uses_budget_thinking(model: &str) -> bool {
         || m == "claude-sonnet-4"
 }
 
+/// Opus 4.7 and later, Sonnet 5 and later, Fable and Mythos reject `temperature`
+/// and `top_p` (Sonnet 5.5 any non-default value), so they are left out.
+fn rejects_sampling(model: &str) -> bool {
+    let m = model.to_ascii_lowercase();
+    ["opus-4-7", "opus-4-8", "opus-5", "sonnet-5", "fable", "mythos"].iter().any(|k| m.contains(k))
+}
+
+/// Models that reject forced tool use (`tool_choice` `any` or `tool`) even with thinking off.
+fn rejects_forced_tool_use(model: &str) -> bool {
+    let m = model.to_ascii_lowercase();
+    ["opus-5-5", "sonnet-5-5", "fable-5-1", "mythos-5-1"].iter().any(|k| m.contains(k))
+}
+
 pub fn default_max_tokens(model: &str) -> u64 {
     let m = model.to_ascii_lowercase();
     if m.contains("claude-3") {
@@ -351,15 +364,17 @@ pub fn build_request(req: &Request, model: &str) -> Value {
             ToolChoice::Tool(n) => json!({ "type": "tool", "name": n }),
             _ => json!({ "type": "auto" }),
         };
+        // Forced tool use is incompatible with thinking, and the newest models refuse it
+        // outright. Let the model choose instead, keeping any limit on parallel calls.
+        if tc["type"] != "auto" && (thinking_on || rejects_forced_tool_use(model)) {
+            tc = json!({ "type": "auto" });
+        }
         if req.parallel_tool_calls == Some(false) {
             tc["disable_parallel_tool_use"] = true.into();
         }
-        // Forced tool use is incompatible with extended thinking.
-        if !(thinking_on && tc["type"] != "auto") {
-            o.insert("tool_choice".into(), tc);
-        }
+        o.insert("tool_choice".into(), tc);
     }
-    if !thinking_on {
+    if !thinking_on && !rejects_sampling(model) {
         if let Some(t) = req.temperature {
             o.insert("temperature".into(), t.clamp(0.0, 1.0).into());
         } else if let Some(p) = req.top_p {
