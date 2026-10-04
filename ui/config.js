@@ -138,7 +138,7 @@ function configRoutingHTML() {
   const strategy = configGet(['routing']);
   const what = configGet(['session-affinity']) ? 'new sessions' : 'requests';
   const help = { 'least-used': `Send ${what} to the account with the most subscription quota remaining. Falls back to round robin when quota is unavailable.`,
-    'smart-quota': `Prefer accounts whose weekly quota resets sooner, while considering 5-hour quota remaining and ${configGet(['session-affinity']) ? 'recently active sessions and requests in progress. Existing sessions stay on their account while it remains available.' : 'requests in progress. With session affinity off, each request is balanced independently.'}`,
+    'smart-quota': `Spread ${what} by quota left and current load, favouring accounts whose weekly limit renews sooner and avoiding ones nearly out of their week.`,
     'round-robin': `Rotate ${what} across available accounts.`, 'fill-first': `Send ${what} to the first available account until it cannot serve them, then the next.` }[strategy];
   return `<h2>Routing</h2><div class="cfg-grid">
     ${configSelect(['routing'], 'Account selection', [['least-used', 'Most quota remaining'], ['smart-quota', 'Smart quota balancing'], ['round-robin', 'Round robin'], ['fill-first', 'Fill first']], { help })}

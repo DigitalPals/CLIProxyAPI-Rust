@@ -1178,7 +1178,10 @@ impl Pool {
                         // reported. The reserve below still applies only to real 5-hour data.
                         let headroom =
                             remaining.or_else(|| st.quota.remaining(upstream)).unwrap_or(crate::quota::UNKNOWN);
-                        let weight = headroom * renewal / (1.0 + load as f64);
+                        // Sessions on an account nearly out of its weekly allowance would soon
+                        // have to move and lose their cache: fade over the last quarter.
+                        let weekly = st.quota.weekly_remaining(upstream).map_or(1.0, |left| (left / 25.0).min(1.0));
+                        let weight = headroom * renewal * weekly / (1.0 + load as f64);
                         (remaining, weight)
                     })
                     .collect();
@@ -1293,6 +1296,41 @@ mod tests {
             account.state.lock().quota.windows[0].resets_at = None;
         }
         assert_eq!(pick(strategy, &[], None), accounts[2].id);
+    }
+
+    #[test]
+    fn smart_quota_avoids_accounts_nearly_out_of_their_week() {
+        use crate::quota::{Quota, Window};
+        use chrono::Duration;
+        let cfg = Config {
+            auth_dir: "/nonexistent".into(),
+            claude_api_key: ["a", "b"]
+                .map(|key| crate::config::KeyEntry { api_key: key.into(), ..Default::default() })
+                .to_vec(),
+            routing: Routing::SmartQuota,
+            ..Default::default()
+        };
+        let pool = Pool::default();
+        pool.reload(&cfg);
+        let accounts = pool.accounts.read().clone();
+        let now = Utc::now();
+        // An earlier renewal must not outweigh a week that is almost used up.
+        for (account, (days, used)) in accounts.iter().zip([(2, 98.0), (6, 0.0)]) {
+            account.state.lock().quota = Quota {
+                windows: vec![
+                    Window { name: "week".into(), used, resets_at: Some(now + Duration::days(days)), model: None },
+                    Window { name: "5h".into(), used: 0.0, resets_at: Some(now + Duration::hours(1)), model: None },
+                ],
+                updated_at: Some(now),
+                ..Default::default()
+            };
+        }
+        for _ in 0..4 {
+            match pool.pick("claude-sonnet-4-6", &[], &cfg, None, None, &HashMap::new()) {
+                Pick::Ok(a, _) => assert_eq!(a.id, accounts[1].id),
+                _ => panic!("expected available account"),
+            }
+        }
     }
 
     #[test]

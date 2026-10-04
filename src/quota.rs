@@ -18,6 +18,9 @@ const CODEX_USAGE: &str = "https://chatgpt.com/backend-api/wham/usage";
 /// Accounts without quota data count as half used.
 pub const UNKNOWN: f64 = 50.0;
 const POLL_EVERY: i64 = 5 * 60;
+/// Response headers keep a busy account's shared windows current, so the usage endpoint
+/// is only needed now and then, for the model-specific windows headers don't carry.
+const BUSY_POLL_EVERY: i64 = 30 * 60;
 /// Banked resets change rarely; opening the dashboard panel checks on demand.
 const RESET_POLL_EVERY: i64 = 30 * 60;
 
@@ -42,6 +45,11 @@ pub struct Quota {
     pub refreshed_at: Option<DateTime<Utc>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub plan: Option<String>,
+    /// Usage-endpoint checks in a row that brought no data, and when the last one ran.
+    #[serde(skip)]
+    pub(crate) check_failures: u32,
+    #[serde(skip)]
+    pub(crate) checked_at: Option<DateTime<Utc>>,
 }
 
 impl Quota {
@@ -79,6 +87,14 @@ impl Quota {
         Some(100.0 - used.clamp(0.0, 100.0))
     }
 
+    /// Allowance left in the tightest weekly window that applies to `model` (None = no data).
+    pub fn weekly_remaining(&self, model: &str) -> Option<f64> {
+        self.live(model)
+            .filter(|w| w.name.starts_with("week"))
+            .map(|w| 100.0 - w.used.clamp(0.0, 100.0))
+            .reduce(f64::min)
+    }
+
     /// Headroom in the tightest known applicable window, for accounts without 5-hour data.
     pub fn remaining(&self, model: &str) -> Option<f64> {
         let lower = model.to_ascii_lowercase();
@@ -90,7 +106,21 @@ impl Quota {
     }
 
     fn needs_refresh(&self, now: DateTime<Utc>) -> bool {
-        self.refreshed_at.is_none_or(|t| (now - t).num_seconds() >= POLL_EVERY)
+        // A check that brought no data waits 2, 4, 8 ... up to 30 minutes before the next.
+        if self.check_failures > 0
+            && let Some(at) = self.checked_at
+            && (now - at).num_seconds() < (60i64 << self.check_failures.min(5)).min(BUSY_POLL_EVERY)
+        {
+            return false;
+        }
+        let Some(refreshed) = self.refreshed_at else { return true };
+        let busy = self.updated_at.is_some_and(|u| u > refreshed && (now - u).num_seconds() < POLL_EVERY);
+        (now - refreshed).num_seconds() >= if busy { BUSY_POLL_EVERY } else { POLL_EVERY }
+    }
+
+    fn checked(&mut self, now: DateTime<Utc>, refreshed: bool) {
+        self.checked_at = Some(now);
+        self.check_failures = if refreshed { 0 } else { self.check_failures.saturating_add(1) };
     }
 
     /// A window that is used up, and when it resets.
@@ -355,7 +385,14 @@ pub async fn poller(app: Arc<App>) {
             if !stale || crate::oauth::ensure_fresh(&app, &acct, chrono::Duration::minutes(5), false).await.is_err() {
                 continue;
             }
-            match poll(&app, &acct).await {
+            let before = acct.state.lock().quota.refreshed_at;
+            let result = poll(&app, &acct).await;
+            {
+                let mut st = acct.state.lock();
+                let refreshed = st.quota.refreshed_at.is_some() && st.quota.refreshed_at != before;
+                st.quota.checked(Utc::now(), refreshed);
+            }
+            match result {
                 Ok(()) => changed = true,
                 Err(e) => tracing::debug!(account = %acct.label, "quota check failed: {e:#}"),
             }
@@ -408,7 +445,7 @@ mod tests {
     }
 
     #[test]
-    fn partial_observations_do_not_postpone_usage_refresh() {
+    fn partial_observations_only_slow_the_usage_refresh() {
         let cfg = crate::config::Config {
             auth_dir: "/nonexistent".into(),
             codex_api_key: vec![crate::config::KeyEntry { api_key: "a".into(), ..Default::default() }],
@@ -438,7 +475,9 @@ mod tests {
         {
             let st = acct.state.lock();
             assert_eq!(st.quota.refreshed_at, Some(refreshed));
-            assert!(st.quota.needs_refresh(refreshed + chrono::Duration::seconds(POLL_EVERY)));
+            // A busy account still refreshes its model-specific windows, just less often.
+            assert!(!st.quota.needs_refresh(refreshed + chrono::Duration::seconds(POLL_EVERY)));
+            assert!(st.quota.needs_refresh(refreshed + chrono::Duration::seconds(BUSY_POLL_EVERY)));
             assert_eq!(st.quota.windows.len(), 2); // WebSocket update also retains the weekly window
             assert_eq!(st.quota.five_hour_remaining("gpt-6.1-sol"), Some(5.0));
         }
@@ -449,6 +488,27 @@ mod tests {
         usage(&mut st, Provider::Codex, &usage_value);
         assert!(!st.quota.needs_refresh(Utc::now()));
         assert_eq!(st.quota.five_hour_remaining("gpt-6.1-sol"), Some(5.0));
+    }
+
+    #[test]
+    fn usage_checks_that_bring_no_data_back_off() {
+        let now = Utc::now();
+        let mut q = Quota::default();
+        assert!(q.needs_refresh(now));
+        q.checked(now, false);
+        assert!(!q.needs_refresh(now + chrono::Duration::seconds(119)));
+        assert!(q.needs_refresh(now + chrono::Duration::seconds(120)));
+        for _ in 0..10 {
+            q.checked(now, false);
+        }
+        assert!(!q.needs_refresh(now + chrono::Duration::seconds(BUSY_POLL_EVERY - 1)));
+        assert!(q.needs_refresh(now + chrono::Duration::seconds(BUSY_POLL_EVERY)));
+        // A successful check ends the backoff; a banked reset can still force the next one.
+        q.refreshed_at = Some(now);
+        q.checked(now, true);
+        assert!(q.needs_refresh(now + chrono::Duration::seconds(POLL_EVERY)));
+        q.refreshed_at = None;
+        assert!(q.needs_refresh(now));
     }
 
     #[test]

@@ -156,7 +156,7 @@ struct Registry {
 impl Registry {
     fn account_load(&self, cfg: &Config) -> HashMap<String, usize> {
         let mut load = HashMap::new();
-        if cfg.routing != Routing::SmartQuota || !cfg.session_affinity {
+        if !weighs_session_load(cfg) {
             return load;
         }
         let cutoff = Utc::now().timestamp()
@@ -170,6 +170,10 @@ impl Registry {
         }
         load
     }
+}
+
+fn weighs_session_load(cfg: &Config) -> bool {
+    cfg.routing == Routing::SmartQuota && cfg.session_affinity
 }
 
 pub struct Sessions {
@@ -411,8 +415,9 @@ impl Sessions {
         pinned: Option<&str>,
         only: Option<&Only>,
     ) -> Pick {
-        let registry = self.registry.lock();
-        pool.pick(model, exclude, cfg, pinned, only, &registry.account_load(cfg))
+        // Only smart quota balancing weighs session load; other strategies skip the registry.
+        let load = if weighs_session_load(cfg) { self.registry.lock().account_load(cfg) } else { HashMap::new() };
+        pool.pick(model, exclude, cfg, pinned, only, &load)
     }
 
     fn prune_locked(registry: &mut Registry, idle: u64) {

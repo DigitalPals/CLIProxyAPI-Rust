@@ -623,7 +623,7 @@ function codeClass(s) {
   return 'code-200';
 }
 
-const ROUTING_LABEL = { 'least-used': 'Least-used', 'smart-quota': 'Smart quota balancing', 'soonest-reset': 'Soonest weekly reset', 'round-robin': 'Round-robin', 'fill-first': 'Fill-first' };
+const ROUTING_LABEL = { 'least-used': 'Least-used', 'smart-quota': 'Smart quota balancing', 'round-robin': 'Round-robin', 'fill-first': 'Fill-first' };
 const ROUTING_REASON = {
   new_session: 'New session',
   session_reused: 'Same session',

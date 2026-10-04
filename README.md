@@ -293,26 +293,14 @@ openai-compatibility:
 
 Requests from one coding session stay on the account the session started on, so the provider's prompt cache keeps working. `routing` picks the account for each new session. A session moves only when its subscription runs out of quota, or its account is disabled, removed or can't serve the model, and the replacement then keeps it. When its account is only busy (a rate limit, an overload, a failed attempt), that request is answered by another account and the session goes back afterwards. Turn this off with `session-affinity: false` (`routing.session-affinity` in a CLIProxyAPI v8 file).
 
-Choose **Config → Routing → Account selection → Smart quota balancing** to prefer earlier weekly renewals while spreading new coding sessions across accounts with capacity. Set **5-hour reserve for existing sessions (%)** (default **30%**) to steer new work away from accounts below that remaining allowance. This is a soft reserve: if every eligible account is below it or has unknown 5-hour quota, routing still uses available quota. Existing sessions stay on their account until the normal failover rules apply, even below the reserve.
+**Smart quota balancing** (`routing: smart-quota`, or **Config → Routing → Account selection**) spreads new sessions by quota left and current load, and favours accounts whose weekly limit renews sooner, so allowance that would expire unused gets used first. An account nearly out of its week is avoided, since its sessions would soon have to move. The **5-hour reserve** keeps new sessions off accounts with less than that share of their 5-hour limit left, so the sessions already there can finish; when every account is below it, they all compete again. Existing sessions never move because of it.
 
 ```yaml
 routing: smart-quota
-five-hour-reserve-percent: 30 # 0 disables the reserve; whole percentages from 0 to 100
-session-affinity: true
+five-hour-reserve-percent: 30 # 0 turns the reserve off; other strategies ignore it
 ```
 
-In a v8 file, put `strategy: smart-quota` and `five-hour-reserve-percent: 30` under `routing`. The earlier `soonest-reset` strategy name is accepted as an alias for smart balancing. Other strategies ignore the reserve. Settings apply without a restart.
-
-Smart balancing works as follows:
-
-- Model/provider restrictions, disabled accounts, exhausted windows (including model-specific quotas), and cooldowns still apply before balancing.
-- If any eligible account has known 5-hour quota at or above the reserve, accounts below it or with unknown 5-hour quota sit out **new assignments**. Otherwise all eligible accounts compete.
-- Among those accounts, the selection weight is `remaining allowance × weekly renewal preference / (1 + load)`. Remaining allowance uses the 5-hour window when known; otherwise it uses the tightest known applicable window (for example, weekly allowance). Only accounts with no applicable quota data use 50% for ranking. This fallback does not turn weekly allowance into a 5-hour reserve. The renewal preference rises linearly from 1 at seven days away to 2 at reset time; missing or expired weekly dates use 1. An elapsed known window is treated as replenished. Equal weights take turns.
-- Partial HTTP or WebSocket quota updates preserve omitted windows and their renewal dates. Expired windows no longer restrict routing. Full usage refreshes remain due every five minutes regardless of response traffic; the background worker checks once a minute.
-- Load is the larger of recently active session count and requests in progress, so the same work is not charged twice. A session counts once per account if it was used within five minutes or still has a request in progress. New assignments count immediately under the same lock used for selection, preventing simultaneous session starts from all selecting an idle account. Old idle assignments remain pinned but no longer reserve load; explicitly ended sessions release it immediately.
-- Without session affinity or a stable session identifier, requests still use the reserve and current request load. Session assignments are only counted while affinity is enabled. Account request load includes HTTP, streaming and native WebSocket requests, and is released on completion, cancellation or retry to another account.
-
-This is a routing heuristic, not a guarantee that sessions will finish before quota runs out. It uses observed quota and current load; it does not forecast future consumption or proactively move existing sessions.
+In a v8 file both go under `routing` (`strategy: smart-quota`).
 
 Sessions are recognised from what clients already send: Claude Code's session metadata, Codex's `session_id` and `thread-id` headers, a Responses `conversation` id or `prompt_cache_key`. Writing your own client? Send one stable `x-cliproxy-session-id` per task. Each client API key has its own sessions. Requests without any of these are routed one by one, and a WebSocket without one keeps its account for the connection.
 
