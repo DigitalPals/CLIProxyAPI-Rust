@@ -181,15 +181,21 @@ async fn mock_chat(State(mock): State<Arc<Mock>>, headers: HeaderMap, Json(body)
 
 async fn mock_ws(State(mock): State<Arc<Mock>>, headers: HeaderMap, upgrade: WebSocketUpgrade) -> Response {
     let account = account(&headers);
-    upgrade.on_upgrade(move |mut socket| async move {
+    upgrade.on_upgrade(move |socket| async move {
         mock.ws_connections.fetch_add(1, Ordering::Relaxed);
         if matches!(*mock.ws_mode.lock(), WsMode::DropOnHandshake) {
             return;
         }
+        let (mut tx, mut rx) = socket.split();
         let mut control = mock.ws_control.lock().take();
         let mut known = std::collections::HashSet::<String>::new();
+        let mut flooding = false;
+        let mut flood_announced = false;
         loop {
             let message = tokio::select! {
+                // The provider must still read and answer requests while sending idle frames.
+                biased;
+                message = rx.next() => message,
                 command = async {
                     match &mut control {
                         Some(control) => control.commands.recv().await,
@@ -198,29 +204,18 @@ async fn mock_ws(State(mock): State<Arc<Mock>>, headers: HeaderMap, upgrade: Web
                 } => {
                     match command {
                         Some(WsCommand::Ping(data)) => {
-                            if socket.send(Message::Ping(data.into())).await.is_err() { return; }
+                            if tx.send(Message::Ping(data.into())).await.is_err() { return; }
                         }
                         Some(WsCommand::Data(value)) => {
-                            if socket.send(Message::Text(value.to_string().into())).await.is_err() { return; }
+                            if tx.send(Message::Text(value.to_string().into())).await.is_err() { return; }
                         }
-                        Some(WsCommand::Flood) => {
-                            let mut first = true;
-                            loop {
-                                for _ in 0..64 {
-                                    if socket.feed(Message::Pong(vec![0; 16].into())).await.is_err() { return; }
-                                }
-                                if socket.flush().await.is_err() { return; }
-                                if first {
-                                    let _ = control.as_ref().unwrap().observations.send(WsObservation::Flooding);
-                                    first = false;
-                                }
-                            }
-                        }
+                        Some(WsCommand::Flood) => flooding = true,
                         Some(WsCommand::Close) => {
-                            if socket.send(Message::Close(None)).await.is_err() { return; }
+                            if tx.send(Message::Close(None)).await.is_err() { return; }
                         }
                         Some(WsCommand::Drop) => {
-                            drop(socket);
+                            drop(tx);
+                            drop(rx);
                             let _ = control.as_ref().unwrap().observations.send(WsObservation::Dropped);
                             return;
                         }
@@ -228,7 +223,19 @@ async fn mock_ws(State(mock): State<Arc<Mock>>, headers: HeaderMap, upgrade: Web
                     }
                     continue;
                 }
-                message = socket.next() => message,
+                result = async {
+                    for _ in 0..64 {
+                        tx.feed(Message::Pong(vec![0; 16].into())).await?;
+                    }
+                    tx.flush().await
+                }, if flooding => {
+                    if result.is_err() { return; }
+                    if !flood_announced {
+                        let _ = control.as_ref().unwrap().observations.send(WsObservation::Flooding);
+                        flood_announced = true;
+                    }
+                    continue;
+                }
             };
             let text = match message {
                 Some(Ok(Message::Text(text))) => text,
@@ -239,7 +246,7 @@ async fn mock_ws(State(mock): State<Arc<Mock>>, headers: HeaderMap, upgrade: Web
                     continue;
                 }
                 Some(Ok(Message::Close(_))) => {
-                    let _ = socket.flush().await;
+                    let _ = tx.flush().await;
                     if let Some(control) = &control {
                         let _ = control.observations.send(WsObservation::Closed);
                     }
@@ -257,12 +264,12 @@ async fn mock_ws(State(mock): State<Arc<Mock>>, headers: HeaderMap, upgrade: Web
             mock.calls.lock().push((account.clone(), body.clone(), "ws"));
             if account == "a" && mock.mode.load(Ordering::Relaxed) == 1 {
                 let error = json!({"type":"error", "status":429, "error":{"code":"usage_limit_reached", "message":"mock error", "resets_in_seconds":3600}});
-                if socket.send(Message::Text(error.to_string().into())).await.is_err() { break; }
+                if tx.send(Message::Text(error.to_string().into())).await.is_err() { break; }
                 continue;
             }
             if let Some(prev) = body["previous_response_id"].as_str() && !known.contains(prev) {
                 let error = json!({"type":"error", "status":400, "error":{"code":"previous_response_not_found", "message":"unknown on this socket"}});
-                if socket.send(Message::Text(error.to_string().into())).await.is_err() { break; }
+                if tx.send(Message::Text(error.to_string().into())).await.is_err() { break; }
                 continue;
             }
             let mut response = completed(&mock, &account, &body);
@@ -277,7 +284,7 @@ async fn mock_ws(State(mock): State<Arc<Mock>>, headers: HeaderMap, upgrade: Web
                 output.truncate(2);
             }
             for event in output {
-                if socket.send(Message::Text(event.to_string().into())).await.is_err() { return; }
+                if tx.send(Message::Text(event.to_string().into())).await.is_err() { return; }
             }
             if partial {
                 return;
@@ -797,26 +804,34 @@ async fn native_websocket_busy_idle_upstream_does_not_starve_next_turn() {
     )
     .await
     .expect("continuous upstream frames starved a ready client turn");
-    assert_eq!(fixture.mock.ws_connections.load(Ordering::Relaxed), 2);
+    let connections = fixture.mock.ws_connections.load(Ordering::Relaxed);
+    assert!(matches!(connections, 1 | 2));
     let calls = fixture.mock.calls.lock();
     assert_eq!(calls.len(), 2);
-    assert!(calls[1].1["previous_response_id"].is_null());
-    assert_eq!(calls[1].1["input"].as_array().unwrap().len(), 3);
+    assert!(calls.iter().all(|(account, _, transport)| account == "a" && *transport == "ws"));
+    // TCP may leave fewer than the drain limit ready. Both healthy reuse and retirement are valid.
+    if connections == 1 {
+        assert_eq!(calls[1].1["previous_response_id"], first["id"]);
+        assert_eq!(calls[1].1["input"].as_array().unwrap().len(), 1);
+    } else {
+        assert!(calls[1].1["previous_response_id"].is_null());
+        assert_eq!(calls[1].1["input"].as_array().unwrap().len(), 3);
+    }
 }
 
 #[tokio::test]
-async fn native_websocket_failed_submission_is_reported_and_not_replayed_through_http() {
+async fn native_websocket_dropped_connection_reports_transport_failure_without_http_replay() {
     let fixture = Fixture::new(Routing::RoundRobin, true).await;
     *fixture.mock.ws_mode.lock() = WsMode::DropOnHandshake;
-    let mut socket = fixture.socket("failed-write").await;
-    // Exceed TCP buffering so a peer that drops without reading fails the send itself.
+    let mut socket = fixture.socket("dropped-upstream").await;
+    // The OS can report this disconnect during send or read, depending on TCP buffering.
     let body = json!({"type":"response.create", "model":"gpt-6.1-sol", "input":"x".repeat(16 * 1024 * 1024)});
     socket.send(tungstenite::Message::Text(body.to_string().into())).await.unwrap();
     let failure = ws_event(&mut socket).await;
     assert_eq!(failure["type"], "error", "failed submissions must not automatically replay");
     assert_eq!(failure["status"], 502);
     assert_eq!(failure["error"]["type"], "upstream_error");
-    assert!(failure["error"]["message"].as_str().unwrap().contains("send failed"));
+    assert!(failure["error"]["message"].as_str().unwrap().starts_with("codex websocket "));
     assert!(fixture.mock.calls.lock().is_empty(), "the request must not reach HTTP fallback");
     let logs = fixture.logs(1).await;
     assert_eq!(logs[0].status, 502);

@@ -654,16 +654,14 @@ mod tests {
         (WebSocketStream::from_raw_socket(socket, Role::Client, None).await, peer)
     }
 
-    #[tokio::test]
-    async fn ready_upstream_close_is_drained_before_submitting_next_turn() {
+    async fn buffered_upstream(buffer: Vec<u8>) -> (Session, WebSocketStream<tokio::net::TcpStream>) {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let client = tokio::net::TcpStream::connect(listener.local_addr().unwrap()).await.unwrap();
         let (server, _) = listener.accept().await.unwrap();
-        let mut peer = WebSocketStream::from_raw_socket(server, Role::Server, None).await;
-        // Buffered server Ping and normal Close make readiness independent of network scheduling.
+        let peer = WebSocketStream::from_raw_socket(server, Role::Server, None).await;
         let up = WebSocketStream::from_partially_read(
             tokio_tungstenite::MaybeTlsStream::Plain(client),
-            vec![0x89, 1, b'p', 0x88, 2, 0x03, 0xe8],
+            buffer,
             Role::Client,
             None,
         )
@@ -675,13 +673,41 @@ mod tests {
             ..Default::default()
         });
         let acct = pool.all().pop().unwrap();
-        let mut sess = Session {
+        let sess = Session {
             upstream: Some((acct, up)),
             upstream_responses: HashSet::from(["prior-response".into()]),
             upstream_quota_epoch: 7,
             key: Some("retained-session".into()),
             ..Default::default()
         };
+        (sess, peer)
+    }
+
+    #[tokio::test]
+    async fn ready_upstream_drain_stops_at_frame_budget() {
+        for frames in [MAX_IDLE_DRAIN - 1, MAX_IDLE_DRAIN, MAX_IDLE_DRAIN + 1] {
+            // Every Pong is already buffered, so TCP batching cannot change the ready-frame count.
+            let (mut sess, _peer) = buffered_upstream([0x8a, 0].repeat(frames)).await;
+            tokio::time::timeout(Duration::from_secs(1), drain_idle_upstream(&mut sess))
+                .await
+                .expect("a ready upstream drain must return within its frame budget");
+            if frames < MAX_IDLE_DRAIN {
+                assert!(sess.upstream.is_some());
+                assert!(sess.upstream_responses.contains("prior-response"));
+                assert_eq!(sess.upstream_quota_epoch, 7);
+            } else {
+                assert!(sess.upstream.is_none());
+                assert!(sess.upstream_responses.is_empty());
+                assert_eq!(sess.upstream_quota_epoch, 0);
+            }
+            assert_eq!(sess.key.as_deref(), Some("retained-session"));
+        }
+    }
+
+    #[tokio::test]
+    async fn ready_upstream_close_is_drained_before_submitting_next_turn() {
+        // Buffered server Ping and normal Close make readiness independent of network scheduling.
+        let (mut sess, mut peer) = buffered_upstream(vec![0x89, 1, b'p', 0x88, 2, 0x03, 0xe8]).await;
         tokio::time::timeout(Duration::from_secs(1), drain_idle_upstream(&mut sess)).await.unwrap();
         assert!(sess.upstream.is_none());
         assert!(sess.upstream_responses.is_empty());
