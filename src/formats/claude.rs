@@ -6,6 +6,10 @@ use super::{Frame, StreamParser, StreamRenderer, text_of};
 use crate::ir::*;
 use crate::sse::SseEvent;
 
+#[cfg(test)]
+#[path = "claude_thinking_tests.rs"]
+mod claude_thinking_tests;
+
 /// Foreign reasoning state rides in the thinking `signature` so Claude clients
 /// (Claude Code) send it back on the next turn.
 const CODEX_SIG: &str = "cpx-codex:";
@@ -207,8 +211,31 @@ fn image_block(img: &Image) -> Value {
     }
 }
 
+/// Map explicit disable requests to the lowest supported thinking configuration.
+/// Sonnet 5.5 can disable up-front thinking; Opus 5.5, Fable and Mythos cannot
+/// disable thinking, so use adaptive thinking at low effort instead.
+pub fn normalize_disabled_thinking(body: &mut Value, model: &str) {
+    if body["thinking"]["type"] != "disabled" {
+        return;
+    }
+    let model = model.to_ascii_lowercase();
+    if model.contains("sonnet-5-5") {
+        body["thinking"] = json!({ "type": "between_tools" });
+        // between_tools only accepts low, medium and high effort.
+        if matches!(body["output_config"]["effort"].as_str(), Some("xhigh" | "max")) {
+            body["output_config"]["effort"] = "high".into();
+        }
+    } else if model.contains("opus-5-5")
+        || model.contains("fable-5")
+        || model.contains("mythos-5")
+        || model.contains("mythos-preview")
+    {
+        body["thinking"] = json!({ "type": "adaptive" });
+        body["output_config"]["effort"] = "low".into();
+    }
+}
+
 pub fn build_request(req: &Request, model: &str) -> Value {
-    let mut thinking_on = false;
     let mut out = json!({ "model": model });
     let o = out.as_object_mut().unwrap();
 
@@ -223,7 +250,6 @@ pub fn build_request(req: &Request, model: &str) -> Value {
                 }
                 let budget = b.clamp(1024, max_tokens - 1024);
                 o.insert("thinking".into(), json!({ "type": "enabled", "budget_tokens": budget }));
-                thinking_on = true;
             }
         } else {
             let effort = match r.effort_level().as_deref() {
@@ -236,12 +262,17 @@ pub fn build_request(req: &Request, model: &str) -> Value {
             };
             o.insert("thinking".into(), json!({ "type": "adaptive" }));
             o.insert("output_config".into(), json!({ "effort": effort }));
-            thinking_on = true;
         }
     }
 
-    // Anthropic rejects a trailing tool_use turn without a signed thinking block when thinking is on.
-    if thinking_on {
+    normalize_disabled_thinking(&mut out, model);
+    let mut thinking_on = matches!(out["thinking"]["type"].as_str(), Some("enabled" | "adaptive" | "between_tools"));
+    let manual_thinking = out["thinking"]["type"] == "enabled";
+    let o = out.as_object_mut().unwrap();
+
+    // Only manual thinking requires a signed thinking block on the last tool turn.
+    // Adaptive thinking accepts unsigned history; keep its mode and effort stable.
+    if manual_thinking {
         let last_assistant = req.messages.iter().rev().find(|m| m.role == Role::Assistant);
         if let Some(m) = last_assistant {
             let has_tool = m.parts.iter().any(|p| matches!(p, Part::ToolCall { .. }));

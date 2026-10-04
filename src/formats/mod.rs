@@ -632,8 +632,9 @@ mod tests {
         assert_eq!(msgs[2]["content"][0]["type"], "tool_result");
         assert_eq!(msgs[2]["content"][0]["tool_use_id"], "call_1");
         assert_eq!(msgs[2]["content"][1]["text"], "thanks");
-        // An unsigned trailing tool_use turn forces thinking off.
-        assert_eq!(out["thinking"]["type"], "disabled");
+        // Adaptive thinking accepts unsigned tool history without changing effort.
+        assert_eq!(out["thinking"]["type"], "adaptive");
+        assert_eq!(out["output_config"]["effort"], "high");
     }
 
     #[test]
