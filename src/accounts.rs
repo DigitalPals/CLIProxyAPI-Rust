@@ -557,25 +557,28 @@ impl Account {
         let now = Utc::now();
         let mut cooldowns: BTreeMap<&str, String> =
             st.cooldowns.iter().filter(|(_, t)| **t > now).map(|(k, t)| (k.as_str(), t.to_rfc3339())).collect();
+        // Why each model is paused: a rate limit, spent subscription quota, or a quota check.
+        let mut kinds: BTreeMap<&str, &str> = cooldowns.keys().map(|k| (*k, "rate_limit")).collect();
         for (model, deadline) in &st.quota_cooldowns {
             if *deadline > now {
                 let value = deadline.to_rfc3339();
-                cooldowns
-                    .entry(model.as_str())
-                    .and_modify(|v| {
-                        if value > *v {
-                            *v = value.clone();
-                        }
-                    })
-                    .or_insert(value);
+                let later = cooldowns.get(model.as_str()).is_none_or(|v| value > *v);
+                if later {
+                    cooldowns.insert(model.as_str(), value);
+                    kinds.insert(model.as_str(), "quota");
+                }
             }
         }
         if st.quota_refreshing {
             cooldowns.insert("*", (now + chrono::Duration::seconds(30)).to_rfc3339());
+            kinds.insert("*", "checking");
         }
         // A used-up usage window blocks every model until it resets.
-        if let Some(t) = st.quota.exhausted_until("") {
-            cooldowns.entry("*").or_insert(t.to_rfc3339());
+        if let Some(t) = st.quota.exhausted_until("")
+            && !cooldowns.contains_key("*")
+        {
+            cooldowns.insert("*", t.to_rfc3339());
+            kinds.insert("*", "quota");
         }
         let (kind, expires, email) = match &*self.cred.read() {
             Credential::OAuth(o) if o.raw.contains_key("service_account") => ("service-account", None, o.email.clone()),
@@ -592,6 +595,7 @@ impl Account {
             "file": self.path.as_ref().and_then(|p| p.file_name()).map(|f| f.to_string_lossy().to_string()),
             "disabled": st.disabled,
             "cooldowns": cooldowns,
+            "cooldown_kinds": kinds,
             "last_error": st.last_error,
             "last_used": st.last_used.map(|t| t.to_rfc3339()),
             "expires_at": expires,
@@ -1153,38 +1157,35 @@ impl Pool {
         if candidates.iter().any(|(a, _)| a.first_party(model)) {
             candidates.retain(|(a, _)| a.first_party(model));
         }
-        let idx = match cfg.routing {
+        let idx = self.choose(&candidates, model, cfg, session_load, true);
+        let (a, m) = &candidates[idx];
+        Pick::Ok((*a).clone(), m.clone())
+    }
+
+    /// Which candidate the routing strategy takes. `advance` moves the turn-taking
+    /// cursor; without it this only reports who is next.
+    fn choose(
+        &self,
+        candidates: &[(&Arc<Account>, String)],
+        model: &str,
+        cfg: &Config,
+        session_load: &HashMap<String, usize>,
+        advance: bool,
+    ) -> usize {
+        let take_turn = |count: usize| {
+            let mut cur = self.cursor.lock();
+            let c = cur.entry(model.to_ascii_lowercase()).or_insert(0);
+            let turn = *c % count;
+            if advance {
+                *c = c.wrapping_add(1);
+            }
+            turn
+        };
+        match cfg.routing {
             Routing::FillFirst => 0,
             Routing::SmartQuota => {
                 let now = Utc::now();
-                let scores: Vec<_> = candidates
-                    .iter()
-                    .map(|(a, upstream)| {
-                        let st = a.state.lock();
-                        let remaining = st.quota.five_hour_remaining(upstream);
-                        // Earlier weekly renewals get up to twice the weight, never unlimited
-                        // priority. Missing/expired weekly dates receive the neutral weight.
-                        let renewal = st.quota.weekly_reset(upstream).map_or(1.0, |reset| {
-                            2.0 - ((reset - now).num_seconds() as f64 / (7.0 * 86_400.0)).clamp(0.0, 1.0)
-                        });
-                        // A busy session is already represented by its in-flight request;
-                        // take the larger count instead of charging that work twice.
-                        let load = session_load
-                            .get(&a.id)
-                            .copied()
-                            .unwrap_or(0)
-                            .max(st.active_requests.load(Ordering::Relaxed));
-                        // Use known weekly/model-specific headroom when no 5-hour window is
-                        // reported. The reserve below still applies only to real 5-hour data.
-                        let headroom =
-                            remaining.or_else(|| st.quota.remaining(upstream)).unwrap_or(crate::quota::UNKNOWN);
-                        // Sessions on an account nearly out of its weekly allowance would soon
-                        // have to move and lose their cache: fade over the last quarter.
-                        let weekly = st.quota.weekly_remaining(upstream).map_or(1.0, |left| (left / 25.0).min(1.0));
-                        let weight = headroom * renewal * weekly / (1.0 + load as f64);
-                        (remaining, weight)
-                    })
-                    .collect();
+                let scores: Vec<_> = candidates.iter().map(|(a, up)| smart_score(a, up, now, session_load)).collect();
                 let reserve = f64::from(cfg.five_hour_reserve_percent);
                 let protect = reserve > 0.0 && scores.iter().any(|(left, _)| left.is_some_and(|v| v >= reserve));
                 // This is an admission preference, not a cooldown: never refuse usable
@@ -1192,42 +1193,169 @@ impl Pool {
                 let eligible = |i: usize| !protect || scores[i].0.is_some_and(|left| left >= reserve);
                 let best = (0..scores.len()).filter(|&i| eligible(i)).map(|i| scores[i].1).fold(0.0, f64::max);
                 let tied: Vec<_> = (0..scores.len()).filter(|&i| eligible(i) && scores[i].1 >= best - 1e-9).collect();
-                let mut cur = self.cursor.lock();
-                let c = cur.entry(model.to_ascii_lowercase()).or_insert(0);
-                let i = tied[*c % tied.len()];
-                *c = c.wrapping_add(1);
-                i
+                tied[take_turn(tied.len())]
             }
             Routing::LeastUsed => {
                 // Most headroom in its tightest usage window; near-ties take turns.
-                let scores: Vec<f64> = candidates
-                    .iter()
-                    .map(|(a, _)| a.state.lock().quota.pressure(model).unwrap_or(crate::quota::UNKNOWN))
-                    .collect();
+                let scores: Vec<f64> = candidates.iter().map(|(a, _)| least_used_score(a, model)).collect();
                 let best = scores.iter().copied().fold(f64::INFINITY, f64::min);
                 let tied: Vec<usize> = (0..candidates.len()).filter(|i| scores[*i] <= best + 2.0).collect();
-                let mut cur = self.cursor.lock();
-                let c = cur.entry(model.to_ascii_lowercase()).or_insert(0);
-                let i = tied[*c % tied.len()];
-                *c = c.wrapping_add(1);
-                i
+                tied[take_turn(tied.len())]
             }
-            Routing::RoundRobin => {
-                let mut cur = self.cursor.lock();
-                let c = cur.entry(model.to_ascii_lowercase()).or_insert(0);
-                let i = *c % candidates.len();
-                *c = c.wrapping_add(1);
-                i
-            }
-        };
-        let (a, m) = &candidates[idx];
-        Pick::Ok((*a).clone(), m.clone())
+            Routing::RoundRobin => take_turn(candidates.len()),
+        }
     }
+
+    /// Every account that can serve `model`, in the order new sessions would try them:
+    /// the strategy's pick first, then the other ready accounts, aggregator fallbacks,
+    /// accounts cooling down, and disabled ones. Read-only: no turn is taken.
+    pub fn route_order(
+        &self,
+        model: &str,
+        cfg: &Config,
+        only: Option<&Only>,
+        session_load: &HashMap<String, usize>,
+    ) -> Vec<RouteStep> {
+        let accounts = self.accounts.read();
+        let mut ready: Vec<(&Arc<Account>, String)> = Vec::new();
+        let mut rest: Vec<RouteStep> = Vec::new();
+        for a in accounts.iter() {
+            let Some(upstream) = self.resolve_account(a, model, only) else { continue };
+            if a.state.lock().disabled {
+                rest.push(RouteStep::new(a, upstream, "disabled", None));
+            } else if let Some(until) = a.cooling_until(model) {
+                rest.push(RouteStep::new(a, upstream, "cooling", Some(until)));
+            } else {
+                ready.push((a, upstream));
+            }
+        }
+        let vendor = ready.iter().any(|(a, _)| a.first_party(model));
+        let (first, overflow): (Vec<_>, Vec<_>) = ready.into_iter().partition(|(a, _)| !vendor || a.first_party(model));
+        let mut steps = Vec::new();
+        if !first.is_empty() {
+            let next = self.choose(&first, model, cfg, session_load, false);
+            let now = Utc::now();
+            let rank = |i: usize| -> f64 {
+                let (a, up) = &first[i];
+                match cfg.routing {
+                    Routing::SmartQuota => smart_score(a, up, now, session_load).1,
+                    Routing::LeastUsed => -least_used_score(a, model),
+                    // Turns continue from the next account, wrapping around.
+                    Routing::RoundRobin => -(((i + first.len() - next) % first.len()) as f64),
+                    Routing::FillFirst => -(i as f64),
+                }
+            };
+            let mut order: Vec<usize> = (0..first.len()).filter(|&i| i != next).collect();
+            order.sort_by(|&x, &y| rank(y).total_cmp(&rank(x)));
+            for i in std::iter::once(next).chain(order) {
+                let (a, up) = &first[i];
+                let mut step = RouteStep::new(a, up.clone(), "ready", None);
+                step.next = i == next;
+                steps.push(step);
+            }
+        }
+        for (a, up) in overflow {
+            let mut step = RouteStep::new(a, up, "ready", None);
+            step.fallback = true;
+            steps.push(step);
+        }
+        rest.sort_by_key(|s| (s.state == "disabled", s.until));
+        steps.extend(rest);
+        steps
+    }
+}
+
+/// One account in a model's route order, for the dashboard.
+#[derive(Debug, Clone, Serialize)]
+pub struct RouteStep {
+    pub account: String,
+    pub upstream: String,
+    /// "ready", "cooling" or "disabled".
+    pub state: &'static str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub until: Option<DateTime<Utc>>,
+    /// An aggregator that only takes over when the vendor's own accounts can't.
+    pub fallback: bool,
+    /// The account the next new session would use.
+    pub next: bool,
+}
+
+impl RouteStep {
+    fn new(a: &Account, upstream: String, state: &'static str, until: Option<DateTime<Utc>>) -> Self {
+        Self { account: a.id.clone(), upstream, state, until, fallback: false, next: false }
+    }
+}
+
+/// Smart quota balancing: the 5-hour allowance left (if reported) and the account's weight.
+fn smart_score(
+    a: &Account,
+    upstream: &str,
+    now: DateTime<Utc>,
+    session_load: &HashMap<String, usize>,
+) -> (Option<f64>, f64) {
+    let st = a.state.lock();
+    let remaining = st.quota.five_hour_remaining(upstream);
+    // Earlier weekly renewals get up to twice the weight, never unlimited
+    // priority. Missing/expired weekly dates receive the neutral weight.
+    let renewal = st
+        .quota
+        .weekly_reset(upstream)
+        .map_or(1.0, |reset| 2.0 - ((reset - now).num_seconds() as f64 / (7.0 * 86_400.0)).clamp(0.0, 1.0));
+    // A busy session is already represented by its in-flight request;
+    // take the larger count instead of charging that work twice.
+    let load = session_load.get(&a.id).copied().unwrap_or(0).max(st.active_requests.load(Ordering::Relaxed));
+    // Use known weekly/model-specific headroom when no 5-hour window is
+    // reported. The reserve below still applies only to real 5-hour data.
+    let headroom = remaining.or_else(|| st.quota.remaining(upstream)).unwrap_or(crate::quota::UNKNOWN);
+    // Sessions on an account nearly out of its weekly allowance would soon
+    // have to move and lose their cache: fade over the last quarter.
+    let weekly = st.quota.weekly_remaining(upstream).map_or(1.0, |left| (left / 25.0).min(1.0));
+    (remaining, headroom * renewal * weekly / (1.0 + load as f64))
+}
+
+/// Least used: use of the tightest window (lower is better).
+fn least_used_score(a: &Account, model: &str) -> f64 {
+    a.state.lock().quota.pressure(model).unwrap_or(crate::quota::UNKNOWN)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn route_order_lists_every_account_without_taking_a_turn() {
+        let model = "claude-sonnet-4-6";
+        let cfg = Config {
+            auth_dir: "/nonexistent".into(),
+            claude_api_key: ["one", "two", "three"]
+                .map(|key| crate::config::KeyEntry { api_key: key.into(), ..Default::default() })
+                .to_vec(),
+            routing: Routing::RoundRobin,
+            ..Default::default()
+        };
+        let pool = Pool::default();
+        pool.reload(&cfg);
+        let ids: Vec<String> = pool.all().iter().map(|a| a.id.clone()).collect();
+        let order = |pool: &Pool| -> Vec<(String, &'static str, bool)> {
+            pool.route_order(model, &cfg, None, &HashMap::new())
+                .into_iter()
+                .map(|s| (s.account, s.state, s.next))
+                .collect()
+        };
+        let ready = |i: usize, next| (ids[i].clone(), "ready", next);
+        assert_eq!(order(&pool), [ready(0, true), ready(1, false), ready(2, false)]);
+        // Looking doesn't take the turn; picking does, and the order follows it.
+        assert_eq!(order(&pool), [ready(0, true), ready(1, false), ready(2, false)]);
+        assert!(matches!(pool.pick(model, &[], &cfg, None, None, &HashMap::new()), Pick::Ok(a, _) if a.id == ids[0]));
+        assert_eq!(order(&pool), [ready(1, true), ready(2, false), ready(0, false)]);
+        // Cooling accounts follow the ready ones; disabled accounts come last.
+        pool.get(&ids[2]).unwrap().state.lock().disabled = true;
+        pool.get(&ids[0]).unwrap().cool(Some(model), Utc::now() + chrono::Duration::minutes(5), "429");
+        assert_eq!(
+            order(&pool),
+            [ready(1, true), (ids[0].clone(), "cooling", false), (ids[2].clone(), "disabled", false)]
+        );
+    }
 
     #[test]
     fn smart_quota_prefers_earlier_renewals_and_respects_availability() {

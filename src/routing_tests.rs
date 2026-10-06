@@ -342,7 +342,7 @@ impl Fixture {
                 .with_state(mock.clone()),
         )
         .await;
-        let directory = std::env::temp_dir().join(format!("cliproxy-routing-{}", uuid::Uuid::new_v4()));
+        let directory = std::env::temp_dir().join(format!("fusebox-routing-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&directory).unwrap();
         let mut cfg = Config {
             auth_dir: directory.to_string_lossy().into(),
@@ -380,6 +380,18 @@ impl Fixture {
         }
         let response = request.send().await.unwrap();
         (response.status().as_u16(), response.json().await.unwrap())
+    }
+
+    /// A Responses request from client-one with exactly these extra headers.
+    async fn request_with(&self, headers: &[(&str, &str)], body: Value) -> Value {
+        let mut request = reqwest::Client::new()
+            .post(format!("{}/v1/responses", self.proxy.url))
+            .bearer_auth("client-one")
+            .json(&body);
+        for (name, value) in headers {
+            request = request.header(*name, *value);
+        }
+        request.send().await.unwrap().json().await.unwrap()
     }
 
     async fn socket(
@@ -1034,19 +1046,43 @@ async fn authentication_scopes_prevent_cross_client_pins_and_accept_query_keys()
         .await
         .unwrap();
     assert_eq!(answer(&response), "a");
-    let response: Value = reqwest::Client::new()
-        .post(format!("{}/v1/responses", fixture.proxy.url))
-        .bearer_auth("client-two")
-        .header("thread-id", "task")
-        .header("x-cliproxy-client-scope", crate::affinity::scope_for_key(Some("client-one")))
-        .json(&prompt())
-        .send()
-        .await
-        .unwrap()
-        .json()
-        .await
-        .unwrap();
-    assert_eq!(answer(&response), "b");
+    // Neither the Fusebox scope header nor its pre-rename name can borrow another client's pins.
+    for name in ["x-fusebox-client-scope", "x-cliproxy-client-scope"] {
+        let response: Value = reqwest::Client::new()
+            .post(format!("{}/v1/responses", fixture.proxy.url))
+            .bearer_auth("client-two")
+            .header("thread-id", "task")
+            .header(name, crate::affinity::scope_for_key(Some("client-one")))
+            .json(&prompt())
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert_eq!(answer(&response), "b", "{name}");
+    }
+}
+
+#[tokio::test]
+async fn fusebox_session_headers_and_their_legacy_names_pin_the_same_session() {
+    let fixture = Fixture::new(Routing::RoundRobin, false).await;
+    let first = fixture.request_with(&[("x-fusebox-session-id", "task")], prompt()).await;
+    assert_eq!(answer(&first), "a");
+    let legacy = fixture.request_with(&[("x-cliproxy-session-id", "task")], prompt()).await;
+    assert_eq!(answer(&legacy), "a");
+    // With both present the Fusebox name wins: "other" is a new session, so it takes the next account.
+    let both =
+        fixture.request_with(&[("x-fusebox-session-id", "other"), ("x-cliproxy-session-id", "task")], prompt()).await;
+    assert_eq!(answer(&both), "b");
+    let logs = fixture.logs(3).await;
+    assert_eq!(logs[0].session_source, Some("x-fusebox-session-id"));
+    assert_eq!(logs[1].session_source, Some("x-cliproxy-session-id"));
+    assert_eq!(logs[1].session_id, logs[0].session_id);
+    assert_eq!(logs[1].routing_reason, Some("session_reused"));
+    assert_eq!(logs[2].session_source, Some("x-fusebox-session-id"));
+    assert_ne!(logs[2].session_id, logs[0].session_id);
+    assert_eq!(logs[2].routing_reason, Some("new_session"));
 }
 
 #[tokio::test]
@@ -1106,22 +1142,14 @@ async fn claude_metadata_pins_the_session_before_request_translation() {
 
 #[tokio::test]
 async fn ending_a_task_releases_its_assignment_and_missing_codex_history_is_explicit() {
-    let fixture = Fixture::new(Routing::RoundRobin, false).await;
-    assert_eq!(answer(&fixture.request(Some("task"), prompt()).await.1), "a");
-    let response: Value = reqwest::Client::new()
-        .post(format!("{}/v1/responses", fixture.proxy.url))
-        .bearer_auth("client-one")
-        .header("thread-id", "task")
-        .header("x-cliproxy-session-end", "true")
-        .json(&prompt())
-        .send()
-        .await
-        .unwrap()
-        .json()
-        .await
-        .unwrap();
-    assert_eq!(answer(&response), "a");
-    assert_eq!(answer(&fixture.request(Some("task"), prompt()).await.1), "b");
+    // The Fusebox header and its pre-rename name both end the session.
+    for name in ["x-fusebox-session-end", "x-cliproxy-session-end"] {
+        let fixture = Fixture::new(Routing::RoundRobin, false).await;
+        assert_eq!(answer(&fixture.request(Some("task"), prompt()).await.1), "a");
+        let response = fixture.request_with(&[("thread-id", "task"), (name, "true")], prompt()).await;
+        assert_eq!(answer(&response), "a", "{name}");
+        assert_eq!(answer(&fixture.request(Some("task"), prompt()).await.1), "b", "{name}");
+    }
     let fixture = Fixture::new(Routing::RoundRobin, true).await;
     let (status, response) = fixture
         .request(

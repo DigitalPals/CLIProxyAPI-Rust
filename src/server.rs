@@ -43,6 +43,8 @@ pub fn router(app: Arc<App>) -> Router {
         .nest("/api", crate::mgmt::router(app.clone()))
         .route("/", get(ui_index))
         .route("/ui/{file}", get(ui_asset))
+        .route("/ui/fonts/{file}", get(ui_font))
+        .route("/favicon.ico", get(favicon))
         .route("/healthz", get(|| async { "ok" }))
         .with_state(app)
 }
@@ -68,7 +70,8 @@ async fn client_auth(State(app): State<Arc<App>>, mut req: Request, next: Next) 
         // Never trust an incoming internal scope header. Query-string credentials
         // and header credentials get the same namespace without forwarding keys.
         let scope = crate::affinity::scope_for_key(provided.as_deref());
-        req.headers_mut().insert("x-cliproxy-client-scope", HeaderValue::from_str(&scope).unwrap());
+        req.headers_mut().remove(crate::affinity::LEGACY_SCOPE_HEADER);
+        req.headers_mut().insert(crate::affinity::SCOPE_HEADER, HeaderValue::from_str(&scope).unwrap());
         return next.run(req).await;
     }
     let format = format_for_path(req.uri().path());
@@ -394,7 +397,7 @@ fn reply(_format: Format, r: Reply, json_array: bool) -> Response {
             h.insert(header::CACHE_CONTROL, HeaderValue::from_static("no-cache"));
             h.insert("x-accel-buffering", HeaderValue::from_static("no"));
             if let Ok(v) = HeaderValue::from_str(&account) {
-                h.insert("x-cliproxyapi-rust-account", v);
+                h.insert("x-fusebox-account", v);
             }
             resp
         }
@@ -442,6 +445,7 @@ const LOGOS: &str = include_str!("../ui/logos.svg");
 const APP_JS: &str = include_str!("../ui/app.js");
 const STYLE: &str = include_str!("../ui/style.css");
 const ICON: &str = include_str!("../ui/icon.svg");
+const FAVICON: &[u8] = include_bytes!("../ui/favicon.ico");
 
 // The logo sprite is inlined so its gradients resolve from every <use>.
 static PAGE: std::sync::LazyLock<String> = std::sync::LazyLock::new(|| INDEX.replace("<!-- logos -->", LOGOS));
@@ -460,4 +464,30 @@ async fn ui_asset(Path(file): Path<String>) -> Response {
         _ => return StatusCode::NOT_FOUND.into_response(),
     };
     ([(header::CONTENT_TYPE, ctype), (header::CACHE_CONTROL, "no-cache")], body).into_response()
+}
+
+// Self-hosted fonts (latin subset, SIL OFL 1.1; licences in ui/fonts). Their names
+// change with their contents, so they can be cached for a long time.
+const FONTS: &[(&str, &[u8])] = &[
+    ("ibm-plex-sans.woff2", include_bytes!("../ui/fonts/ibm-plex-sans.woff2")),
+    ("ibm-plex-sans-condensed-500.woff2", include_bytes!("../ui/fonts/ibm-plex-sans-condensed-500.woff2")),
+    ("ibm-plex-sans-condensed-600.woff2", include_bytes!("../ui/fonts/ibm-plex-sans-condensed-600.woff2")),
+    ("dm-mono-400.woff2", include_bytes!("../ui/fonts/dm-mono-400.woff2")),
+    ("dm-mono-500.woff2", include_bytes!("../ui/fonts/dm-mono-500.woff2")),
+];
+
+async fn ui_font(Path(file): Path<String>) -> Response {
+    match FONTS.iter().find(|(name, _)| *name == file) {
+        Some((_, body)) => (
+            [(header::CONTENT_TYPE, "font/woff2"), (header::CACHE_CONTROL, "public, max-age=31536000, immutable")],
+            *body,
+        )
+            .into_response(),
+        None => StatusCode::NOT_FOUND.into_response(),
+    }
+}
+
+async fn favicon() -> Response {
+    ([(header::CONTENT_TYPE, "image/x-icon"), (header::CACHE_CONTROL, "public, max-age=86400")], FAVICON)
+        .into_response()
 }

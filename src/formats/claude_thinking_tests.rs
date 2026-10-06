@@ -186,7 +186,7 @@ impl Fixture {
                 Response::builder().header(header::CONTENT_TYPE, "text/event-stream").body(Body::from(data)).unwrap()
             }
         }))).await;
-        let directory = std::env::temp_dir().join(format!("cliproxy-claude-thinking-{}", uuid::Uuid::new_v4()));
+        let directory = std::env::temp_dir().join(format!("fusebox-claude-thinking-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&directory).unwrap();
         let cfg = Config {
             auth_dir: directory.to_string_lossy().into(),

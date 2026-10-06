@@ -320,7 +320,7 @@ async fn turn(
         match native_turn(app, headers, sess, &body, full.as_deref(), tx).await {
             Native::Done => {
                 sess.pending_selection = None;
-                if headers.get("x-cliproxy-session-end").is_some_and(|v| v == "true") {
+                if crate::affinity::ends_session(headers) {
                     app.sessions.end(sess.key.as_deref().unwrap());
                 }
                 return Ok(());
@@ -504,6 +504,7 @@ async fn native_turn(
     let quota_epoch = acct.quota_epoch();
     sess.upstream_quota_epoch = quota_epoch;
     let mut tracker = Tracker::new(app, Format::Responses, true, "ws", &model);
+    tracker.client_app(headers);
     tracker.session(sess.key.as_deref(), sess.source, &cfg);
     tracker.selected(&selected);
     let payload = payload.to_string();

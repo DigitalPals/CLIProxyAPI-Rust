@@ -33,19 +33,19 @@ jobs:
       - name: Package
         shell: bash
         run: |
-          name="cliproxyapi-rust-${GITHUB_REF_NAME}-${{ matrix.target }}"
+          name="fusebox-${GITHUB_REF_NAME}-${{ matrix.target }}"
           mkdir "$name"
           cp README.md LICENSE "$name/"
           if [[ "${{ matrix.target }}" == *windows* ]]; then
-            cp "target/${{ matrix.target }}/release/cliproxyapi-rust.exe" "$name/"
+            cp "target/${{ matrix.target }}/release/fusebox.exe" "$name/"
             7z a "$name.zip" "$name" > /dev/null
           else
-            cp "target/${{ matrix.target }}/release/cliproxyapi-rust" "$name/"
+            cp "target/${{ matrix.target }}/release/fusebox" "$name/"
             tar czf "$name.tar.gz" "$name"
           fi
       - uses: softprops/action-gh-release@v2
         with:
           generate_release_notes: true
           files: |
-            cliproxyapi-rust-*.tar.gz
-            cliproxyapi-rust-*.zip
+            fusebox-*.tar.gz
+            fusebox-*.zip

@@ -181,9 +181,13 @@ pub struct RequestLog {
     pub id: u64,
     pub ts: DateTime<Utc>,
     pub client: &'static str,
+    /// The client program, when its User-Agent names one (Claude Code, Codex, an SDK).
+    pub client_app: Option<&'static str>,
     pub provider: String,
     pub model: String,
     pub account: String,
+    /// Id of the account that answered (empty when none was tried).
+    pub account_id: String,
     /// Client-scoped fingerprint; never the client's raw session ID or API key.
     pub session_id: Option<String>,
     pub session_source: Option<&'static str>,
@@ -219,6 +223,46 @@ pub struct Bucket {
     pub requests: u64,
     pub failed: u64,
     pub tokens: u64,
+    pub input_tokens: u64,
+    pub output_tokens: u64,
+    pub cache_tokens: u64,
+}
+
+impl Bucket {
+    fn add(&mut self, log: &RequestLog) {
+        self.requests += 1;
+        if log.status >= 400 {
+            self.failed += 1;
+        }
+        self.tokens += log.input_tokens + log.output_tokens + log.cache_tokens;
+        self.input_tokens += log.input_tokens;
+        self.output_tokens += log.output_tokens;
+        self.cache_tokens += log.cache_tokens;
+    }
+}
+
+/// Adds a request to the minute it belongs to, keeping the last hour.
+fn add_to_minute(series: &mut VecDeque<Bucket>, log: &RequestLog) {
+    let minute = log.ts.timestamp() / 60;
+    if series.back().map(|b| b.minute) != Some(minute) {
+        series.push_back(Bucket { minute, ..Default::default() });
+        while series.len() > MINUTES {
+            series.pop_front();
+        }
+    }
+    series.back_mut().unwrap().add(log);
+}
+
+/// The last 60 minutes, oldest first, with empty minutes filled in.
+fn last_hour(series: &VecDeque<Bucket>) -> Vec<Bucket> {
+    let now = Utc::now().timestamp() / 60;
+    (0..MINUTES as i64)
+        .rev()
+        .map(|ago| {
+            let m = now - ago;
+            series.iter().find(|b| b.minute == m).cloned().unwrap_or(Bucket { minute: m, ..Default::default() })
+        })
+        .collect()
 }
 
 #[derive(Default)]
@@ -226,6 +270,8 @@ pub struct Stats {
     pub totals: Mutex<Totals>,
     pub recent: Mutex<VecDeque<RequestLog>>,
     pub series: Mutex<VecDeque<Bucket>>,
+    /// The same minutes per account id.
+    accounts: Mutex<HashMap<String, VecDeque<Bucket>>>,
     pub active: std::sync::atomic::AtomicU64,
     next_id: std::sync::atomic::AtomicU64,
 }
@@ -252,21 +298,13 @@ impl Stats {
             t.output_tokens += log.output_tokens;
             t.cache_tokens += log.cache_tokens;
         }
-        {
-            let minute = log.ts.timestamp() / 60;
-            let mut s = self.series.lock();
-            if s.back().map(|b| b.minute) != Some(minute) {
-                s.push_back(Bucket { minute, ..Default::default() });
-                while s.len() > MINUTES {
-                    s.pop_front();
-                }
-            }
-            let b = s.back_mut().unwrap();
-            b.requests += 1;
-            if !ok {
-                b.failed += 1;
-            }
-            b.tokens += log.input_tokens + log.output_tokens + log.cache_tokens;
+        add_to_minute(&mut self.series.lock(), log);
+        if !log.account_id.is_empty() {
+            let mut accounts = self.accounts.lock();
+            // Forget accounts that have been quiet for an hour (or were removed).
+            let cutoff = log.ts.timestamp() / 60 - MINUTES as i64;
+            accounts.retain(|_, s| s.back().is_some_and(|b| b.minute > cutoff));
+            add_to_minute(accounts.entry(log.account_id.clone()).or_default(), log);
         }
         let mut r = self.recent.lock();
         r.push_back(log.clone());
@@ -276,15 +314,12 @@ impl Stats {
     }
 
     pub fn series(&self) -> Vec<Bucket> {
-        let now = Utc::now().timestamp() / 60;
-        let s = self.series.lock();
-        (0..MINUTES as i64)
-            .rev()
-            .map(|ago| {
-                let m = now - ago;
-                s.iter().find(|b| b.minute == m).cloned().unwrap_or(Bucket { minute: m, ..Default::default() })
-            })
-            .collect()
+        last_hour(&self.series.lock())
+    }
+
+    /// One account's last 60 minutes.
+    pub fn account_series(&self, id: &str) -> Vec<Bucket> {
+        last_hour(self.accounts.lock().get(id).unwrap_or(&VecDeque::new()))
     }
 }
 

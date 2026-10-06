@@ -11,7 +11,7 @@ permissions:
   packages: write
 
 env:
-  IMAGE: ghcr.io/iucc123/cliproxyapi-rust
+  IMAGE: ghcr.io/digitalpals/fusebox
 
 jobs:
   build:

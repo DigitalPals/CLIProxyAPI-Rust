@@ -2,8 +2,28 @@
 
 const CONFIG_SECTIONS = [
   ['server', 'Server'], ['access', 'Access'], ['routing', 'Routing'], ['connections', 'Connections'],
-  ['providers', 'Providers'], ['models', 'Models'], ['diagnostics', 'Diagnostics'], ['yaml', 'YAML file'],
+  ['providers', 'Providers'], ['models', 'Model rules'], ['diagnostics', 'Diagnostics'], ['yaml', 'YAML file'],
 ];
+const CONFIG_DESCRIPTIONS = {
+  server: 'Where Fusebox listens and where it keeps sign-in files.',
+  access: 'Who can use the proxy and the dashboard.',
+  routing: 'How Fusebox picks an account for each request.',
+  connections: 'How Fusebox reaches the providers.',
+  providers: 'API keys used alongside your signed-in accounts.',
+  models: 'Rules for signed-in accounts. API key model rules are set under Providers.',
+  diagnostics: 'Logging, and settings in the file that Fusebox ignores.',
+  yaml: 'The whole config.yaml, including settings the other sections don\u2019t cover. Changes are checked before they are applied.',
+};
+// Which section shows each setting, for the unsaved-changes dots.
+const CONFIG_KEY_SECTION = {
+  host: 'server', port: 'server', 'auth-dir': 'server', tls: 'server',
+  'api-keys': 'access', 'management-key': 'access', 'management-allow-remote': 'access',
+  routing: 'routing', 'five-hour-reserve-percent': 'routing', 'request-retry': 'routing', 'session-affinity': 'routing',
+  'session-affinity-idle-seconds': 'routing', 'force-model-prefix': 'routing',
+  'proxy-url': 'connections', 'codex-websockets': 'connections', 'claude-cloak': 'connections', 'banked-resets': 'connections',
+  'oauth-model-alias': 'models', 'oauth-excluded-models': 'models', debug: 'diagnostics',
+};
+const CONFIG_OAUTH = [['claude', 'Claude'], ['codex', 'Codex'], ['antigravity', 'Antigravity'], ['kimi', 'Kimi'], ['xai', 'Grok'], ['meta', 'Meta'], ['devin', 'Devin'], ['vertex', 'Vertex AI']];
 const CONFIG_PROVIDERS = [
   ['claude', 'Claude', 'claude-api-key'], ['codex', 'OpenAI / Codex', 'codex-api-key'],
   ['gemini', 'Gemini', 'gemini-api-key'], ['vertex', 'Vertex AI', 'vertex-api-key'],
@@ -40,6 +60,7 @@ function configHelp(path, text) {
   return text ? `<small id="${configId(path)}-help">${esc(text)}</small>` : '';
 }
 
+// A text, number or secret input. `bare` keeps the label for screen readers only (list rows).
 function configField(path, label, opts = {}) {
   const value = configGet(path);
   const id = configId(path);
@@ -50,165 +71,187 @@ function configField(path, label, opts = {}) {
   const placeholder = secret && value && !editing ? 'Saved key · leave unchanged' : opts.placeholder || '';
   const input = `<input id="${id}" data-cfg="${configPath(path)}" ${opts.nullable ? 'data-nullable="true"' : ''}
     type="${opts.type || 'text'}" value="${esc(shown)}" placeholder="${esc(placeholder)}" ${secret ? 'data-secret="true"' : ''}
-    ${opts.mono !== false ? 'class="mono" spellcheck="false"' : ''}
+    ${opts.mono === false ? 'style="font-family:var(--sans)"' : 'spellcheck="false"'} ${opts.disabled ? 'disabled' : ''}
     ${opts.required && !(secret && value) ? 'required' : ''} ${opts.min != null ? `min="${opts.min}"` : ''}
     ${opts.max != null ? `max="${opts.max}"` : ''} ${opts.type === 'number' ? 'step="1"' : ''}
     ${secret ? 'autocomplete="new-password"' : 'autocomplete="off"'}
     aria-describedby="${opts.help ? `${id}-help ` : ''}${id}-error" ${error ? 'aria-invalid="true"' : ''}>`;
-  return `<div class="field ${opts.wide ? 'wide' : ''}"><label for="${id}">${esc(label)}${opts.restart ? '<span class="cfg-badge">Needs restart</span>' : ''}</label>
-    ${secret ? `<div class="cfg-secret">${input}<button type="button" class="btn ghost small" data-config-act="reveal" data-path="${configPath(path)}" aria-label="Show ${esc(label)}">Show</button>
-      ${value ? `<button type="button" class="btn ghost small" data-config-act="clear-secret" data-path="${configPath(path)}" aria-label="Clear ${esc(label)}">Clear</button>` : ''}</div>` : input}
+  const badge = opts.restart ? '<span class="cfg-badge">Needs restart</span>' : '';
+  return `<div class="field ${opts.wide ? 'wide' : ''} ${opts.cls || ''}"><label for="${id}"${opts.bare ? ' class="sr-only"' : ''}>${esc(label)}${badge}</label>
+    ${secret ? `<div class="cfg-secret">${input}<button type="button" class="btn ghost" data-config-act="reveal" data-path="${configPath(path)}" aria-label="Show ${esc(label)}">Show</button>
+      ${value && !opts.bare ? `<button type="button" class="btn ghost" data-config-act="clear-secret" data-path="${configPath(path)}" aria-label="Clear ${esc(label)}">Clear</button>` : ''}</div>` : input}
     ${configHelp(path, opts.help)}<small id="${id}-error" class="cfg-error" data-error-for="${id}">${esc(error || '')}</small></div>`;
 }
 
-function configSelect(path, label, options, opts = {}) {
+// Segmented choice (a few short options) for a setting.
+function configChoice(path, label, options, help = '') {
+  const value = JSON.stringify(configGet(path) ?? null);
   const id = configId(path);
+  return `<div class="cfg-choice wide"><span id="${id}-label">${esc(label)}</span>
+    <div class="seg" role="group" aria-labelledby="${id}-label">${options.map(([v, text]) => `<button type="button" data-config-act="choice" data-path="${configPath(path)}" data-value="${esc(JSON.stringify(v))}" aria-pressed="${value === JSON.stringify(v)}">${esc(text)}</button>`).join('')}</div>
+    ${configHelp(path, help)}</div>`;
+}
+
+// Option cards for a choice whose options need a sentence each (routing strategy).
+function configCards(path, label, options) {
   const value = configGet(path);
-  return `<div class="field"><label for="${id}">${esc(label)}</label>
-    <select id="${id}" data-cfg="${configPath(path)}" ${opts.help ? `aria-describedby="${id}-help"` : ''}>
-      ${options.map(([v, text]) => `<option value="${esc(v)}" ${String(value) === String(v) ? 'selected' : ''}>${esc(text)}</option>`).join('')}
-    </select>${configHelp(path, opts.help)}<small class="cfg-error" data-error-for="${id}"></small></div>`;
+  return `<div class="cfg-choice wide"><span id="${configId(path)}-label">${esc(label)}</span>
+    <div class="opt-cards" role="radiogroup" aria-labelledby="${configId(path)}-label">${options.map(([v, title, desc]) => `<button type="button" class="opt-card" role="radio" aria-checked="${value === v}" data-config-act="choice" data-path="${configPath(path)}" data-value="${esc(JSON.stringify(v))}">
+      <span class="ring" aria-hidden="true"></span><span class="cell2"><span>${esc(title)}</span><span>${esc(desc)}</span></span></button>`).join('')}</div></div>`;
 }
 
 function configSwitch(path, label, help = '', restart = false) {
   const id = configId(path);
-  return `<div class="cfg-toggle"><div><label id="${id}-label" for="${id}">${esc(label)}${restart ? '<span class="cfg-badge">Needs restart</span>' : ''}</label>${configHelp(path, help)}</div>
+  return `<div class="cfg-toggle wide"><div><label id="${id}-label" for="${id}">${esc(label)}${restart ? '<span class="cfg-badge">Needs restart</span>' : ''}</label>${configHelp(path, help)}</div>
     <button id="${id}" type="button" class="switch" role="switch" aria-checked="${!!configGet(path)}" aria-labelledby="${id}-label"
       ${help ? `aria-describedby="${id}-help"` : ''} data-config-act="switch" data-path="${configPath(path)}"></button></div>`;
 }
 
 function configRemove(path, label = 'Remove row') {
-  return `<button type="button" class="btn ghost small danger" data-config-act="remove" data-path="${configPath(path)}" aria-label="${esc(label)}">Remove</button>`;
+  return `<button type="button" class="btn danger" data-config-act="remove" data-path="${configPath(path)}" aria-label="${esc(label)}">Remove</button>`;
 }
 
-function configStrings(path, label, help = '', secret = false) {
+function configListHead(title, help, addLabel, addAttrs) {
+  return `<div class="cfg-list-head"><div class="cell2"><h3>${esc(title)}</h3>${help ? `<p class="cfg-description">${esc(help)}</p>` : ''}</div>
+    ${addLabel ? `<button type="button" class="btn sm" ${addAttrs}>${esc(addLabel)}</button>` : ''}</div>`;
+}
+
+function configStrings(path, label, help = '', secret = false, empty = '') {
   const list = configGet(path) || [];
-  return `<div class="cfg-list"><div class="cfg-list-head"><h3>${esc(label)}</h3>
-    <button type="button" class="btn small" data-config-act="add-string" data-path="${configPath(path)}">Add ${secret ? 'key' : 'pattern'}</button></div>
-    ${help ? `<p class="cfg-description">${esc(help)}</p>` : ''}
-    ${list.length ? list.map((_, i) => `<div class="cfg-string-row">${configField([...path, i], `${secret ? 'API key' : 'Model pattern'} ${i + 1}`, { type: secret ? 'password' : 'text', required: true, placeholder: secret ? 'Enter an API key' : 'claude-*' })}${configRemove([...path, i], `Remove ${secret ? 'API key' : 'pattern'} ${i + 1}`)}</div>`).join('')
-      : `<p class="cfg-empty">${secret ? 'No keys configured.' : 'No models excluded.'}</p>`}</div>`;
+  return `<div class="cfg-list wide">${configListHead(label, help, secret ? 'Add key' : 'Add pattern', `data-config-act="add-string" data-path="${configPath(path)}"${secret && path[0] === 'api-keys' ? ' data-generate="true"' : ''}`)}
+    ${list.length ? list.map((_, i) => `<div class="cfg-row">${configField([...path, i], `${secret ? 'API key' : 'Model pattern'} ${i + 1}`, { type: secret ? 'password' : 'text', required: true, bare: true, placeholder: secret ? 'Enter an API key' : 'claude-*' })}${configRemove([...path, i], `Remove ${secret ? 'API key' : 'pattern'} ${i + 1}`)}</div>`).join('')
+      : `<p class="cfg-empty">${esc(empty || (secret ? 'No keys configured.' : 'No models excluded.'))}</p>`}</div>`;
 }
 
 function configAliases(path, oauth = false) {
   const list = configGet(path) || [];
-  return `<div class="cfg-list"><div class="cfg-list-head"><h3>${oauth ? 'Model aliases' : 'Allowed models and aliases'}</h3>
-    <button type="button" class="btn small" data-config-act="add-alias" data-path="${configPath(path)}" ${oauth ? 'data-oauth="true"' : ''}>Add model</button></div>
-    <p class="cfg-description">${oauth ? 'Expose an upstream model under a name your clients use.' : 'Leave empty to allow all available models. An alias changes the name clients use.'}</p>
-    ${list.length ? list.map((_, i) => `<div class="cfg-alias-row">${configField([...path, i, 'name'], 'Upstream model', { required: true, placeholder: 'claude-sonnet-4-6' })}
-      ${configField([...path, i, 'alias'], 'Alias', { required: oauth, nullable: !oauth, placeholder: oauth ? 'sonnet' : 'Same as upstream' })}
-      ${oauth ? `<div class="cfg-fork">${configSwitch([...path, i, 'fork'], 'Keep original name', 'Serve both the original name and the alias.')}</div>` : ''}
-      ${configRemove([...path, i], `Remove model ${i + 1}`)}</div>`).join('') : '<p class="cfg-empty">No model aliases configured.</p>'}</div>`;
+  return `<div class="cfg-list wide">${configListHead(oauth ? 'Model aliases' : 'Allowed models and aliases', oauth ? 'Expose an upstream model under a name your clients use.' : 'Leave empty to allow all available models. An alias changes the name clients use.', 'Add model', `data-config-act="add-alias" data-path="${configPath(path)}"${oauth ? ' data-oauth="true"' : ''}`)}
+    ${list.length ? list.map((_, i) => {
+      const fork = [...path, i, 'fork'];
+      return `<div class="cfg-row">${configField([...path, i, 'name'], `Upstream model ${i + 1}`, { required: true, bare: true, placeholder: oauth ? 'claude-sonnet-5-5' : 'Upstream model' })}
+      <span class="arrow" aria-hidden="true">→</span>${configField([...path, i, 'alias'], `Alias ${i + 1}`, { required: oauth, nullable: !oauth, bare: true, cls: 'alias', placeholder: oauth ? 'sonnet' : 'Same as upstream' })}
+      ${oauth ? `<button type="button" class="fork" role="switch" aria-checked="${!!configGet(fork)}" data-config-act="switch" data-path="${configPath(fork)}" id="${configId(fork)}" title="Serve both the original name and the alias"><span class="switch sm" aria-hidden="true"${configGet(fork) ? ' data-on="true"' : ''}></span>Keep original</button>` : ''}
+      ${configRemove([...path, i], `Remove model ${i + 1}`)}</div>`;
+    }).join('') : `<p class="cfg-empty">${oauth ? 'No model aliases configured.' : 'All models from this provider are allowed.'}</p>`}</div>`;
 }
 
 function configHeaders(path) {
   const headers = configGet(path) || {};
-  return `<div class="cfg-list"><div class="cfg-list-head"><h3>Extra HTTP headers</h3>
-    <button type="button" class="btn small" data-config-act="add-header" data-path="${configPath(path)}">Add header</button></div>
-    <p class="cfg-description">Sent with requests to this provider.</p>
-    ${Object.entries(headers).map(([key], i) => `<div class="cfg-header-row"><div class="field"><label for="${configId([...path, i, 'key'])}">Header name</label>
-      <input id="${configId([...path, i, 'key'])}" class="mono" type="text" value="${esc(key)}" data-header-path="${configPath(path)}" data-header-key="${esc(key)}" data-header-index="${i}" required autocomplete="off" spellcheck="false">
+  return `<div class="cfg-list wide">${configListHead('Extra HTTP headers', 'Sent with requests to this provider.', 'Add header', `data-config-act="add-header" data-path="${configPath(path)}"`)}
+    ${Object.entries(headers).map(([key], i) => `<div class="cfg-row"><div class="field"><label class="sr-only" for="${configId([...path, i, 'key'])}">Header name ${i + 1}</label>
+      <input id="${configId([...path, i, 'key'])}" type="text" value="${esc(key)}" data-header-path="${configPath(path)}" data-header-key="${esc(key)}" data-header-index="${i}" required autocomplete="off" spellcheck="false">
       <small class="cfg-error" data-header-error="true">${esc(S.config.errors[configId([...path, i, 'key'])] || '')}</small></div>
-      ${configField([...path, key], 'Value')}
-      <button type="button" class="btn ghost small danger" data-config-act="remove-header" data-path="${configPath(path)}" data-key="${esc(key)}" aria-label="Remove ${esc(key)} header">Remove</button></div>`).join('') || '<p class="cfg-empty">No extra headers configured.</p>'}</div>`;
+      <span class="arrow" aria-hidden="true">:</span>${configField([...path, key], `${key} value`, { bare: true, placeholder: 'Value' })}
+      <button type="button" class="btn danger" data-config-act="remove-header" data-path="${configPath(path)}" data-key="${esc(key)}" aria-label="Remove ${esc(key)} header">Remove</button></div>`).join('') || '<p class="cfg-empty">No extra headers configured.</p>'}</div>`;
 }
 
 function configServerHTML() {
-  return `<h2>Server</h2><div class="cfg-grid">
+  const tls = !!configGet(['tls', 'enable']);
+  return `<div class="cfg-grid">
     ${configField(['host'], 'Bind address', { restart: true, placeholder: '127.0.0.1' })}
     ${configField(['port'], 'Port', { type: 'number', min: 1, max: 65535, required: true, restart: true })}
     ${configField(['auth-dir'], 'Credentials directory', { required: true, wide: true, help: 'OAuth credential files are read from this directory.' })}
-    </div><div class="cfg-divider"></div>
-    ${configSwitch(['tls', 'enable'], 'HTTPS', '', true)}
-    <div class="cfg-grid cfg-dependent ${configGet(['tls', 'enable']) ? '' : 'is-disabled'}" data-tls-fields>
-      ${configField(['tls', 'cert'], 'Certificate path', { required: !!configGet(['tls', 'enable']) })}
-      ${configField(['tls', 'key'], 'Private key path', { required: !!configGet(['tls', 'enable']) })}
-    </div>`;
+    <div class="cfg-divider wide"></div>
+    ${configSwitch(['tls', 'enable'], 'HTTPS', 'Serve the endpoint and the dashboard over TLS.', true)}
+    ${configField(['tls', 'cert'], 'Certificate path', { required: tls, disabled: !tls, placeholder: '/etc/fusebox/cert.pem' })}
+    ${configField(['tls', 'key'], 'Private key path', { required: tls, disabled: !tls, placeholder: '/etc/fusebox/key.pem' })}
+  </div>`;
 }
 
 function configAccessHTML() {
-  return `<h2>Access</h2>${configStrings(['api-keys'], 'Client API keys', 'Clients send one of these keys to use the proxy. Leave empty to allow access without a key.', true)}
-    <div class="cfg-divider"></div><div class="cfg-grid">${configField(['management-key'], 'Dashboard key', { type: 'password', wide: true,
-      help: 'Protects the dashboard and management API. With no key, access is limited to localhost.' })}
-    ${configSelect(['management-allow-remote'], 'Remote dashboard access', [['null', 'Default (allow with a dashboard key)'], ['true', 'Allow'], ['false', 'Localhost only']], {
-      help: 'Remote access requires a dashboard key, even when allowed.' })}</div>`;
+  return `<div class="cfg-grid">${configStrings(['api-keys'], 'Client API keys', 'Clients send one of these keys to use the proxy. Leave empty to allow access without a key.', true, 'No keys configured. Any client that can reach the endpoint can use it.')}
+    <div class="cfg-divider wide"></div>
+    ${configField(['management-key'], 'Dashboard key', { type: 'password', wide: true, help: 'Protects the dashboard and management API. With no key, access is limited to localhost.' })}
+    ${configChoice(['management-allow-remote'], 'Remote dashboard access', [[null, 'Default'], [true, 'Allow'], [false, 'Localhost only']], 'Remote access requires a dashboard key, even when allowed.')}</div>`;
 }
 
 function configRoutingHTML() {
   const strategy = configGet(['routing']);
-  const what = configGet(['session-affinity']) ? 'new sessions' : 'requests';
-  const help = { 'least-used': `Send ${what} to the account with the most subscription quota remaining. Falls back to round robin when quota is unavailable.`,
-    'smart-quota': `Spread ${what} by quota left and current load, favouring accounts whose weekly limit renews sooner and avoiding ones nearly out of their week.`,
-    'round-robin': `Rotate ${what} across available accounts.`, 'fill-first': `Send ${what} to the first available account until it cannot serve them, then the next.` }[strategy];
-  return `<h2>Routing</h2><div class="cfg-grid">
-    ${configSelect(['routing'], 'Account selection', [['least-used', 'Most quota remaining'], ['smart-quota', 'Smart quota balancing'], ['round-robin', 'Round robin'], ['fill-first', 'Fill first']], { help })}
+  const affinity = !!configGet(['session-affinity']);
+  const what = affinity ? 'new sessions' : 'requests';
+  return `<div class="cfg-grid">
+    ${configCards(['routing'], 'Account selection', [
+      ['least-used', 'Most quota remaining', `Send ${what} to the account with the most subscription quota remaining. Falls back to round robin when quota is unavailable.`],
+      ['smart-quota', 'Smart quota balancing', `Spread ${what} by quota left and current load, favouring accounts whose weekly limit renews sooner and avoiding ones nearly out of their week.`],
+      ['round-robin', 'Round robin', `Rotate ${what} across available accounts.`],
+      ['fill-first', 'Fill first', `Send ${what} to the first available account until it cannot serve them, then the next.`],
+    ])}
     ${strategy === 'smart-quota' ? configField(['five-hour-reserve-percent'], '5-hour reserve for existing sessions (%)', { type: 'number', min: 0, max: 100, required: true,
       help: `Below this level, prefer other accounts for ${what}. Remaining quota can still be used when all accounts are below their reserve. Default: 30%. Set 0 to turn off the reserve.` }) : ''}
     ${configField(['request-retry'], 'Account attempts', { type: 'number', min: 0, max: 4294967295, required: true,
-      help: 'Maximum accounts to try before a request fails. Zero still tries one account.' })}</div>
-    <div class="cfg-divider"></div>${configSwitch(['session-affinity'], 'Keep sessions on one account', 'A coding session stays on the account it started on, so its prompt cache keeps working. It moves when that subscription runs out or the account is disabled; while an account is busy, its requests briefly use another.')}
-    <div class="cfg-grid cfg-dependent ${configGet(['session-affinity']) ? '' : 'is-disabled'}">
-      ${configField(['session-affinity-idle-seconds'], 'Forget idle sessions after (seconds)', { type: 'number', min: 60, required: true, help: '86400 is one day.' })}
-    </div>
-    <div class="cfg-divider"></div>${configSwitch(['force-model-prefix'], 'Require model prefixes', 'Unprefixed requests only use accounts without a prefix. Use prefix/model to select a prefixed account.')}`;
+      help: 'Maximum accounts to try before a request fails. Zero still tries one account.' })}
+    <div class="cfg-divider wide"></div>
+    ${configSwitch(['session-affinity'], 'Keep sessions on one account', 'A coding session stays on the account it started on, so its prompt cache keeps working. It moves when that subscription runs out or the account is disabled; while an account is busy, its requests briefly use another.')}
+    ${configField(['session-affinity-idle-seconds'], 'Forget idle sessions after (seconds)', { type: 'number', min: 60, required: true, disabled: !affinity, help: '86400 is one day.' })}
+    <div class="cfg-divider wide"></div>
+    ${configSwitch(['force-model-prefix'], 'Require model prefixes', 'Unprefixed requests only use accounts without a prefix. Use prefix/model to select a prefixed account.')}
+  </div>`;
 }
 
 function configConnectionsHTML() {
-  return `<h2>Connections</h2><div class="cfg-grid">${configField(['proxy-url'], 'Upstream proxy', { wide: true,
-    placeholder: 'socks5://127.0.0.1:1080', help: 'Default proxy for upstream requests. Supports HTTP, HTTPS and SOCKS5; individual providers can override it.' })}</div>
-    <div class="cfg-divider"></div>${configSwitch(['codex-websockets'], 'Native Codex websockets', 'Keep a native upstream websocket connection for clients using Codex over websockets.')}
+  return `<div class="cfg-grid">${configField(['proxy-url'], 'Upstream proxy', { wide: true,
+    placeholder: 'socks5://127.0.0.1:1080', help: 'Default proxy for upstream requests. Supports HTTP, HTTPS and SOCKS5; individual providers can override it.' })}
+    <div class="cfg-divider wide"></div>
+    ${configSwitch(['codex-websockets'], 'Native Codex websockets', 'Keep a native upstream websocket connection for clients using Codex over websockets.')}
     ${configSwitch(['claude-cloak'], 'Claude Code compatibility', 'Make requests through Claude OAuth accounts resemble Claude Code requests for other clients.')}
-    ${configSwitch(['banked-resets'], 'Banked resets', 'Show saved Claude and ChatGPT limit resets beside each subscription and let you spend them. Checks every 30 minutes through unofficial provider endpoints.')}`;
+    ${configSwitch(['banked-resets'], 'Banked resets', 'Show saved Claude and ChatGPT limit resets beside each subscription and let you spend them. Checks every 30 minutes through unofficial provider endpoints.')}</div>`;
 }
 
 // Provider ids here are config groups; the logo sprite knows them as account providers.
-const configLogo = (provider, name) => logo(provider === 'compat' ? 'openai-compat' : provider, name, 'api-key');
+const configLogo = (provider, name, size = 16) => logo(provider === 'compat' ? 'openai-compat' : provider, name, 'api-key', size);
+// "sk-ant-…f3e2", or dots while emails and keys are hidden.
+const configMask = (key) => (!key ? 'No key' : S.private ? '••••…••••' : key.length > 12 ? `${key.slice(0, 7)}…${key.slice(-4)}` : '••••');
 
 function configProvidersHTML() {
   const c = S.config;
   const [provider, label, field] = CONFIG_PROVIDERS.find(([p]) => p === c.provider);
   const entries = configGet([field]) || [];
   const compatible = provider === 'compat';
-  return `<div class="cfg-section-head"><h2>Providers</h2><button type="button" class="btn" data-config-act="add-provider">Add ${compatible ? 'provider' : 'key'}</button></div>
-    <div class="cfg-provider-tabs" role="group" aria-label="Provider">${CONFIG_PROVIDERS.map(([p, name, f]) => `<button type="button" class="btn ghost small" data-config-act="provider" data-provider="${p}" aria-pressed="${p === provider}">${configLogo(p)}${esc(name)}<span class="cfg-count">${configGet([f])?.length || 0}</span></button>`).join('')}</div>
+  return `<div class="cfg-tabs" role="group" aria-label="Provider">${CONFIG_PROVIDERS.map(([p, name, f]) => `<button type="button" data-config-act="provider" data-provider="${p}" aria-pressed="${p === provider}">${configLogo(p, null, 14)}${esc(name)}<span class="n">${configGet([f])?.length || 0}</span></button>`).join('')}</div>
     ${entries.length ? entries.map((entry, i) => {
       const path = [field, i];
       const openKey = `${field}:${i}`;
+      const title = compatible ? entry.name || `Provider ${i + 1}` : entry.label || `${label} key ${i + 1}`;
+      const meta = compatible ? `${(entry['api-keys'] || []).length} key${(entry['api-keys'] || []).length === 1 ? '' : 's'} · ${(entry.models || []).length} models` : configMask(entry['api-key']);
       return `<details class="cfg-provider" data-cfg-open="${openKey}" ${c.opens[openKey] ? 'open' : ''}>
-        <summary>${configLogo(provider, entry.name)}<span>${esc(entry.label || entry.name || `${label} key ${i + 1}`)}</span>
-          ${entry.prefix ? `<span class="cfg-count mono">${esc(entry.prefix)}/</span>` : ''}
-          ${compatible && entry.disabled ? '<span class="cfg-count">Disabled</span>' : ''}<span class="cfg-chevron" aria-hidden="true">›</span></summary>
+        <summary>${configLogo(provider, entry.name || entry['base-url'])}<span class="nm">${esc(title)}</span>
+          ${compatible && entry.disabled ? '<span class="badge">Disabled</span>' : entry.prefix ? `<span class="badge">${esc(entry.prefix)}/</span>` : ''}
+          <span class="meta-r">${esc(meta)}</span><span class="cfg-chevron" aria-hidden="true">›</span></summary>
         <div class="cfg-provider-body"><div class="cfg-grid">
           ${compatible ? configField([...path, 'name'], 'Provider name', { required: true, mono: false }) : configField([...path, 'label'], 'Label', { nullable: true, mono: false, placeholder: 'Optional' })}
           ${configField([...path, 'base-url'], 'Base URL', { type: 'url', required: compatible, nullable: !compatible, placeholder: compatible ? 'http://localhost:11434/v1' : 'Provider default' })}
-          ${!compatible ? configField([...path, 'api-key'], 'API key', { type: 'password', required: true, wide: true }) : ''}</div>
+          ${!compatible ? configField([...path, 'api-key'], 'API key', { type: 'password', required: true, wide: true }) : ''}
           ${compatible ? configStrings([...path, 'api-keys'], 'API keys', 'Leave empty for local servers that do not require authentication.', true) : ''}
+          ${compatible ? configAliases([...path, 'models']) : ''}
           ${compatible ? configSwitch([...path, 'disabled'], 'Disable provider', 'Keep its configuration while excluding it from requests.') : ''}
-          <details class="cfg-advanced" data-cfg-open="${openKey}:advanced" ${c.opens[`${openKey}:advanced`] ? 'open' : ''}><summary>Advanced options<span class="cfg-chevron" aria-hidden="true">›</span></summary>
-            <div class="cfg-grid">${configField([...path, 'prefix'], 'Model prefix', { nullable: true, placeholder: 'team', help: 'Clients use prefix/model to route requests to this key or provider.' })}
+          <details class="cfg-advanced wide" data-cfg-open="${openKey}:advanced" ${c.opens[`${openKey}:advanced`] ? 'open' : ''}><summary>Advanced options<span class="cfg-chevron" aria-hidden="true">›</span></summary>
+            <div><div class="cfg-grid">${configField([...path, 'prefix'], 'Model prefix', { nullable: true, placeholder: 'team', help: 'Clients use prefix/model to send requests to this key.' })}
               ${configField([...path, 'proxy-url'], 'Proxy override', { nullable: true, placeholder: 'Use default proxy' })}</div>
-            ${configAliases([...path, 'models'])}
+            ${compatible ? '' : configAliases([...path, 'models'])}
             ${configStrings([...path, 'excluded-models'], 'Excluded models', 'Model names or patterns this provider must not serve. Use * as a wildcard.')}
-            ${configHeaders([...path, 'headers'])}
-          </details><div class="cfg-provider-foot">${configRemove(path, `Remove ${entry.label || entry.name || label}`)}</div>
+            ${configHeaders([...path, 'headers'])}</div>
+          </details></div>
+          <div class="cfg-provider-foot"><button type="button" class="btn danger" data-config-act="remove" data-path="${configPath(path)}">Remove ${esc(title)}</button></div>
         </div></details>`;
     }).join('') : `<div class="cfg-empty-state"><h3>No ${compatible ? 'compatible providers' : `${esc(label)} keys`} configured</h3><p>${compatible ? 'Connect OpenRouter, Ollama, or another OpenAI-compatible endpoint.' : 'Add an API key to use alongside your signed-in accounts.'}</p></div>`}`;
 }
 
 function configModelsHTML() {
-  const names = [...new Set([...['claude', 'codex', 'antigravity', 'kimi', 'xai', 'meta', 'devin', 'vertex'],
-    ...Object.keys(configGet(['oauth-model-alias']) || {}), ...Object.keys(configGet(['oauth-excluded-models']) || {})])];
+  const known = CONFIG_OAUTH.map(([p]) => p);
+  const names = [...new Set([...known, ...Object.keys(configGet(['oauth-model-alias']) || {}), ...Object.keys(configGet(['oauth-excluded-models']) || {})])];
   const provider = S.config.oauthProvider;
-  return `<h2>OAuth model rules</h2><p class="cfg-description">Rules for signed-in accounts. API key model rules are set under Providers.</p>
-    <div class="field cfg-provider-select"><label for="oauth-provider">Provider</label><select id="oauth-provider" data-config-provider="oauth">${names.map((p) => `<option value="${esc(p)}" ${p === provider ? 'selected' : ''}>${esc(PROVIDER[p] || p)}</option>`).join('')}</select></div>
+  const count = (p) => ((configGet(['oauth-model-alias', p]) || []).length + (configGet(['oauth-excluded-models', p]) || []).length);
+  return `<div class="cfg-tabs" role="group" aria-label="Provider">${names.map((p) => `<button type="button" data-config-act="oauth-provider" data-provider="${esc(p)}" aria-pressed="${p === provider}">${logo(p, null, null, 14)}${esc((CONFIG_OAUTH.find(([id]) => id === p) || [, PROVIDER[p] || p])[1])}<span class="n">${count(p)}</span></button>`).join('')}</div>
     ${configAliases(['oauth-model-alias', provider], true)}
-    ${configStrings(['oauth-excluded-models', provider], 'Excluded models', 'Model names or patterns these OAuth accounts must not serve. Use * as a wildcard.')}`;
+    <div class="cfg-divider"></div>
+    ${configStrings(['oauth-excluded-models', provider], 'Excluded models', 'Model names or patterns these accounts must not serve. Use * as a wildcard.')}`;
 }
 
 function configDiagnosticsHTML() {
-  return `<h2>Diagnostics</h2>${configSwitch(['debug'], 'Debug logging', 'Write detailed server logs for troubleshooting.', true)}
-    <div class="cfg-divider"></div><h3>Compatibility notices</h3>
-    ${S.config.ignored.length ? `<p class="cfg-description">These settings are retained in the file but have no effect in CLIProxyAPI-Rust.</p><ul class="cfg-notices">${S.config.ignored.map((s) => `<li>${esc(s)}</li>`).join('')}</ul>` : '<p class="cfg-description">No ignored CLIProxyAPI features were detected.</p>'}`;
+  return `${configSwitch(['debug'], 'Debug logging', 'Write detailed server logs for troubleshooting.', true)}
+    <div class="cfg-divider"></div>
+    <div class="cfg-list">${configListHead('Compatibility notices', S.config.ignored.length ? 'These settings are kept in the file but have no effect in Fusebox.' : 'No ignored CLIProxyAPI features were detected.')}
+    ${S.config.ignored.length ? `<ul class="cfg-notices">${S.config.ignored.map((s) => `<li>${esc(s)}</li>`).join('')}</ul>` : ''}</div>`;
 }
 
 // The whole file, for settings the sections don't cover. One kind of edit at a time:
@@ -218,17 +261,16 @@ const rawDirty = () => S.config.raw.text != null && S.config.raw.text !== S.conf
 function configYamlHTML() {
   const c = S.config;
   const r = c.raw;
-  const head = '<h2>YAML file</h2><p class="cfg-description">The whole config.yaml, including settings the other sections don\'t cover. Changes are checked before they are applied.</p>';
-  if (configDirty()) return `${head}<p class="cfg-empty">Save or discard the changes in the other sections first.</p>`;
+  if (configDirty()) return '<p class="cfg-empty">Save or discard the changes in the other sections first.</p>';
   if (S.private && !c.reveal) {
-    return `${head}<div class="cfg-empty-state"><h3>Hidden while emails and keys are hidden</h3><p>config.yaml holds your API keys in plain text.</p>
-      <button type="button" class="btn" data-act="reveal-config">${ICON.eye}Show file</button></div>`;
+    return `<div class="cfg-empty-state"><h3>Hidden while emails and keys are hidden</h3><p>config.yaml holds your API keys in plain text.</p>
+      <button type="button" class="btn" data-act="reveal-config">Show file</button></div>`;
   }
   if (r.text == null) {
     loadRawConfig();
-    return `${head}<div class="skel-rows" aria-busy="true" aria-label="Loading">${'<div class="skel"></div>'.repeat(4)}</div>`;
+    return `<div class="skel-rows" aria-busy="true" aria-label="Loading">${'<div class="skel"></div>'.repeat(4)}</div>`;
   }
-  return `${head}<label class="sr-only" for="cfg-yaml">config.yaml</label>
+  return `<label class="sr-only" for="cfg-yaml">config.yaml</label>
     <textarea id="cfg-yaml" class="editor" spellcheck="false" autocapitalize="off" autocomplete="off">${esc(r.text)}</textarea>`;
 }
 
@@ -262,40 +304,67 @@ async function saveRawConfig() {
   if (ta2 && pos) { ta2.focus(); ta2.selectionStart = ta2.selectionEnd = pos[0]; ta2.scrollTop = pos[1]; }
 }
 
-function configFootHTML() {
+// The footer's message, and whether there is anything to save.
+function configFootState() {
   const c = S.config;
   if (c.section === 'yaml') {
     const dirty = rawDirty();
-    const msg = c.msg || (dirty ? { kind: '', text: 'The file has unsaved changes.' } : { kind: 'dim', text: 'Saved changes apply immediately.' });
-    return `<div class="cfg-foot-actions"><button type="button" class="btn primary" data-config-act="save" ${dirty && !c.busy ? '' : 'disabled'}>${c.busy ? 'Saving…' : 'Save file'}</button>
-      <button type="button" class="btn ghost" data-config-act="discard" ${dirty && !c.busy ? '' : 'disabled'}>Revert</button></div>
-      <p class="msg ${msg.kind}" role="status">${esc(msg.text)}</p>`;
+    return { dirty, save: 'Save file', discard: 'Revert',
+      msg: c.msg || (dirty ? { kind: '', text: 'The file has unsaved changes.' } : { kind: 'dim', text: 'Saved changes apply immediately.' }) };
   }
   const count = Object.keys(configChanges()).length;
   const error = Object.values(c.errors).find(Boolean);
-  const msg = c.msg || (count ? { kind: '', text: `${count} ${count === 1 ? 'setting has' : 'settings have'} unsaved changes.` } : { kind: 'dim', text: 'Changes are saved to your config file.' });
-  return `<div class="cfg-foot-actions"><button type="button" class="btn primary" data-config-act="save" ${count && !c.busy ? '' : 'disabled'}>${c.busy ? 'Saving…' : 'Save changes'}</button>
-    <button type="button" class="btn ghost" data-config-act="discard" ${count && !c.busy ? '' : 'disabled'}>Discard changes</button></div>
-    <p class="msg ${error ? 'err' : msg.kind}" role="status">${esc(error || msg.text)}</p>`;
+  const msg = error ? { kind: 'err', text: error }
+    : c.msg || (count ? { kind: '', text: `${count} ${count === 1 ? 'setting has' : 'settings have'} unsaved changes.` } : { kind: 'dim', text: 'Changes are saved to your config file.' });
+  return { dirty: count > 0, save: 'Save changes', discard: 'Discard changes', msg };
+}
+
+function configFootHTML() {
+  const c = S.config;
+  const f = configFootState();
+  const dot = { err: 'err', ok: 'ok', dim: 'dim', '': 'pending' }[f.msg.kind] || 'pending';
+  const can = f.dirty && !c.busy;
+  return `<span class="dot s7 ${dot}"></span><span class="msg ${f.msg.kind}" role="status">${esc(f.msg.text)}</span><span class="grow"></span>
+    <kbd class="kbd">${MOD}S</kbd>
+    <button type="button" class="btn ghost" data-config-act="discard" ${can ? '' : 'disabled'}>${mob() ? 'Discard' : f.discard}</button>
+    <button type="button" class="btn primary" data-config-act="save" ${can ? '' : 'disabled'}>${c.busy ? 'Saving…' : mob() ? 'Save' : f.save}</button>`;
+}
+
+// Phones only show the save bar while there is something to save or report.
+function configFootClass() {
+  const f = configFootState();
+  return `cfg-foot${f.dirty || ['ok', 'err'].includes(f.msg.kind) ? '' : ' idle'}`;
+}
+
+function configDirtySections() {
+  const out = new Set(Object.keys(configChanges()).map((k) => CONFIG_KEY_SECTION[k] || 'providers'));
+  if (rawDirty()) out.add('yaml');
+  return out;
 }
 
 function configHTML() {
   const c = S.config;
   if (!c.values) {
     if (!c.loading && !c.msg) loadConfig();
-    if (c.msg) return `<div class="empty"><h1>Configuration</h1><p class="err" role="alert">${esc(c.msg.text)}</p><button class="btn" data-config-act="reload">Try again</button></div>`;
+    if (c.msg) return `<div class="lock"><h1>Config</h1><p class="err" role="alert">${esc(c.msg.text)}</p><button class="btn" type="button" data-config-act="reload">Try again</button></div>`;
     return skeletonHTML();
   }
   const sections = { server: configServerHTML, access: configAccessHTML, routing: configRoutingHTML,
     connections: configConnectionsHTML, providers: configProvidersHTML, models: configModelsHTML, diagnostics: configDiagnosticsHTML, yaml: configYamlHTML };
-  return `<div class="page-head"><div><h1>Configuration</h1><p class="mono cfg-path">${esc(home(c.path))}</p></div>
-      <button type="button" class="btn ghost" data-config-act="reload" ${c.busy ? 'disabled' : ''}>Reload settings</button></div>
-    ${c.reloadConfirm ? '<div class="cfg-banner"><span>Reloading will discard your unsaved changes.</span><button class="btn small" data-config-act="confirm-reload">Reload and discard</button><button class="btn ghost small" data-config-act="cancel-reload">Keep editing</button></div>' : ''}
-    ${c.restart_fields.length ? `<div class="cfg-banner warn" role="status">Restart CLIProxyAPI-Rust to apply changes to ${esc(c.restart_fields.join(', '))}.</div>` : ''}
-    <div class="cfg-layout"><nav class="cfg-nav" aria-label="Configuration sections">${CONFIG_SECTIONS.map(([id, name]) => `<button type="button" data-config-act="section" data-section="${id}" ${c.section === id ? 'aria-current="page"' : ''}>${name}</button>`).join('')}</nav>
-    <form id="config-form" class="cfg-content" aria-label="${esc(CONFIG_SECTIONS.find(([id]) => id === c.section)[1])} settings" novalidate>
+  const dirty = configDirtySections();
+  const name = CONFIG_SECTIONS.find(([id]) => id === c.section)[1];
+  const restart = { host: 'bind address', port: 'port', tls: 'HTTPS', debug: 'debug logging' };
+  const sectionAction = c.section === 'providers' ? `<button type="button" class="btn" data-config-act="add-provider">Add ${c.provider === 'compat' ? 'provider' : 'key'}</button>` : '';
+  const reload = `<button type="button" class="btn" data-config-act="reload" ${c.busy ? 'disabled' : ''}>Reload from file</button>`;
+  return `<div class="page-head">${mob() ? `<span class="mono meta ellipsis" style="font-size:12px">${esc(home(c.path))}</span>` : `<div><h1 class="h-page">Config</h1><span class="mono meta" style="font-size:12.5px">${esc(home(c.path))}</span></div>`}<span class="grow"></span>${reload}</div>
+    ${c.reloadConfirm ? '<div class="banner plain"><span class="grow">Reloading will discard your unsaved changes.</span><button class="btn sm" type="button" data-config-act="confirm-reload">Reload and discard</button><button class="btn sm ghost" type="button" data-config-act="cancel-reload">Keep editing</button></div>' : ''}
+    ${c.restart_fields.length ? `<div class="banner warn" role="status"><span class="dot warn"></span><span class="grow">Restart Fusebox to apply changes to ${esc(c.restart_fields.map((f) => restart[f] || f).join(', '))}.</span></div>` : ''}
+    <div class="cfg-chips" role="group" aria-label="Config sections">${CONFIG_SECTIONS.map(([id, label]) => `<button type="button" data-config-act="section" data-section="${id}" ${c.section === id ? 'aria-current="page"' : ''}>${label}<span class="cfg-dot${dirty.has(id) ? ' on' : ''}" aria-label="${dirty.has(id) ? 'Unsaved changes' : ''}"></span></button>`).join('')}</div>
+    <div class="cfg-layout"><nav class="cfg-nav" aria-label="Config sections">${CONFIG_SECTIONS.map(([id, label]) => `<button type="button" data-config-act="section" data-section="${id}" ${c.section === id ? 'aria-current="page"' : ''}><span>${label}</span><span class="cfg-dot${dirty.has(id) ? ' on' : ''}"${dirty.has(id) ? ' title="Unsaved changes"' : ''}></span></button>`).join('')}</nav>
+    <form id="config-form" class="card cfg-content" aria-label="${esc(name)} settings" novalidate>
+      <div class="cfg-sec-head"><div class="cell2"><h2 class="h-sec">${esc(name)}</h2><p class="meta">${esc(CONFIG_DESCRIPTIONS[c.section])}</p></div>${sectionAction}</div>
       <fieldset ${c.busy ? 'disabled' : ''}>${sections[c.section]()}</fieldset></form></div>
-    <div class="cfg-foot" id="config-foot" aria-live="polite">${configFootHTML()}</div>`;
+    <div class="${configFootClass()}" id="config-foot" aria-live="polite">${configFootHTML()}</div>`;
 }
 
 function acceptConfig(result) {
@@ -318,7 +387,11 @@ async function loadConfig() {
 
 function configUpdateFoot() {
   const foot = $('#config-foot');
-  if (foot) foot.innerHTML = configFootHTML();
+  if (foot) { foot.innerHTML = configFootHTML(); foot.className = configFootClass(); }
+  const dirty = configDirtySections();
+  for (const dot of $$('.cfg-nav [data-section] .cfg-dot, .cfg-chips [data-section] .cfg-dot')) {
+    dot.classList.toggle('on', dirty.has(dot.closest('[data-section]').dataset.section));
+  }
 }
 
 function configError(path, message) {
@@ -420,7 +493,7 @@ async function saveConfig() {
     // A newly configured dashboard key must also authenticate this browser's next request.
     if (oldKey !== newKey) {
       S.key = newKey;
-      if (newKey) localStorage.setItem('cliproxyapi-rust.key', newKey); else localStorage.removeItem('cliproxyapi-rust.key');
+      if (newKey) store.set('key', newKey); else store.del('key');
       ws?.close();
     }
     refreshAccounts();
@@ -458,12 +531,10 @@ function bindConfig() {
     const path = JSON.parse(input.dataset.cfg);
     let value = input.type === 'number' ? (input.value === '' ? null : Number(input.value)) : input.value;
     if (input.dataset.nullable && value === '') value = null;
-    if (path[0] === 'management-allow-remote') value = JSON.parse(input.value);
     if (input.dataset.secret) S.config.secrets[JSON.stringify(path)] = true;
     configSet(path, value);
     configError(path, ''); S.config.msg = null;
-    if (path[0] === 'routing') { render(); document.getElementById(input.id)?.focus(); }
-    else configUpdateFoot();
+    configUpdateFoot();
   });
   const updateHeaderName = (e) => {
     const input = e.target.closest('[data-header-path]');
@@ -481,12 +552,13 @@ function bindConfig() {
       if (old !== name) {
         Object.defineProperty(headers, name, { value: headers[old], writable: true, enumerable: true, configurable: true });
         delete headers[old];
-        const row = input.closest('.cfg-header-row');
+        const row = input.closest('.cfg-row');
         const valueInput = row.querySelector('[data-cfg]');
         const oldId = valueInput.id;
         valueInput.dataset.cfg = JSON.stringify([...path, name]);
         valueInput.id = configId([...path, name]);
         row.querySelector(`label[for="${CSS.escape(oldId)}"]`).htmlFor = valueInput.id;
+        row.querySelector(`label[for="${CSS.escape(valueInput.id)}"]`).textContent = `${name} value`;
         row.querySelector('[data-error-for]').dataset.errorFor = valueInput.id;
         row.querySelector('[data-error-for]').id = `${valueInput.id}-error`;
         valueInput.setAttribute('aria-describedby', `${valueInput.id}-error`);
@@ -495,7 +567,6 @@ function bindConfig() {
       }
       S.config.msg = null; configUpdateFoot();
     }
-    if (e.target.matches('[data-config-provider="oauth"]')) { S.config.oauthProvider = e.target.value; render(); }
   };
   form.addEventListener('input', updateHeaderName);
   form.addEventListener('change', updateHeaderName);
@@ -526,9 +597,20 @@ document.addEventListener('click', (e) => {
     if (c.section === 'yaml' && button.dataset.section !== 'yaml' && rawDirty()) {
       c.msg = { kind: 'err', text: 'Save or revert the file first.' }; configUpdateFoot(); return;
     }
-    c.section = button.dataset.section; c.msg = null; render(); $('.cfg-content h2')?.scrollIntoView({ block: 'nearest' }); return;
+    c.section = button.dataset.section; c.msg = null;
+    history.replaceState(null, '', `#/config/${c.section}`);
+    render();
+    $(`.cfg-nav [data-section="${c.section}"], .cfg-chips [data-section="${c.section}"]`)?.focus({ preventScroll: true });
+    if (mob()) $(`.cfg-chips [data-section="${c.section}"]`)?.scrollIntoView({ block: 'nearest', inline: 'nearest' });
+    return;
   }
-  if (act === 'provider') { c.provider = button.dataset.provider; render(); return; }
+  if (act === 'provider') { c.provider = button.dataset.provider; render(); $(`[data-config-act="provider"][data-provider="${c.provider}"]`)?.focus(); return; }
+  if (act === 'oauth-provider') { c.oauthProvider = button.dataset.provider; render(); $(`[data-config-act="oauth-provider"][data-provider="${CSS.escape(c.oauthProvider)}"]`)?.focus(); return; }
+  if (act === 'choice') {
+    configSet(path, JSON.parse(button.dataset.value)); c.msg = null; render();
+    $(`[data-config-act="choice"][data-path="${CSS.escape(button.dataset.path)}"][data-value="${CSS.escape(button.dataset.value)}"]`)?.focus();
+    return;
+  }
   if (act === 'switch') {
     configSet(path, !configGet(path)); c.msg = null; render(); document.getElementById(configId(path))?.focus(); return;
   }
@@ -549,8 +631,10 @@ document.addEventListener('click', (e) => {
   }
   if (act === 'add-string' || act === 'add-alias') {
     const list = configGet(path) || [];
-    list.push(act === 'add-string' ? '' : button.dataset.oauth ? { name: '', alias: '', fork: false } : { name: '', alias: null });
+    // New client keys start as a random fbx_ key; replace it to use your own.
+    list.push(act === 'add-string' ? (button.dataset.generate ? generateClientKey() : '') : button.dataset.oauth ? { name: '', alias: '', fork: false } : { name: '', alias: null });
     configSet(path, list);
+    if (button.dataset.generate) c.secrets[JSON.stringify([...path, list.length - 1])] = true;
   }
   if (act === 'remove') {
     const parent = path.slice(0, -1); const index = path[path.length - 1];
@@ -570,8 +654,14 @@ document.addEventListener('click', (e) => {
   }
 });
 
+function generateClientKey() {
+  const alphabet = 'abcdefghijklmnopqrstuvwxyz0123456789';
+  const bytes = crypto.getRandomValues(new Uint8Array(24));
+  return `fbx_${[...bytes].map((b) => alphabet[b % alphabet.length]).join('')}`;
+}
+
 function formInputsForAddedRow(act, path) {
-  if (act === 'add-provider') return $('.cfg-provider[open]:last-of-type input');
+  if (act === 'add-provider') return $$('.cfg-provider[open]').at(-1)?.querySelector('input');
   if (path) {
     if (act === 'add-header') return document.querySelectorAll('[data-header-path]')[document.querySelectorAll('[data-header-path]').length - 1];
     const index = (configGet(path)?.length || 1) - 1;

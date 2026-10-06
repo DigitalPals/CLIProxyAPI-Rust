@@ -39,9 +39,24 @@ fn identifier(v: &Value) -> Option<&str> {
     v.as_str().map(str::trim).filter(|s| !s.is_empty() && s.len() <= 1024)
 }
 
-/// Authentication middleware overwrites this scope, including for query-string keys.
+/// The internal scope header. Authentication middleware overwrites it (and strips
+/// [`LEGACY_SCOPE_HEADER`]), including for query-string keys.
+pub const SCOPE_HEADER: &str = "x-fusebox-client-scope";
+/// The scope header's name before the rename to Fusebox.
+pub const LEGACY_SCOPE_HEADER: &str = "x-cliproxy-client-scope";
+
+/// A header sent under its Fusebox name or its pre-rename `x-cliproxy-*` name; the new name wins.
+pub fn renamed_header<'a>(headers: &'a HeaderMap, name: &str, legacy: &str) -> Option<&'a str> {
+    header(headers, name).or_else(|| header(headers, legacy))
+}
+
+/// True when the client asks to end its session (`x-fusebox-session-end: true`).
+pub fn ends_session(headers: &HeaderMap) -> bool {
+    renamed_header(headers, "x-fusebox-session-end", "x-cliproxy-session-end") == Some("true")
+}
+
 pub fn client_scope(headers: &HeaderMap) -> String {
-    if let Some(scope) = header(headers, "x-cliproxy-client-scope") {
+    if let Some(scope) = renamed_header(headers, SCOPE_HEADER, LEGACY_SCOPE_HEADER) {
         return scope.to_string();
     }
     let key = header(headers, "authorization")
@@ -68,6 +83,8 @@ pub fn session_identity(headers: &HeaderMap, body: &Value) -> Option<SessionIden
     let claude_user = body["metadata"]["user_id"].as_str().unwrap_or_default();
     let claude_json: Value = serde_json::from_str(claude_user).unwrap_or(Value::Null);
     let (id, source) = [
+        "x-fusebox-session-id",
+        // The same header before the rename to Fusebox.
         "x-cliproxy-session-id",
         "thread-id",
         "x-codex-thread-id",
@@ -201,6 +218,18 @@ impl Drop for Lease {
         }
         registry.dirty = true;
     }
+}
+
+/// A session assignment, as the dashboard lists it.
+pub struct Pinned {
+    pub owner: String,
+    pub last_seen: i64,
+    pub active: bool,
+}
+
+/// How an assignment names its session: request logs carry the session key, assignments this.
+pub fn owner_of(session: &str) -> String {
+    digest(&["owner", session])
 }
 
 pub type Selection = Result<(Arc<Account>, String), (u16, String)>;
@@ -403,6 +432,31 @@ impl Sessions {
     pub fn prune(&self, idle: u64) {
         let mut registry = self.registry.lock();
         Self::prune_locked(&mut registry, idle);
+    }
+
+    /// Sessions per account that smart balancing counts right now (empty for other strategies).
+    pub fn account_load(&self, cfg: &Config) -> HashMap<String, usize> {
+        self.registry.lock().account_load(cfg)
+    }
+
+    /// Sessions currently assigned to `account`: their owner digest (see [`owner_of`]),
+    /// when one was last seen, and whether a call is in flight. Most recent first.
+    pub fn pinned(&self, account: &str, idle: u64) -> Vec<Pinned> {
+        let mut registry = self.registry.lock();
+        Self::prune_locked(&mut registry, idle);
+        let mut out: HashMap<&str, Pinned> = HashMap::new();
+        for (key, b) in registry.bindings.iter().filter(|(_, b)| b.account == account) {
+            let owner = if b.session.is_empty() { key.as_str() } else { b.session.as_str() };
+            let entry = out.entry(owner).or_insert_with(|| Pinned {
+                owner: owner.to_string(),
+                last_seen: b.last_seen,
+                active: registry.active.contains_key(owner),
+            });
+            entry.last_seen = entry.last_seen.max(b.last_seen);
+        }
+        let mut out: Vec<Pinned> = out.into_values().collect();
+        out.sort_by_key(|p| std::cmp::Reverse(p.last_seen));
+        out
     }
 
     /// Retries and requests without affinity still respect the reserve and current load.
@@ -909,6 +963,7 @@ mod tests {
             "x-codex-thread-id",
             "thread-id",
             "x-cliproxy-session-id",
+            "x-fusebox-session-id",
         ] {
             headers.insert(name, "task".parse().unwrap());
             let identity = session_identity(&headers, &json!({"prompt_cache_key":"lower-priority"})).unwrap();
@@ -968,7 +1023,7 @@ mod tests {
 
     #[test]
     fn assignments_survive_restart_and_idle_sessions_expire() {
-        let dir = std::env::temp_dir().join(format!("cliproxy-affinity-{}", uuid::Uuid::new_v4()));
+        let dir = std::env::temp_dir().join(format!("fusebox-affinity-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&dir).unwrap();
         let cfg = config(Routing::RoundRobin);
         let pool = Pool::default();

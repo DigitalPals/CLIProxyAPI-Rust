@@ -59,6 +59,9 @@ pub struct Config {
     /// CLIProxyAPI settings found in the file that have no effect here.
     #[serde(skip)]
     pub ignored: Vec<String>,
+    /// The file names no auth-dir and only the pre-Fusebox directory exists, so it is used.
+    #[serde(skip)]
+    pub legacy_auth_dir: bool,
     pub claude_api_key: Vec<KeyEntry>,
     pub codex_api_key: Vec<KeyEntry>,
     pub gemini_api_key: Vec<KeyEntry>,
@@ -204,7 +207,7 @@ impl Default for Config {
         Self {
             host: default_host(),
             port: 8317,
-            auth_dir: "~/.cli-proxy-api".into(),
+            auth_dir: DEFAULT_AUTH_DIR.into(),
             api_keys: vec![],
             management_key: String::new(),
             management_allow_remote: None,
@@ -223,6 +226,7 @@ impl Default for Config {
             oauth_model_alias: BTreeMap::new(),
             oauth_excluded_models: BTreeMap::new(),
             ignored: vec![],
+            legacy_auth_dir: false,
             claude_api_key: vec![],
             codex_api_key: vec![],
             gemini_api_key: vec![],
@@ -235,11 +239,15 @@ impl Default for Config {
     }
 }
 
-const TEMPLATE: &str = r#"# CLIProxyAPI-Rust configuration. Changes are picked up automatically.
+pub const DEFAULT_AUTH_DIR: &str = "~/.fusebox";
+/// Where sign-ins lived before the rename (and where CLIProxyAPI keeps them).
+pub const LEGACY_AUTH_DIR: &str = "~/.cli-proxy-api";
+
+const TEMPLATE: &str = r#"# Fusebox configuration. Changes are picked up automatically.
 
 host: "127.0.0.1"          # use 0.0.0.0 to expose on your network (set api-keys first!)
 port: 8317
-auth-dir: "~/.cli-proxy-api" # OAuth credentials (compatible with CLIProxyAPI)
+auth-dir: "~/.fusebox"      # OAuth credentials (CLIProxyAPI's files work too)
 
 # Keys your clients must send. Leave empty to allow anyone who can reach the port.
 api-keys: []
@@ -259,7 +267,7 @@ banked-resets: false        # show and spend banked Claude/ChatGPT limit resets 
 debug: false
 
 # API keys (optional). Accounts (Claude, Codex, Antigravity, Kimi, xAI, Meta, Devin, Vertex)
-# are added with `cliproxyapi-rust login <provider>` or from the dashboard.
+# are added with `fusebox login <provider>` or from the dashboard.
 claude-api-key: []
 #  - api-key: "sk-ant-..."
 #    base-url: "https://api.anthropic.com"   # optional
@@ -271,7 +279,7 @@ codex-api-key: []
 gemini-api-key: []
 #  - api-key: "AIza..."
 
-vertex-api-key: []          # Vertex AI express mode; service accounts: `cliproxyapi-rust login vertex --file sa.json`
+vertex-api-key: []          # Vertex AI express mode; service accounts: `fusebox login vertex --file sa.json`
 #  - api-key: "AQ..."
 
 kimi-api-key: []
@@ -294,14 +302,41 @@ openai-compatibility: []
 #        alias: "kimi-k3"
 "#;
 
-/// 127.0.0.1, unless the environment says otherwise (the Docker image binds all interfaces).
-fn default_host() -> String {
-    std::env::var("CLIPROXYAPI_RUST_DEFAULT_HOST").unwrap_or_else(|_| "127.0.0.1".into())
+/// The first of `names` that is set, so renamed variables keep their old spelling.
+pub fn first_env(names: &[&str], get: impl Fn(&str) -> Option<String>) -> Option<String> {
+    names.iter().find_map(|n| get(n).filter(|v| !v.is_empty()))
 }
 
-/// The commented starter config, bound to the default host.
+pub fn env_var(names: &[&str]) -> Option<String> {
+    first_env(names, |n| std::env::var(n).ok())
+}
+
+/// 127.0.0.1, unless the environment says otherwise (the Docker image binds all interfaces).
+fn default_host() -> String {
+    // CLIPROXYAPI_RUST_DEFAULT_HOST: the name before the rename to Fusebox, still honoured.
+    env_var(&["FUSEBOX_DEFAULT_HOST", "CLIPROXYAPI_RUST_DEFAULT_HOST"]).unwrap_or_else(|| "127.0.0.1".into())
+}
+
+fn home_dir() -> Option<PathBuf> {
+    std::env::var_os("HOME").or_else(|| std::env::var_os("USERPROFILE")).map(PathBuf::from)
+}
+
+/// `~/.fusebox`, unless only the pre-Fusebox `~/.cli-proxy-api` exists.
+pub fn default_auth_dir_in(home: Option<&Path>) -> &'static str {
+    match home {
+        Some(h) if !h.join(".fusebox").exists() && h.join(".cli-proxy-api").is_dir() => LEGACY_AUTH_DIR,
+        _ => DEFAULT_AUTH_DIR,
+    }
+}
+
+pub fn default_auth_dir() -> &'static str {
+    default_auth_dir_in(home_dir().as_deref())
+}
+
+/// The commented starter config, bound to the default host and auth directory.
 pub fn template() -> String {
-    TEMPLATE.replacen("host: \"127.0.0.1\"", &format!("host: \"{}\"", default_host()), 1)
+    let t = TEMPLATE.replacen("host: \"127.0.0.1\"", &format!("host: \"{}\"", default_host()), 1);
+    if default_auth_dir() == LEGACY_AUTH_DIR { t.replacen("\"~/.fusebox\"", "\"~/.cli-proxy-api\"", 1) } else { t }
 }
 
 pub fn expand_home(p: &str) -> PathBuf {
@@ -315,25 +350,37 @@ pub fn expand_home(p: &str) -> PathBuf {
 
 impl Config {
     pub fn load(path: &Path) -> Result<Self> {
+        let mut created = false;
         if !path.exists() {
             if let Some(dir) = path.parent().filter(|d| !d.as_os_str().is_empty()) {
                 std::fs::create_dir_all(dir).ok();
             }
             std::fs::write(path, template()).with_context(|| format!("writing {}", path.display()))?;
             tracing::info!("created default config at {}", path.display());
+            created = true;
         }
         let text = std::fs::read_to_string(path).with_context(|| format!("reading {}", path.display()))?;
-        Self::parse(&text)
+        let mut cfg = Self::parse(&text)?;
+        // A new config written with the legacy directory still deserves the startup note.
+        cfg.legacy_auth_dir |= created && cfg.auth_dir == LEGACY_AUTH_DIR;
+        Ok(cfg)
     }
 
     pub fn parse(text: &str) -> Result<Self> {
-        if text.trim().is_empty() {
-            return Ok(Self::default());
-        }
-        let mut doc: Yaml = serde_yaml::from_str(text).context("invalid config")?;
+        let mut doc: Yaml = if text.trim().is_empty() {
+            Yaml::Mapping(Default::default())
+        } else {
+            serde_yaml::from_str(text).context("invalid config")?
+        };
         let ignored = crate::compat::normalize(&mut doc);
+        let explicit = doc.get("auth-dir").is_some_and(|v| !v.is_null());
         let mut cfg: Config = serde_yaml::from_value(doc).context("invalid config")?;
         cfg.ignored = ignored;
+        // An explicit auth-dir always wins; otherwise keep using an existing legacy directory.
+        if !explicit && default_auth_dir() == LEGACY_AUTH_DIR {
+            cfg.auth_dir = LEGACY_AUTH_DIR.into();
+            cfg.legacy_auth_dir = true;
+        }
         Ok(cfg)
     }
 
@@ -343,5 +390,65 @@ impl Config {
 
     pub fn is_loopback(&self) -> bool {
         matches!(self.host.as_str(), "127.0.0.1" | "localhost" | "::1")
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn renamed_variables_fall_back_to_their_old_names() {
+        let env = |vars: &'static [(&'static str, &'static str)]| {
+            move |n: &str| vars.iter().find(|(k, _)| *k == n).map(|(_, v)| v.to_string())
+        };
+        let names = ["FUSEBOX_DEFAULT_HOST", "CLIPROXYAPI_RUST_DEFAULT_HOST"];
+        let both = env(&[("FUSEBOX_DEFAULT_HOST", "0.0.0.0"), ("CLIPROXYAPI_RUST_DEFAULT_HOST", "::")]);
+        assert_eq!(first_env(&names, both).as_deref(), Some("0.0.0.0"));
+        let old = env(&[("CLIPROXYAPI_RUST_DEFAULT_HOST", "::")]);
+        assert_eq!(first_env(&names, old).as_deref(), Some("::"));
+        let blank = env(&[("FUSEBOX_DEFAULT_HOST", ""), ("CLIPROXYAPI_RUST_DEFAULT_HOST", "::")]);
+        assert_eq!(first_env(&names, blank).as_deref(), Some("::"));
+        assert_eq!(first_env(&names, env(&[])), None);
+    }
+
+    #[test]
+    fn the_default_auth_dir_falls_back_to_an_existing_legacy_directory() {
+        let home = std::env::temp_dir().join(format!("fusebox-home-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&home).unwrap();
+        assert_eq!(default_auth_dir_in(Some(&home)), DEFAULT_AUTH_DIR);
+        std::fs::create_dir_all(home.join(".cli-proxy-api")).unwrap();
+        assert_eq!(default_auth_dir_in(Some(&home)), LEGACY_AUTH_DIR);
+        std::fs::create_dir_all(home.join(".fusebox")).unwrap();
+        assert_eq!(default_auth_dir_in(Some(&home)), DEFAULT_AUTH_DIR);
+        assert_eq!(default_auth_dir_in(None), DEFAULT_AUTH_DIR);
+        std::fs::remove_dir_all(home).unwrap();
+    }
+
+    #[test]
+    fn an_explicit_auth_dir_always_wins() {
+        for (text, dir) in [
+            ("auth-dir: /data/auths\n", "/data/auths"),
+            ("auth-dir: \"~/.cli-proxy-api\"\n", LEGACY_AUTH_DIR),
+            ("auth-dir: \"~/.fusebox\"\n", DEFAULT_AUTH_DIR),
+            ("oauth:\n  auth-dir: /nested\n", "/nested"),
+        ] {
+            let cfg = Config::parse(text).unwrap();
+            assert_eq!(cfg.auth_dir, dir);
+            assert!(!cfg.legacy_auth_dir);
+        }
+        // Without one, the default applies (or the legacy directory, when only that exists).
+        let cfg = Config::parse("port: 8317\n").unwrap();
+        assert_eq!(cfg.auth_dir, default_auth_dir());
+        assert_eq!(cfg.legacy_auth_dir, default_auth_dir() == LEGACY_AUTH_DIR);
+    }
+
+    #[test]
+    fn the_template_names_fusebox() {
+        let t = TEMPLATE;
+        assert!(t.starts_with("# Fusebox configuration."));
+        assert!(t.contains("auth-dir: \"~/.fusebox\""));
+        assert!(t.contains("`fusebox login <provider>`"));
+        assert_eq!(Config::parse(t).unwrap().auth_dir, DEFAULT_AUTH_DIR);
     }
 }

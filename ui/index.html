@@ -1,42 +1,60 @@
 <!doctype html>
 <!--
-THESIS: An always-on operator panel: the screen is off except for what you need lit — the endpoint, account health, and live traffic. Refuses the KPI-card grid.
-OWN-WORLD: Pure #000, luminance ramp (f4f4f5 / a1a1aa / 7c7c85) for hierarchy, 1px #1a1a1a hairlines, color only for state dots and the real provider logos, system sans + mono for data.
-STORY: Glance: is it running, are my accounts healthy, where is traffic going. Act: connect a client, sign in an account, fix a cooling account.
-FIRST VIEWPORT: Top bar with tabs and the privacy toggle (a red "Reconnecting" appears only if the live connection drops); a one-line endpoint strip; a full-width hour of traffic with inline totals; accounts with their 5-hour and weekly limits; latest requests below.
-FORM: Brief-pinned ("clean black OLED UI, simplistic"); no seed roll.
+Fusebox dashboard. One operator panel for the proxy: the main line (endpoint and key),
+the hour of load, what has tripped, every account's quota meters, and live traffic.
+Design system: DESIGN.md. Warm near-black surfaces, IBM Plex Sans for text, Plex Sans
+Condensed caps for labels, DM Mono for data, 20-segment quota meters, amber (#F3B52F)
+only for the active tab, the live bar and the phone tab indicator.
+Vanilla HTML/CSS/JS, embedded in the binary by src/server.rs. No build step and no
+external requests: fonts, logos and icons are all served from /ui.
 -->
 <html lang="en">
 <head>
   <meta charset="utf-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
   <meta name="color-scheme" content="dark">
-  <meta name="theme-color" content="#000000">
-  <title>CLIProxyAPI-Rust</title>
+  <meta name="theme-color" content="#0b0b0a">
+  <title>Fusebox</title>
   <link rel="icon" href="/ui/icon.svg" type="image/svg+xml">
+  <link rel="alternate icon" href="/favicon.ico" sizes="16x16 32x32">
+  <link rel="preload" href="/ui/fonts/ibm-plex-sans.woff2" as="font" type="font/woff2" crossorigin>
   <link rel="stylesheet" href="/ui/style.css">
 </head>
 <body>
   <!-- logos -->
-  <header class="bar">
-    <div class="bar-inner">
-      <a class="brand" href="#/overview" aria-label="CLIProxyAPI Rust overview">
-        <svg class="mark" viewBox="0 0 20 20" aria-hidden="true"><rect width="20" height="20" rx="5" fill="#e11d48"/><path d="M6 10h8M11 6.5 14.5 10 11 13.5" stroke="#fff" stroke-width="1.8" fill="none" stroke-linecap="round" stroke-linejoin="round"/></svg>
-        <span>CLIProxyAPI Rust</span>
-      </a>
-      <nav class="tabs" aria-label="Sections">
-        <a href="#/overview" data-tab="overview">Overview</a>
-        <a href="#/accounts" data-tab="accounts">Accounts</a>
-        <a href="#/requests" data-tab="requests">Requests</a>
-        <a href="#/config" data-tab="config">Config</a>
-      </nav>
-      <div class="bar-end">
-        <button class="btn ghost small icon-btn" id="privacy" type="button" data-act="privacy"></button>
-        <div class="bar-status" id="live-status" aria-live="polite"></div>
-      </div>
-    </div>
+  <a class="skip" href="#view">Skip to content</a>
+  <header class="bar" id="bar">
+    <a class="brand" href="#/overview" aria-label="Fusebox overview">
+      <svg class="wordmark" viewBox="0 -700 4327 914" aria-hidden="true" focusable="false"><path fill="#F3B52F" d="M0 -700H200V-600H100V114H200V214H0ZM4327 -700H4127V-600H4227V114H4127V214H4327Z"/><path fill="currentColor" d="M521 0L418 0L418-406L280-406L280-493L418-493L418-601Q418-646 445-673Q472-700 517-700L517-700L644-700L644-613L550-613Q521-613 521-583L521-583L521-493L663-493L663-406L521-406L521 0ZM932 9L932 9Q876 9 832-16Q788-41 763-87Q738-133 738-197L738-197L738-493L841-493L841-204Q841-140 873-109.5Q905-79 962-79L962-79Q1025-79 1063.5-121.5Q1102-164 1102-244L1102-244L1102-493L1205-493L1205 0L1104 0L1104-74L1088-74Q1074-44 1038-17.5Q1002 9 932 9ZM1534 14L1534 14Q1440 14 1378-28Q1316-70 1302-155L1302-155L1398-178Q1406-137 1425-113Q1444-89 1472.5-79Q1501-69 1534-69L1534-69Q1583-69 1609.5-88Q1636-107 1636-137L1636-137Q1636-167 1611-181Q1586-195 1537-204L1537-204L1503-210Q1453-219 1412-236Q1371-253 1347-283Q1323-313 1323-360L1323-360Q1323-430 1375-468.5Q1427-507 1513-507L1513-507Q1596-507 1649.5-469.5Q1703-432 1719-368L1719-368L1623-341Q1614-386 1585-404.5Q1556-423 1513-423L1513-423Q1471-423 1447-407.5Q1423-392 1423-364L1423-364Q1423-334 1446.5-320Q1470-306 1510-299L1510-299L1545-293Q1598-284 1642-268Q1686-252 1711.5-222Q1737-192 1737-142L1737-142Q1737-68 1682-27Q1627 14 1534 14ZM2058 14L2058 14Q1983 14 1927-17.5Q1871-49 1839.5-106.5Q1808-164 1808-240L1808-240L1808-252Q1808-329 1839-386.5Q1870-444 1925.5-475.5Q1981-507 2054-507L2054-507Q2125-507 2178.5-475.5Q2232-444 2262-388Q2292-332 2292-257L2292-257L2292-218L1913-218Q1915-153 1956.5-114.5Q1998-76 2060-76L2060-76Q2118-76 2147.5-102Q2177-128 2193-162L2193-162L2278-118Q2264-90 2237.5-59Q2211-28 2168-7Q2125 14 2058 14ZM1914-297L1914-297L2187-297Q2183-353 2147-384.5Q2111-416 2053-416L2053-416Q1995-416 1958.5-384.5Q1922-353 1914-297ZM2676 14L2676 14Q2604 14 2565.5-12Q2527-38 2508-70L2508-70L2492-70L2492 0L2391 0L2391-700L2494-700L2494-426L2510-426Q2522-446 2542-464.5Q2562-483 2595-495Q2628-507 2676-507L2676-507Q2738-507 2790-477Q2842-447 2873-390Q2904-333 2904-254L2904-254L2904-239Q2904-159 2872.5-102.5Q2841-46 2789.5-16Q2738 14 2676 14ZM2646-76L2646-76Q2713-76 2756.5-119Q2800-162 2800-242L2800-242L2800-251Q2800-330 2757-373Q2714-416 2646-416L2646-416Q2580-416 2536.5-373Q2493-330 2493-251L2493-251L2493-242Q2493-162 2536.5-119Q2580-76 2646-76ZM3238 14L3238 14Q3164 14 3106.5-16.5Q3049-47 3016-104Q2983-161 2983-239L2983-239L2983-254Q2983-332 3016-388.5Q3049-445 3106.5-476Q3164-507 3238-507L3238-507Q3312-507 3370-476Q3428-445 3461-388.5Q3494-332 3494-254L3494-254L3494-239Q3494-161 3461-104Q3428-47 3370-16.5Q3312 14 3238 14ZM3238-78L3238-78Q3306-78 3348.5-121.5Q3391-165 3391-242L3391-242L3391-251Q3391-328 3349-371.5Q3307-415 3238-415L3238-415Q3171-415 3128.5-371.5Q3086-328 3086-251L3086-251L3086-242Q3086-165 3128.5-121.5Q3171-78 3238-78ZM3646 0L3523 0L3711-249L3527-493L3648-493L3777-316L3793-316L3922-493L4044-493L3859-249L4047 0L3924 0L3793-181L3777-181L3646 0Z"/></svg>
+      <svg class="mark" viewBox="0 0 48 56" aria-hidden="true" focusable="false"><path fill="#F3B52F" d="M0 0H16V8H8V48H16V56H0ZM48 0H32V8H40V48H32V56H48Z"/><path fill="currentColor" d="M16 24H32V32H16Z"/></svg>
+    </a>
+    <nav class="tabs" aria-label="Sections">
+      <a href="#/overview" data-tab="overview">Overview</a>
+      <a href="#/accounts" data-tab="accounts">Accounts</a>
+      <a href="#/requests" data-tab="requests">Requests</a>
+      <a href="#/models" data-tab="models">Models</a>
+      <a href="#/config" data-tab="config">Config</a>
+    </nav>
+    <span class="grow"></span>
+    <button class="search" type="button" data-act="palette" aria-haspopup="dialog">
+      <svg viewBox="0 0 14 14" aria-hidden="true"><circle cx="6" cy="6" r="4.25"/><path d="M9.2 9.2l3 3"/></svg>
+      <span class="search-text">Search or run a command</span><kbd class="kbd" data-mod-key="K">⌘K</kbd>
+    </button>
+    <span class="faults-slot" data-faults-slot></span>
+    <button class="icon-btn" type="button" data-act="privacy" data-privacy></button>
+    <div class="live" data-live aria-live="polite"></div>
   </header>
+  <header class="mbar" id="mbar"></header>
   <main id="view" class="view" tabindex="-1"></main>
+  <nav class="mtabs" aria-label="Sections">
+    <a href="#/overview" data-tab="overview"><i aria-hidden="true"></i>Overview</a>
+    <a href="#/accounts" data-tab="accounts"><i aria-hidden="true"></i>Accounts</a>
+    <a href="#/requests" data-tab="requests"><i aria-hidden="true"></i>Requests</a>
+    <a href="#/models" data-tab="models"><i aria-hidden="true"></i>Models</a>
+    <a href="#/config" data-tab="config"><i aria-hidden="true"></i>Config</a>
+  </nav>
+  <div id="layer"></div>
+  <div id="toast" class="toast" role="status" aria-live="polite" hidden></div>
   <dialog id="banked-reset-modal" class="reset-modal" aria-labelledby="reset-modal-title" aria-describedby="reset-modal-account"></dialog>
   <script src="/ui/config.js"></script>
   <script src="/ui/app.js"></script>

@@ -76,9 +76,11 @@ impl Tracker {
                 id: app.stats.next_id(),
                 ts: Utc::now(),
                 client: client.as_str(),
+                client_app: None,
                 provider: String::new(),
                 model: model.to_string(),
                 account: String::new(),
+                account_id: String::new(),
                 session_id: None,
                 session_source: None,
                 routing_strategy: app.cfg().routing,
@@ -104,7 +106,13 @@ impl Tracker {
         self.log.attempts += 1;
         self.log.provider = acct.provider.as_str().to_string();
         self.log.account = acct.label.clone();
+        self.log.account_id = acct.id.clone();
         self.acct = Some(acct.clone());
+    }
+
+    /// Names the client program from its User-Agent, for the dashboard.
+    pub fn client_app(&mut self, headers: &HeaderMap) {
+        self.log.client_app = client_app(headers);
     }
 
     pub fn session(&mut self, key: Option<&str>, source: Option<&'static str>, cfg: &crate::config::Config) {
@@ -125,7 +133,7 @@ impl Tracker {
             tracing::warn!(
                 request_id = self.log.id,
                 transport = self.log.transport,
-                "request has no stable session identifier; send x-cliproxy-session-id to preserve its subscription across requests"
+                "request has no stable session identifier; send x-fusebox-session-id to preserve its subscription across requests"
             );
         }
     }
@@ -221,7 +229,7 @@ impl Tracker {
         self.app.stats.record(&self.log);
         self.app.broadcast("request", &self.log);
         tracing::info!(
-            target: "cliproxyapi_rust::request",
+            target: "fusebox::request",
             request_id = self.log.id,
             session = self.log.session_id.as_deref().unwrap_or("none"),
             session_source = self.log.session_source.unwrap_or("none"),
@@ -247,6 +255,28 @@ impl Drop for Tracker {
             }
         }
     }
+}
+
+/// The client program behind a request, when its headers say so. Unknown agents stay unnamed.
+pub fn client_app(headers: &HeaderMap) -> Option<&'static str> {
+    let get = |n: &str| headers.get(n).and_then(|v| v.to_str().ok()).unwrap_or_default().to_ascii_lowercase();
+    let (agent, originator) = (get("user-agent"), get("originator"));
+    let has = |s: &str| agent.contains(s);
+    Some(if has("claude-cli") || has("claude-code") {
+        "Claude Code"
+    } else if originator.starts_with("codex") || agent.starts_with("codex") {
+        "Codex"
+    } else if has("geminicli") || has("gemini-cli") {
+        "Gemini CLI"
+    } else if agent.starts_with("openai/") {
+        "OpenAI SDK"
+    } else if agent.starts_with("anthropic/") {
+        "Anthropic SDK"
+    } else if agent.starts_with("curl/") {
+        "curl"
+    } else {
+        return None;
+    })
 }
 
 // -------------------------------------------------------------------- pipeline
@@ -513,7 +543,7 @@ pub async fn execute(app: Arc<App>, mut call: Call) -> Reply {
     let headers = call.headers.clone();
     let session = call.session.clone();
     let lease = session.as_deref().map(|s| app.sessions.hold(s, app.cfg().session_affinity_idle_seconds));
-    let end_session = headers.get("x-cliproxy-session-end").is_some_and(|v| v == "true");
+    let end_session = crate::affinity::ends_session(&headers);
     let full = capture.as_ref().map(|_| crate::affinity::input_items(&call.body)).unwrap_or_default();
     match execute_inner(app.clone(), call).await {
         Reply::Stream { mut frames, account } if lease.is_some() => {
@@ -566,6 +596,7 @@ async fn execute_inner(app: Arc<App>, call: Call) -> Reply {
     let (only, model) = app.pool.route(&model);
     let model = app.pool.canonical(&model, only.as_ref());
     let mut tracker = Tracker::new(&app, call.format, call.stream, call.transport, &model);
+    tracker.client_app(&call.headers);
     tracker.session(call.session.as_deref(), call.session_source, &cfg);
 
     let mut parsed: Option<Request> = None;

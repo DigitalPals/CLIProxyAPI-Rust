@@ -1,159 +1,195 @@
 ---
-name: CLIProxyAPI-Rust dashboard
-description: Pure-black OLED operator panel for a local AI API proxy.
+name: Fusebox dashboard
+description: A warm near-black operator panel for a local AI API proxy, read like a fusebox.
 colors:
-  bg: "#000000"
-  raise: "#0a0a0a"
-  raise-hover: "#111111"
-  line: "#1a1a1a"
-  line-strong: "#2a2a2a"
-  line-hover: "#3a3a3f"
-  bar-idle: "#3f3f46"
-  meter-track: "#232327"
-  switch-on: "#e4e4e7"
-  lit: "#ffffff"
-  fg: "#f4f4f5"
-  fg-2: "#a1a1aa"
-  fg-3: "#7c7c85"
+  bg: "#0b0b0a"
+  surface: "#121210"
+  surface-pop: "#141412"
+  surface-inset: "#0e0e0c"
+  row-hover: "#151513"
+  row-fresh: "#1b1811"
+  ctl-hover: "#1c1b18"
+  icon-hover: "#1a1917"
+  pal-active: "#1f1e1a"
+  seg-on: "#2a2925"
+  line: "#24231f"
+  line-soft: "#1d1c19"
+  line-strong: "#33312c"
+  line-hover: "#4a4740"
+  card-hover: "#3d3b35"
+  rivet: "#2b2a26"
+  fg: "#f2efe8"
+  fg-2: "#b4afa4"
+  fg-3: "#857f74"
+  idle: "#55524b"
+  bar: "#3a3833"
+  meter: "#d9d4c8"
+  brand: "#F3B52F"
   ok: "#4ade80"
   warn: "#fbbf24"
   err: "#fb7185"
-  brand: "#e11d48"
+  warn-line: "#4a3f22"
+  err-line: "#4a2a30"
+  err-field: "#7a3440"
+  err-btn-line: "#3a2328"
+  err-hover: "#1f1414"
 typography:
   body:
-    fontFamily: "ui-sans-serif, -apple-system, BlinkMacSystemFont, Segoe UI, system-ui, sans-serif"
+    fontFamily: "IBM Plex Sans"
     fontSize: "14px"
     fontWeight: 400
-    lineHeight: 1.5
-  title:
-    fontFamily: "ui-sans-serif, -apple-system, BlinkMacSystemFont, Segoe UI, system-ui, sans-serif"
+    lineHeight: 1.45
+  row:
+    fontFamily: "IBM Plex Sans"
+    fontSize: "13px"
+    fontWeight: 400
+  meta:
+    fontFamily: "IBM Plex Sans"
+    fontSize: "12-12.5px"
+    fontWeight: 400
+  figure:
+    fontFamily: "IBM Plex Sans"
+    fontSize: "20px (phone 17px)"
+    fontWeight: 500
+    lineHeight: 1.15
+    letterSpacing: "-0.01em"
+  drawer-title:
+    fontFamily: "IBM Plex Sans"
+    fontSize: "17px"
+    fontWeight: 600
+  page-title:
+    fontFamily: "IBM Plex Sans Condensed"
     fontSize: "22px"
     fontWeight: 600
-    lineHeight: 1.2
-    letterSpacing: "-0.015em"
-  section:
-    fontFamily: "ui-sans-serif, -apple-system, BlinkMacSystemFont, Segoe UI, system-ui, sans-serif"
-    fontSize: "15px"
+    letterSpacing: "0.08em"
+    textTransform: uppercase
+  section-title:
+    fontFamily: "IBM Plex Sans Condensed"
+    fontSize: "13px (phone 12px)"
     fontWeight: 600
-    lineHeight: 1.3
-  label:
-    fontFamily: "ui-sans-serif, -apple-system, BlinkMacSystemFont, Segoe UI, system-ui, sans-serif"
-    fontSize: "12px"
-    fontWeight: 500
-    lineHeight: 1.4
-  figure:
-    fontFamily: "ui-sans-serif, -apple-system, BlinkMacSystemFont, Segoe UI, system-ui, sans-serif"
-    fontSize: "20px"
-    fontWeight: 500
-    lineHeight: 1.2
-    letterSpacing: "-0.02em"
-  figure-compact:
-    fontFamily: "ui-sans-serif, -apple-system, BlinkMacSystemFont, Segoe UI, system-ui, sans-serif"
-    fontSize: "17px"
-    fontWeight: 500
-    lineHeight: 1.2
+    letterSpacing: "0.12em"
+    textTransform: uppercase
+  panel-label:
+    fontFamily: "IBM Plex Sans Condensed"
+    fontSize: "11px"
+    fontWeight: 600
+    letterSpacing: "0.12em"
+    textTransform: uppercase
+  table-header:
+    fontFamily: "IBM Plex Sans Condensed"
+    fontSize: "11px"
+    fontWeight: 600
+    letterSpacing: "0.10em"
+    textTransform: uppercase
+  tag-caps:
+    fontFamily: "IBM Plex Sans Condensed"
+    fontSize: "10.5px"
+    fontWeight: 600
+    letterSpacing: "0.08em"
   data:
-    fontFamily: "ui-monospace, SF Mono, SFMono-Regular, Menlo, Consolas, monospace"
-    fontSize: "12.5px"
+    fontFamily: "DM Mono"
+    fontSize: "11-14px"
     fontWeight: 400
-    lineHeight: 1.5
 rounded:
-  hair: "1.5px"
-  bar: "2px"
-  meter: "3px"
-  xs: "4px"
+  segment: "1px"
+  track: "2px"
+  route-tag: "3px"
+  kbd: "4px"
   tag: "5px"
-  sm: "6px"
-  seg-inner: "7px"
-  md: "8px"
-  seg: "9px"
-  lg: "12px"
+  control: "6px"
+  segmented: "7px"
+  panel: "8px"
+  popover: "10px"
+  sheet: "18px"
 spacing:
-  xs: "4px"
-  sm: "8px"
-  md: "12px"
-  lg: "20px"
-  xl: "32px"
-  xxl: "48px"
+  page: "28px clamp(16px, 3vw, 40px) 56px (phone 16px 16px 24px)"
+  section-gap: "32px (phone 24px)"
+  panel: "18px 20px"
+  row: "10px vertical, 16px column gap"
 components:
   button:
-    backgroundColor: "{colors.bg}"
+    borderColor: "{colors.line-strong}"
     textColor: "{colors.fg}"
-    rounded: "{rounded.md}"
-    height: "32px"
-    padding: "0 12px"
-  button-hover:
-    backgroundColor: "{colors.raise-hover}"
+    rounded: "{rounded.control}"
+    height: "32px (phone 36-44px)"
   button-primary:
     backgroundColor: "{colors.fg}"
     textColor: "{colors.bg}"
-    rounded: "{rounded.md}"
-    height: "32px"
-    padding: "0 14px"
+    hoverBackground: "#ffffff"
   input:
-    backgroundColor: "{colors.raise}"
-    textColor: "{colors.fg}"
-    rounded: "{rounded.md}"
-    height: "34px"
-    padding: "0 10px"
-  code-block:
-    backgroundColor: "{colors.raise}"
-    textColor: "{colors.fg-2}"
+    backgroundColor: "{colors.bg}"
+    borderColor: "{colors.line-strong}"
     typography: "{typography.data}"
-    rounded: "{rounded.lg}"
+    height: "34px"
+  panel:
+    backgroundColor: "{colors.surface}"
+    borderColor: "{colors.line}"
+    rounded: "{rounded.panel}"
+  code-block:
+    backgroundColor: "{colors.bg}"
+    textColor: "{colors.fg-2}"
+    rounded: "{rounded.control}"
     padding: "14px 16px"
 ---
 
 ## Overview
 
-An operator panel that behaves like an always-on display: the screen is black, and only information is lit. Luminance, not color, carries hierarchy (fg → fg-2 → fg-3). Color is reserved for state (ok / warn / err) and for the providers' own logos. Nothing glows. There are no cards: sections are separated by space and single hairlines.
+Fusebox is read like the fusebox it is named after. The main line comes in at the top, every account is a circuit with its own breaker, and anything that has tripped is said plainly with the time it comes back. Surfaces are warm near-black, text is warm off-white, and hierarchy comes from luminance and from type: condensed capitals for labels, a plain sans for reading, a monospace for data.
 
-Mode: Operate. Familiar controls, dense tables, tabular numbers, system fonts.
+Mode: Operate. Familiar controls, dense tables, tabular numbers, keyboard shortcuts.
 
 ## Colors
 
-- `bg` #000 everywhere; OLED pixels stay off. `raise` (#0a0a0a) only for inputs, code and inline panels.
-- Text ramp: `fg` for primary values and titles, `fg-2` for body and secondary values, `fg-3` (5.1:1) for labels and metadata. Never go dimmer than `fg-3` for text.
-- State: `ok` ready/success, `warn` cooling down, `err` failures. Used for dots and short status words, never for large fills.
-- `brand` rose is the mark only. It is not a text color (4.47:1 on black).
-- Providers are identified by their real logos, in their own colors. One-color marks (OpenAI, Grok, xAI, OpenRouter, Ollama, LM Studio, Groq) take `fg`; the generic OpenAI-compatible mark takes `fg-3`.
-- Supporting neutrals: `line-hover` for hovered control borders, `meter-track` for the empty part of usage meters, `bar-idle` for traffic bars and disabled dots, `switch-on` for an enabled switch track, and `lit` (#fff) only for the instant a new row lights up and for the hovered primary button.
+- `bg` #0b0b0a for the page, header, phone tab bar, inputs and code. `surface` #121210 for panels and the drawer; `surface-pop` for the command palette and faults menu; `surface-inset` for an expanded request.
+- Text ramp: `fg` for primary text and values, `fg-2` for body copy in rows, `fg-3` (4.9:1 on `bg`) for labels, headers and metadata. Never dimmer than `fg-3` for text; `idle` is only for a disabled dot.
+- State: `ok` ready and live, `warn` cooling, 75–94% used and routing detours, `err` errors, 95%+ used and failed requests. Dots, short words and meter segments only, never large fills.
+- `brand` amber #F3B52F is the fuse. It appears in four places only: the active tab's underline, the current minute's load bar, link hover and the phone tab indicator (plus the selected option ring, the unsaved-section dot and the `NEXT` route tag). Never a fill, never body text.
+- Providers are identified by their real logos (`ui/logos.svg`, LobeHub Icons, MIT) through `<use>`; one-colour marks take `fg`.
 
 ## Typography
 
-One system sans family for all UI; monospace only for real code and data (endpoints, model ids, keys, config, numbers in logs). All numbers use `font-variant-numeric: tabular-nums`. Section titles are sentence case at 15px/600 with no eyebrows or tracking.
+Self-hosted from `ui/fonts/` (latin subset, SIL OFL 1.1), served at `/ui/fonts/*` with no external requests.
+
+- IBM Plex Sans for everything people read: 14px/1.45 body, 13px rows and buttons, 12–12.5px metadata, 20px/500 figures.
+- IBM Plex Sans Condensed, uppercase and tracked, for labels: 22px page titles (Accounts, Requests, Models, Config), 13px section titles (Subscriptions, Other circuits, Latest requests), 11px panel labels (Main line, Load · last 60 min, Tripped & faults) and table headers, 10.5px meter labels (5H, WK), `NEEDS RESTART` and `NEXT`. Labels are written in sentence case in the markup and set in capitals by CSS.
+- DM Mono for data: the endpoint, keys, model ids, times, status codes, session ids, file paths, YAML and keyboard hints.
+- `font-variant-numeric: tabular-nums` everywhere.
 
 ## Layout
 
-Single column, max width 1180px, 32px side padding (16px on mobile). Sticky 56px top bar with tabs and the privacy toggle; a red "Reconnecting" appears beside it only while the live connection is down (the brand mark gives way to the tabs under 480px). More space above a section title (32–40px) than below it (12px).
+Fluid and full width (no max-width container). Desktop: a 56px header with the wordmark (the mark below 900px), five tabs (Overview, Accounts, Requests, Models, Config), the search button (⌘K), the faults button, the privacy toggle and Live / Reconnecting. Phones (below 760px): a 52px header (the wordmark on Overview, otherwise the mark and the page title) and a 64px bottom tab bar with an amber 16×2px indicator.
 
-Overview, top to bottom: a one-line endpoint strip (endpoint, key, model count, and a "Set up a client" disclosure that expands the client snippets; open until the first request, then remembered), traffic, accounts at full width, latest requests. The accounts table gives subscription limits their own columns (5-hour, weekly) so several subscriptions compare at a glance; accounts that report limits come first. A Used / Remaining switch beside the section title flips every meter between the share used and the share left (remembered per browser, synced across tabs). On phones each row stacks: name and status, then the two meters side by side with inline labels ("5h used", "Week left").
+Overview, top to bottom: the main line (endpoint, key, model count and "Set up a client", open until the first request), then Load · last 60 min beside Tripped & faults, Subscriptions, Other circuits, Latest requests. On phones the order is main line, faults, subscriptions, load, other circuits, latest requests.
 
-Config: a section list on the left (Server, Access, Routing, Connections, Providers, Models, Diagnostics, YAML file) beside one form at a time, with Save and Discard in a footer shared by every section. Fields sit in a two-column grid that collapses to one on phones; settings that need a restart carry a "Needs restart" note. YAML file is the whole config.yaml in the monospace editor, for anything the forms don't cover; form drafts and file drafts never stack.
+Column tiers: Requests adds First token at 1100px and In / Out / Cached at 1360px; Accounts adds Traffic at 1100px and # / Last used at 1380px; Overview's subscriptions add # and Requests at 1180px and latest requests add First token at 1240px; Models shows route order beside the ids from 1180px; Config's section nav becomes chips below 980px.
 
 ## Elevation & Depth
 
-Flat. Depth comes only from `raise` surfaces and 1px `line` hairlines. No shadows on the page; the floating elements (copy feedback, the reset panel dialog over a dimmed `#000b` backdrop) use a soft offset shadow.
+Flat. Panels are `surface` with a 1px `line` hairline. The only shadow is on floating layers (palette, faults menu): `0 24px 60px rgba(0,0,0,.6)`. Scrims are `rgba(0,0,0,.55)` behind the palette and `.6` behind the drawer.
 
 ## Shapes
 
-8px radius for controls, 12px for code blocks and inline panels, full round for status dots (6px). Small radii exist only where the element is small: 2px/1.5px traffic bars, 4px focus ring and skeleton lines, 5px tags, 9px/7px segmented control and its buttons.
+1px meter segments and load bars, 2px meter track, 3px route tags, 4px kbd and copy buttons, 5px tags and row buttons, 6px buttons, inputs, small cards and notices, 7px segmented controls, 8px panels, 10px for the Subscriptions panel, palette and faults menu, 18px top corners on the phone bottom sheet. Hairlines are 1px. No gradients, glows or coloured side borders.
 
 ## Components
 
-- Buttons: outline (line-strong border) by default; one white-filled primary per view at most; ghost buttons for row actions.
-- Tables: 12px fg-3 headers, 10px cell padding, 1px line separators, row hover `#070707`. The request table's account cell has a second `fg-3` line: why the account was chosen ("Same session", amber for "Moved: quota used up" or "Detour: account busy") and the session's 8-character fingerprint, which filters the table to that session.
-- Status: dot + word ("Ready", "Cooling 4:12", "Disabled", "Error").
-- Provider logos: an inline SVG sprite (`ui/logos.svg`, from LobeHub Icons, MIT) used through `<use>`; 18px beside account names, 14px in routes, buttons and the segmented control, 20px in the sign-in picker. OpenAI-compatible groups get their vendor's logo when the group name gives it away (OpenRouter, Ollama, LM Studio, DeepSeek, Groq, Mistral, Qwen, Kimi), otherwise the generic mark. xAI API keys show the xAI mark; Grok sign-ins show Grok.
-- Privacy toggle: a 30px ghost icon button (eye / eye-off) at the right end of the bar, pressed state on `#18181b`, remembered per browser. When on, emails read `••••••@••••••`, key ends `••••…••••`, the client key `••••••••`, sign-ins without an email are hidden whole, home folders read `~`, and the YAML file section waits behind "Show file"; secret fields in the settings forms stay masked. Copy buttons still copy the real value.
-- Usage meters: 6px track (`meter-track`, 3px radius) with the shown share (used or left) in `fg-2`; `warn` once a window is 75% used and `err` from 95%, in either mode, and a used-up window keeps a 1px `err` outline. Whole percentages in `fg` with tabular numbers to the right ("<1%" and ">99%" at the ends), "used" or "left" in the column heading, and "Resets in 2h 14m" in `fg-3` underneath. Meters for one window share a column; accounts without subscription limits leave the columns empty, and subscriptions that haven't reported yet show a dash.
-- Banked reset badge (only with `banked-resets` on): a 22px outline tag beside the account name (`line-strong` border, 6px radius, `fg-2`, refresh icon, "2 resets"), amber when an earlier request needs review, with a 5px amber dot when a reset expires within a day. It opens a native dialog panel (`raise`, 12px radius) listing grants, with Refresh and a single primary "Use 1 reset" that leads to a separate confirmation.
-- Live rows: a new request row lights up at full white and settles to its resting luminance over 1.8s (the one authored motion; disabled for reduced motion).
+- **Segmented quota meter.** 20 segments of 5%, 9px tall (10px in the drawer, 20px on the account page), 2px gap, 180px at most. Lit segments are `meter` below 75% used, `warn` from 75% and `err` from 95%; the thresholds always measure used, even in Remaining mode. Off segments are `line`. To the right: the percentage ("<1%" and ">99%" at the ends), then "↺ 20:09" (5H) or "↺ Fri" (WK) in DM Mono.
+- **Status.** An 8px dot and a word: Ready (`ok` dot, `fg-2` word), Cooling 1h 41m (`warn`), Error (`err`), Disabled (`idle`).
+- **Rivets.** The Subscriptions, Accounts and Models panels carry four 6px `rivet` dots in their corners.
+- **Breaker.** Each account row ends with refresh, an on/off switch (`role="switch"`, square knob, `meter` track when on) and remove.
+- **Segmented control.** 2px padding inside a 1px `line-strong` border; the selected segment is `seg-on` with `fg` text.
+- **Filter chips.** 13px with a DM Mono count; selected chips have a `line-hover` border.
+- **Command palette.** ⌘K / Ctrl K or `/`: actions, accounts and models, ↑↓ to move, ↵ to run, Esc to close.
+- **Faults.** Derived from account state and the request log: expired sign-ins, used-up limits, rate limits, account errors and three or more failed requests in an hour.
+- **Toast.** Bottom centre, `fg` on `bg`, for 1.6s.
+- **Fresh rows.** A new request row shows `row-fresh` for 1.5s, then fades (no transition with reduced motion).
+- **Privacy.** Emails read `••••••@••••••`, key ends `••••…••••`, the client key `fbx_••••••••`; copy buttons still copy the real value.
 
 ## Do's and Don'ts
 
-- Do keep the background pure #000.
-- Do show time-to-recovery for cooling accounts.
-- Don't use glows, gradients, glass, or colored side borders.
-- Don't use monospace for labels or headings.
-- Don't put more than one primary (white) button in a view.
+- Do keep amber for the fuse only.
+- Do show the time until an account comes back.
+- Do keep one primary (off-white) button per view at most.
+- Do give every control a visible 2px focus ring (`line-hover`) and 44px touch targets on phones.
+- Don't use colour for anything but state and provider logos.
+- Don't use monospace for prose or labels, or the condensed face for reading text.

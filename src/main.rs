@@ -38,14 +38,14 @@ use crate::state::App;
 
 #[derive(Parser)]
 #[command(
-    name = "cliproxyapi-rust",
+    name = "fusebox",
     version,
     about = "OpenAI / Claude / Gemini compatible proxy for your Claude, ChatGPT, Gemini, Antigravity, Grok, Kimi, Meta, Devin and Vertex accounts"
 )]
 struct Cli {
-    /// Path to the config file (created with defaults if missing).
-    #[arg(short, long, global = true, env = "CLIPROXYAPI_RUST_CONFIG", default_value = "config.yaml")]
-    config: PathBuf,
+    /// Path to the config file (created with defaults if missing). Default: $FUSEBOX_CONFIG, else config.yaml.
+    #[arg(short, long, global = true)]
+    config: Option<PathBuf>,
     #[command(subcommand)]
     cmd: Option<Cmd>,
 }
@@ -76,22 +76,36 @@ enum Cmd {
 async fn main() -> Result<()> {
     // CLIProxyAPI's Go-style flags (-config, -claude-login, ...) work too.
     let cli = Cli::parse_from(compat::translate_args(std::env::args().collect()));
+    let path = config_path(cli.config, |n| std::env::var(n).ok());
     if matches!(cli.cmd, Some(Cmd::Check)) {
-        return check(&cli.config);
+        return check(&path);
     }
-    let cfg = Config::load(&cli.config)?;
+    let cfg = Config::load(&path)?;
     let filter = std::env::var("RUST_LOG")
-        .unwrap_or_else(|_| if cfg.debug { "cliproxyapi_rust=debug".into() } else { "cliproxyapi_rust=info".into() });
+        .unwrap_or_else(|_| if cfg.debug { "fusebox=debug".into() } else { "fusebox=info".into() });
     tracing_subscriber::fmt().with_env_filter(filter).with_target(false).compact().init();
+    if cfg.legacy_auth_dir {
+        tracing::info!(
+            "using sign-ins from {} because {} doesn't exist; set auth-dir in config.yaml to choose",
+            config::LEGACY_AUTH_DIR,
+            config::DEFAULT_AUTH_DIR
+        );
+    }
     std::fs::create_dir_all(cfg.auth_dir()).ok();
 
-    let app = App::new(cfg, cli.config.clone());
+    let app = App::new(cfg, path);
     match cli.cmd {
         Some(Cmd::Login { provider, no_browser, file, location }) => {
             login(app, &provider, no_browser, file, &location).await
         }
         _ => serve(app).await,
     }
+}
+
+/// `--config`, then `FUSEBOX_CONFIG`, then the pre-rename `CLIPROXYAPI_RUST_CONFIG`, then config.yaml.
+fn config_path(flag: Option<PathBuf>, get: impl Fn(&str) -> Option<String>) -> PathBuf {
+    flag.or_else(|| config::first_env(&["FUSEBOX_CONFIG", "CLIPROXYAPI_RUST_CONFIG"], get).map(PathBuf::from))
+        .unwrap_or_else(|| PathBuf::from("config.yaml"))
 }
 
 async fn serve(app: Arc<App>) -> Result<()> {
@@ -133,7 +147,7 @@ async fn serve(app: Arc<App>) -> Result<()> {
     };
     let accounts = app.pool.all();
     println!();
-    println!("  \x1b[1mCLIProxyAPI-Rust\x1b[0m {}", env!("CARGO_PKG_VERSION"));
+    println!("  \x1b[1mFusebox\x1b[0m {}", env!("CARGO_PKG_VERSION"));
     println!("  dashboard  {shown}");
     println!("  openai     {shown}/v1");
     println!("  anthropic  {shown}");
@@ -141,7 +155,7 @@ async fn serve(app: Arc<App>) -> Result<()> {
     println!("  accounts   {} loaded from {}", accounts.len(), cfg.auth_dir().display());
     if accounts.is_empty() {
         println!(
-            "\n  No accounts yet. Run `cliproxyapi-rust login <provider>` (claude, codex, antigravity, kimi, xai,\n  meta, devin, vertex) or open the dashboard."
+            "\n  No accounts yet. Run `fusebox login <provider>` (claude, codex, antigravity, kimi, xai,\n  meta, devin, vertex) or open the dashboard."
         );
     }
     println!();
@@ -292,7 +306,7 @@ fn check(path: &Path) -> Result<()> {
     let bind = if cfg.host.is_empty() { "0.0.0.0" } else { &cfg.host };
     let key = &cfg.management_key;
     let hashed = ["$2a$", "$2b$", "$2y$"].iter().any(|p| key.starts_with(p));
-    println!("\n  \x1b[1mCLIProxyAPI-Rust\x1b[0m {} · {}\n", env!("CARGO_PKG_VERSION"), path.display());
+    println!("\n  \x1b[1mFusebox\x1b[0m {} · {}\n", env!("CARGO_PKG_VERSION"), path.display());
     println!("  listen       {bind}:{}{}", cfg.port, if cfg.tls.enable { " (https)" } else { "" });
     println!(
         "  client keys  {}",
@@ -362,4 +376,22 @@ fn check(path: &Path) -> Result<()> {
     }
     println!();
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn config_path_prefers_the_flag_then_the_new_variable_then_the_old_one() {
+        let env = |vars: &'static [(&'static str, &'static str)]| {
+            move |n: &str| vars.iter().find(|(k, _)| *k == n).map(|(_, v)| v.to_string())
+        };
+        let both = env(&[("FUSEBOX_CONFIG", "/new.yaml"), ("CLIPROXYAPI_RUST_CONFIG", "/old.yaml")]);
+        assert_eq!(config_path(Some("/flag.yaml".into()), both), PathBuf::from("/flag.yaml"));
+        assert_eq!(config_path(None, both), PathBuf::from("/new.yaml"));
+        assert_eq!(config_path(None, env(&[("CLIPROXYAPI_RUST_CONFIG", "/old.yaml")])), PathBuf::from("/old.yaml"));
+        assert_eq!(config_path(None, env(&[("FUSEBOX_CONFIG", "")])), PathBuf::from("config.yaml"));
+        assert_eq!(config_path(None, env(&[])), PathBuf::from("config.yaml"));
+    }
 }

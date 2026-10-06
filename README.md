@@ -1,8 +1,6 @@
 <div align="center">
 
-<img src="assets/icon.svg" width="72" height="72" alt="CLIProxyAPI-Rust logo">
-
-# CLIProxyAPI-Rust
+<h1><picture><source media="(prefers-color-scheme: dark)" srcset="assets/fusebox-wordmark.svg"><img src="assets/fusebox-wordmark-light.svg" height="44" alt="Fusebox"></picture></h1>
 
 **All your AI subscriptions. One fast API.**
 
@@ -10,11 +8,11 @@ A single Rust binary that exposes OpenAI, Anthropic and Gemini compatible endpoi
 Claude, ChatGPT, Gemini, Antigravity, Grok, Kimi, Meta, Devin and Vertex AI.<br>
 Point Claude Code, Codex, your editor or any SDK at one URL and stop caring which account answers.
 
-[![CI](https://img.shields.io/github/actions/workflow/status/IuCC123/CLIProxyAPI-Rust/ci.yml?branch=main&style=flat-square&labelColor=000&label=ci)](https://github.com/IuCC123/CLIProxyAPI-Rust/actions/workflows/ci.yml)
-[![License: Unlicense](https://img.shields.io/badge/license-Unlicense-f4f4f5?style=flat-square&labelColor=000)](LICENSE)
-[![Rust](https://img.shields.io/badge/rust-1.88%2B-f4f4f5?style=flat-square&labelColor=000&logo=rust&logoColor=white)](https://www.rust-lang.org)
-[![Binary](https://img.shields.io/badge/single%20binary-~8%20MB-f4f4f5?style=flat-square&labelColor=000)](https://github.com/IuCC123/CLIProxyAPI-Rust/releases/latest)
-[![Dashboard](https://img.shields.io/badge/dashboard-built%20in-f4f4f5?style=flat-square&labelColor=000)](#the-dashboard)
+[![CI](https://img.shields.io/github/actions/workflow/status/DigitalPals/Fusebox/ci.yml?branch=main&style=flat-square&labelColor=0b0b0a&label=ci)](https://github.com/DigitalPals/Fusebox/actions/workflows/ci.yml)
+[![License: Unlicense](https://img.shields.io/badge/license-Unlicense-f2efe8?style=flat-square&labelColor=0b0b0a)](LICENSE)
+[![Rust](https://img.shields.io/badge/rust-1.88%2B-f2efe8?style=flat-square&labelColor=0b0b0a&logo=rust&logoColor=white)](https://www.rust-lang.org)
+[![Binary](https://img.shields.io/badge/single%20binary-~8%20MB-f2efe8?style=flat-square&labelColor=0b0b0a)](https://github.com/DigitalPals/Fusebox/releases/latest)
+[![Dashboard](https://img.shields.io/badge/dashboard-built%20in-f2efe8?style=flat-square&labelColor=0b0b0a)](#the-dashboard)
 
 [Quick start](#quick-start) · [Coming from CLIProxyAPI](#coming-from-cliproxyapi) · [Connect your tools](#connect-your-tools) · [Dashboard](#the-dashboard) · [Configuration](#configuration) · [FAQ](#faq)
 
@@ -22,57 +20,57 @@ Point Claude Code, Codex, your editor or any SDK at one URL and stop caring whic
 
 <br>
 
-<img src="assets/screenshots/overview.png" alt="CLIProxyAPI-Rust dashboard: the endpoint, an hour of traffic, and every subscription's 5-hour and weekly limits side by side" width="100%">
+<img src="assets/screenshots/overview.png" alt="Fusebox dashboard: the main line, an hour of load, tripped accounts, and every subscription's 5-hour and weekly limits side by side" width="100%">
 
 <br>
 
-## Why CLIProxyAPI-Rust
+## Why Fusebox
 
 - **One small binary.** About 8 MB with the dashboard inside, around 13 MB of memory in our tests. No Docker, no Node, no runtime to install.
 - **Any model from any tool.** Use GPT inside Claude Code, Claude inside Codex, or Gemini behind the OpenAI SDK. Requests are translated between formats automatically. When the client and the provider already speak the same format, the request passes through untouched.
 - **Ten providers.** Subscription sign-in for Claude, ChatGPT (Codex), Antigravity, Grok, Kimi, Meta and Devin; service accounts for Vertex AI; API keys for Anthropic, OpenAI, Gemini, Vertex, Kimi, xAI, Meta and anything OpenAI-compatible.
 - **Images and video too.** `/v1/images/generations` and `/v1/images/edits` work with ChatGPT accounts, OpenAI and xAI keys, Vertex Imagen and Gemini image models. xAI video generation is behind `/v1/videos`.
-- **WebSockets.** Codex WebSocket sessions are relayed to ChatGPT's own WebSocket upstream, so `previous_response_id` works on the server side. Switch to a Claude or Gemini model mid-session and CLIProxyAPI-Rust carries the conversation over.
+- **WebSockets.** Codex WebSocket sessions are relayed to ChatGPT's own WebSocket upstream, so `previous_response_id` works on the server side. Switch to a Claude or Gemini model mid-session and Fusebox carries the conversation over.
 - **Many accounts, no babysitting.** Each new coding session goes to the account with the most quota left, using the 5-hour and weekly usage Claude and ChatGPT report, and stays there so its prompt cache keeps paying off. An account whose limit is used up sits out until it resets, a rate limit cools down only that model on that account, failed requests move to the next account, and OAuth tokens refresh themselves.
-- **A dashboard you'll actually open.** Pure black, live over WebSocket: every subscription's 5-hour and weekly limits side by side, traffic, cooldown timers, sign-in flows, a request log and a config editor.
+- **A dashboard you'll actually open.** Live over WebSocket: every subscription's 5-hour and weekly limits as segmented meters, what has tripped and why, an hour of load, cooldown timers, sign-in flows, a request log that explains each routing decision, the route order for every model, and a config editor. It works on a phone too.
 - **Drop-in for CLIProxyAPI users.** Same credential files, same `config.yaml` (both of its layouts), same Docker paths and flags. Swap the image and keep everything else.
 
 ## Quick start
 
-**1. Get the binary.** Download it for macOS, Linux or Windows from [Releases](https://github.com/IuCC123/CLIProxyAPI-Rust/releases/latest), or build it with Rust 1.88 or newer:
+**1. Get the binary.** Download it for macOS, Linux or Windows from [Releases](https://github.com/DigitalPals/Fusebox/releases/latest), or build it with Rust 1.88 or newer:
 
 ```sh
-cargo install --git https://github.com/IuCC123/CLIProxyAPI-Rust
+cargo install --git https://github.com/DigitalPals/Fusebox
 ```
 
 Or run it with Docker (for amd64 and arm64):
 
 ```sh
 touch config.yaml && mkdir -p auths
-docker run -d --name cliproxyapi-rust -p 8317:8317 \
+docker run -d --name fusebox -p 8317:8317 \
   -v ./config.yaml:/CLIProxyAPI/config.yaml -v ./auths:/root/.cli-proxy-api \
-  ghcr.io/iucc123/cliproxyapi-rust
+  ghcr.io/digitalpals/fusebox
 ```
 
 **2. Start it.**
 
 ```sh
-cliproxyapi-rust
+fusebox
 ```
 
-The first run writes a commented `config.yaml` in the current directory and serves everything on `http://127.0.0.1:8317`. That address is also the dashboard.
+The first run writes a commented `config.yaml` in the current directory (or wherever `--config` or `FUSEBOX_CONFIG` points) and serves everything on `http://127.0.0.1:8317`. That address is also the dashboard.
 
 **3. Add an account.** Click **Connect account** in the dashboard, or use the terminal:
 
 ```sh
-cliproxyapi-rust login claude        # Claude Pro / Max
-cliproxyapi-rust login codex         # ChatGPT Plus / Pro / Team
-cliproxyapi-rust login antigravity   # Google account with Antigravity
-cliproxyapi-rust login xai           # SuperGrok / X Premium (shows a code to confirm)
-cliproxyapi-rust login kimi          # Kimi Code (shows a code to confirm)
-cliproxyapi-rust login meta          # Meta Muse (shows a code to confirm)
-cliproxyapi-rust login devin         # Devin / Windsurf
-cliproxyapi-rust login vertex --file key.json --location global   # Vertex AI service account
+fusebox login claude        # Claude Pro / Max
+fusebox login codex         # ChatGPT Plus / Pro / Team
+fusebox login antigravity   # Google account with Antigravity
+fusebox login xai           # SuperGrok / X Premium (shows a code to confirm)
+fusebox login kimi          # Kimi Code (shows a code to confirm)
+fusebox login meta          # Meta Muse (shows a code to confirm)
+fusebox login devin         # Devin / Windsurf
+fusebox login vertex --file key.json --location global   # Vertex AI service account
 ```
 
 API keys (Anthropic, OpenAI, Gemini, Vertex, Kimi, xAI, Meta, OpenRouter, Ollama, …) can be added from the dashboard or in `config.yaml`.
@@ -84,18 +82,18 @@ Your config, your sign-ins and your Docker setup carry over as they are.
 **Docker.** Keep your `docker-compose.yml`, `config.yaml` and `auths/` folder. Add one line to the `.env` next to the compose file and restart:
 
 ```sh
-echo "CLI_PROXY_IMAGE=ghcr.io/iucc123/cliproxyapi-rust:latest" >> .env
+echo "CLI_PROXY_IMAGE=ghcr.io/digitalpals/fusebox:latest" >> .env
 docker compose up -d
 ```
 
 The image uses the same paths (`/CLIProxyAPI/config.yaml`, `/root/.cli-proxy-api`) and port, and `./CLIProxyAPI` still works inside the container. To go back, delete the line.
 
-**Binary.** Point it at your existing file: `cliproxyapi-rust --config /path/to/config.yaml`. CLIProxyAPI's flags work too: `-config`, `-claude-login`, `-codex-login`, `-antigravity-login`, `-kimi-login`, `-xai-login`, `-meta-login`, `-devin-login`, `-vertex-import`, `-no-browser`.
+**Binary.** Point it at your existing file: `fusebox --config /path/to/config.yaml`. CLIProxyAPI's flags work too: `-config`, `-claude-login`, `-codex-login`, `-antigravity-login`, `-kimi-login`, `-xai-login`, `-meta-login`, `-devin-login`, `-vertex-import`, `-no-browser`.
 
 **Check before you switch.** This prints the accounts it found per provider, where it will listen, and any settings it will ignore, without starting the server:
 
 ```sh
-cliproxyapi-rust --config config.yaml check
+fusebox --config config.yaml check
 ```
 
 | From CLIProxyAPI | |
@@ -126,13 +124,13 @@ Want GPT in Claude Code? `export ANTHROPIC_MODEL=gpt-6-astra`.
 
 ```toml
 model = "gpt-6-astra"
-model_provider = "cliproxyapi-rust"
+model_provider = "fusebox"
 
-[model_providers.cliproxyapi-rust]
-name = "CLIProxyAPI-Rust"
+[model_providers.fusebox]
+name = "Fusebox"
 base_url = "http://127.0.0.1:8317/v1"
 wire_api = "responses"
-env_key = "CLIPROXYAPI_RUST_KEY"   # only needed if you set api-keys
+env_key = "FUSEBOX_KEY"   # only needed if you set api-keys
 ```
 
 **OpenAI SDK**, or any tool with a custom OpenAI base URL
@@ -218,12 +216,12 @@ Everything is served from the binary at `/`, with no external requests.
 
 <table>
 <tr>
-<td width="50%" valign="top"><img src="assets/screenshots/accounts.png" alt="Accounts page with OAuth accounts, API keys, a cooling account and a disabled key"></td>
-<td width="50%" valign="top"><img src="assets/screenshots/requests.png" alt="Live request log showing routes between client formats and providers, latency and tokens"></td>
+<td width="50%" valign="top"><img src="assets/screenshots/accounts.png" alt="Accounts page: subscriptions with segmented quota meters, a cooling account, API keys and a breaker per account"></td>
+<td width="50%" valign="top"><img src="assets/screenshots/requests.png" alt="Live request log with one row expanded to show why the request went to its account"></td>
 </tr>
 <tr>
-<td valign="top"><b>Accounts:</b> used or remaining 5-hour and weekly quota with colored meters, token expiry, cooldown timers per model, and one-click enable, refresh or remove.</td>
-<td valign="top"><b>Requests:</b> every request as it happens, showing which client format went to which provider, time to first token, and tokens.</td>
+<td valign="top"><b>Accounts:</b> used or remaining 5-hour and weekly quota as segmented meters, token expiry, cooldowns per model, and a breaker for each account: refresh, switch off, remove. Each account has its own page with its hour of load and the coding sessions pinned to it.</td>
+<td valign="top"><b>Requests:</b> every request as it happens, showing which client format went to which provider, time to first token and tokens. Click a row to see why it went to that account; click a session to follow it.</td>
 </tr>
 <tr>
 <td colspan="2"><img src="assets/screenshots/sign-in.png" alt="Connect an account panel listing Claude, ChatGPT, Antigravity, Grok, Kimi, Meta, Devin and Vertex AI"></td>
@@ -233,11 +231,15 @@ Everything is served from the binary at `/`, with no external requests.
 </tr>
 </table>
 
-Sharing a screenshot or your screen? The eye button in the top bar hides every email and API key on the page, and copy buttons still copy the real values.
+The **Models** tab groups every model id by family, shows aliases, and lists the order in which accounts would take a new session, with the next one marked.
 
-Choose **Used** or **Remaining** beside the quota meters on Overview or Accounts; your browser remembers it. Meters stay gray while there's room, turn amber with a quarter or less left and red at 5% or less, and a used-up window keeps a red outline until it resets.
+Sharing a screenshot or your screen? The eye button in the top bar (or <kbd>.</kbd>) hides every email and API key on the page, and copy buttons still copy the real values.
 
-**Banked resets** (off by default). Claude and ChatGPT sometimes give subscribers saved resets that clear a usage limit early. Turn on `banked-resets` (Config, Connections) and subscriptions that have some show a badge beside the account name; click it to see expiry dates and spend one, always with a confirmation. It relies on unofficial provider endpoints, checks every 30 minutes, and keeps a crash-safe journal so a reset is never spent twice. See [banked resets](docs/banked-resets.md).
+Choose **Used** or **Remaining** beside the quota meters (or press <kbd>U</kbd>); your browser remembers it. Each meter has 20 segments of 5%: they light up off-white while there's room, amber from 75% used and red from 95%.
+
+<kbd>⌘K</kbd> / <kbd>Ctrl K</kbd> or <kbd>/</kbd> opens a command palette for accounts, models and actions such as connecting an account or clearing cooldowns. The faults button in the top bar lists what has tripped: expired sign-ins, used-up limits, rate limits and runs of failed requests.
+
+**Banked resets** (off by default). Claude and ChatGPT sometimes give subscribers saved resets that clear a usage limit early. Turn on `banked-resets` (Config, Connections) and subscriptions that have some show “↻ 2 resets banked” under their status; click it to see expiry dates and spend one, always with a confirmation. It relies on unofficial provider endpoints, checks every 30 minutes, and keeps a crash-safe journal so a reset is never spent twice. See [banked resets](docs/banked-resets.md).
 
 <sub>Screenshots use sample data.</sub>
 
@@ -250,8 +252,8 @@ The dashboard's Config page has forms for server and access settings, routing, c
 ```yaml
 host: "127.0.0.1"             # 0.0.0.0 to expose it (set api-keys first)
 port: 8317
-auth-dir: "~/.cli-proxy-api"  # OAuth credential files, shared with CLIProxyAPI
-api-keys: ["sk-pick-anything"] # keys your clients must send; empty = open
+auth-dir: "~/.fusebox"        # OAuth credential files (CLIProxyAPI's work too)
+api-keys: ["fbx_pick-anything"] # keys your clients must send; empty = open
 management-key: ""            # empty = dashboard only from localhost
 proxy-url: ""                 # optional http://, https:// or socks5:// upstream proxy
 request-retry: 3              # accounts to try before giving up
@@ -302,9 +304,9 @@ five-hour-reserve-percent: 30 # 0 turns the reserve off; other strategies ignore
 
 In a v8 file both go under `routing` (`strategy: smart-quota`).
 
-Sessions are recognised from what clients already send: Claude Code's session metadata, Codex's `session_id` and `thread-id` headers, a Responses `conversation` id or `prompt_cache_key`. Writing your own client? Send one stable `x-cliproxy-session-id` per task. Each client API key has its own sessions. Requests without any of these are routed one by one, and a WebSocket without one keeps its account for the connection.
+Sessions are recognised from what clients already send: Claude Code's session metadata, Codex's `session_id` and `thread-id` headers, a Responses `conversation` id or `prompt_cache_key`. Writing your own client? Send one stable `x-fusebox-session-id` per task (the older `x-cliproxy-session-id` still works). Each client API key has its own sessions. Requests without any of these are routed one by one, and a WebSocket without one keeps its account for the connection.
 
-Assignments are saved to `.routing-sessions.state` in the auth directory (hashed ids, owner-only permissions), so they survive restarts, and forgotten after `session-affinity-idle-seconds` without requests (a day by default). Send `x-cliproxy-session-end: true` with a task's last request to release it early. Responses history for `previous_response_id` is kept in memory only, up to 64 MiB. Run one proxy per auth directory.
+Assignments are saved to `.routing-sessions.state` in the auth directory (hashed ids, owner-only permissions), so they survive restarts, and forgotten after `session-affinity-idle-seconds` without requests (a day by default). Send `x-fusebox-session-end: true` (or `x-cliproxy-session-end: true`) with a task's last request to release it early. Responses history for `previous_response_id` is kept in memory only, up to 64 MiB. Run one proxy per auth directory.
 
 The Requests page shows each request's session fingerprint (click it to see the whole session), why its account was chosen, and its cached tokens.
 
@@ -315,20 +317,20 @@ Cache hints carry across formats: OpenAI cache settings and breakpoints between 
 Set `host: "0.0.0.0"`, an `api-keys` entry for your clients, and a `management-key` for the dashboard. In Docker the dashboard also needs a `management-key`, because browser requests reach the container from outside `localhost`. Then keep it running, for example with systemd:
 
 ```ini
-# /etc/systemd/system/cliproxyapi-rust.service
+# /etc/systemd/system/fusebox.service
 [Unit]
-Description=CLIProxyAPI-Rust
+Description=Fusebox
 After=network-online.target
 
 [Service]
-ExecStart=/usr/local/bin/cliproxyapi-rust --config /etc/cliproxyapi-rust/config.yaml
+ExecStart=/usr/local/bin/fusebox --config /etc/fusebox/config.yaml
 Restart=always
 
 [Install]
 WantedBy=multi-user.target
 ```
 
-To sign in accounts on a server, open the dashboard, click **Connect account**, approve in your browser, then paste the `localhost` URL the browser lands on (it won't load, which is expected). Grok, Kimi and Meta use device codes, so they work from anywhere with nothing to paste. `cliproxyapi-rust login <provider>` on the server works the same way.
+To sign in accounts on a server, open the dashboard, click **Connect account**, approve in your browser, then paste the `localhost` URL the browser lands on (it won't load, which is expected). Grok, Kimi and Meta use device codes, so they work from anywhere with nothing to paste. `fusebox login <provider>` on the server works the same way.
 
 ## How it works
 
@@ -355,9 +357,9 @@ Each wire format (`src/formats/{chat,responses,claude,gemini}.rs`) knows how to 
 
 ## Compared with CLIProxyAPI
 
-CLIProxyAPI-Rust is a smaller rewrite of [CLIProxyAPI](https://github.com/router-for-me/CLIProxyAPI), not a port.
+Fusebox is a smaller rewrite of [CLIProxyAPI](https://github.com/router-for-me/CLIProxyAPI), not a port.
 
-| | CLIProxyAPI-Rust | CLIProxyAPI |
+| | Fusebox | CLIProxyAPI |
 | --- | --- | --- |
 | Language | Rust, one binary | Go |
 | Dashboard | Built in | Separate web panel |
@@ -372,17 +374,19 @@ Plugins are Go shared libraries loaded into CLIProxyAPI's process, and the Redis
 
 ## FAQ
 
-**Is this allowed?** CLIProxyAPI-Rust is not affiliated with Anthropic, OpenAI, Google, xAI, Moonshot, Meta or Cognition. Using subscription accounts through third-party tools may be against a provider's terms, and providers can rate-limit or suspend accounts. You are responsible for how you use it.
+**Is this allowed?** Fusebox is not affiliated with Anthropic, OpenAI, Google, xAI, Moonshot, Meta or Cognition. Using subscription accounts through third-party tools may be against a provider's terms, and providers can rate-limit or suspend accounts. You are responsible for how you use it.
 
-**Does it work with my CLIProxyAPI setup?** Yes. See [Coming from CLIProxyAPI](#coming-from-cliproxyapi): credential files, both config layouts, the Docker image paths and the command-line flags all carry over. Run `cliproxyapi-rust check` to see exactly what it picks up.
+**Does it work with my CLIProxyAPI setup?** Yes. See [Coming from CLIProxyAPI](#coming-from-cliproxyapi): credential files, both config layouts, the Docker image paths and the command-line flags all carry over. Run `fusebox check` to see exactly what it picks up.
 
-**Where are my credentials stored?** In `auth-dir` (`~/.cli-proxy-api` by default), one JSON file per account, written with `0600` permissions. Nothing leaves your machine except requests to the providers you use.
+**Where are my credentials stored?** In `auth-dir`, one JSON file per account, written with `0600` permissions. It defaults to `~/.fusebox`; if that doesn't exist but `~/.cli-proxy-api` (CLIProxyAPI's directory, and this project's before it was renamed) does, that one is used and the server says so at startup. Setting `auth-dir` always wins. Nothing leaves your machine except requests to the providers you use.
 
 **Does it phone home?** No. There is no telemetry and the dashboard loads no external assets.
 
-**Claude sign-in fails or gets blocked.** Some Anthropic endpoints sit behind bot protection that CLIProxyAPI works around with a browser TLS fingerprint. CLIProxyAPI-Rust uses standard rustls. If token exchange fails for you, please open an issue with the error from the dashboard.
+**Claude sign-in fails or gets blocked.** Some Anthropic endpoints sit behind bot protection that CLIProxyAPI works around with a browser TLS fingerprint. Fusebox uses standard rustls. If token exchange fails for you, please open an issue with the error from the dashboard.
 
-**Are usage stats saved?** They're kept in memory and reset when CLIProxyAPI-Rust restarts.
+**Are usage stats saved?** They're kept in memory and reset when Fusebox restarts.
+
+**I used this project when it was called CLIProxyAPI-Rust.** Everything keeps working. The old `CLIPROXYAPI_RUST_CONFIG` and `CLIPROXYAPI_RUST_DEFAULT_HOST` variables are still read (the new names are `FUSEBOX_CONFIG` and `FUSEBOX_DEFAULT_HOST`), the `x-cliproxy-*` session headers are still accepted, `~/.cli-proxy-api` is still found, and the dashboard moves its saved preferences over. Rename the binary in your scripts from `cliproxyapi-rust` to `fusebox`, and Codex's `env_key` to `FUSEBOX_KEY` if you like.
 
 ## Development
 

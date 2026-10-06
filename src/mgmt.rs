@@ -214,15 +214,25 @@ async fn callback(State(app): State<Arc<App>>, Query(q): Query<CallbackQuery>) -
         (Some(code), Some(state), _) => complete_login(&app, &state, &code).await.map_err(|e| format!("{e:#}")),
         _ => Err("missing code or state".to_string()),
     };
-    let (title, body) = match result {
-        Ok(label) => ("Signed in", format!("Connected <b>{}</b>. You can close this tab.", html_escape(&label))),
-        Err(e) => ("Sign-in failed", html_escape(&e)),
+    let (title, body, dot) = match result {
+        Ok(label) => (
+            "Signed in",
+            format!(
+                "Connected <b style=\"color:#f2efe8;font-weight:500\">{}</b>. You can close this tab.",
+                html_escape(&label)
+            ),
+            "#4ade80",
+        ),
+        Err(e) => ("Sign-in failed", html_escape(&e), "#fb7185"),
     };
+    // Served from the OAuth callback port, so the page carries its own styles and no assets.
     Html(format!(
-        r#"<!doctype html><meta charset="utf-8"><meta name="color-scheme" content="dark"><title>{title}</title>
-<body style="margin:0;height:100vh;display:grid;place-items:center;background:#000;color:#f5f5f5;font:15px/1.5 ui-sans-serif,system-ui,-apple-system,sans-serif">
-<div style="text-align:center;max-width:420px;padding:24px"><div style="font-size:13px;letter-spacing:.08em;text-transform:uppercase;color:#737373">CLIProxyAPI-Rust</div>
-<h1 style="font-size:22px;font-weight:600;margin:10px 0">{title}</h1><p style="color:#a3a3a3;margin:0">{body}</p></div></body>"#
+        r##"<!doctype html><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><meta name="color-scheme" content="dark"><meta name="theme-color" content="#0b0b0a"><title>{title} · Fusebox</title>
+<body style="margin:0;min-height:100vh;display:grid;place-items:center;background:#0b0b0a;color:#f2efe8;font:14px/1.45 'IBM Plex Sans',system-ui,-apple-system,sans-serif">
+<main style="box-sizing:border-box;width:min(420px,calc(100% - 32px));padding:22px 24px 24px;background:#121210;border:1px solid #24231f;border-radius:8px">
+<div style="font:600 11px/1 'IBM Plex Sans Condensed','IBM Plex Sans',system-ui,sans-serif;letter-spacing:.12em;text-transform:uppercase;color:#857f74">Fusebox</div>
+<h1 style="display:flex;align-items:center;gap:10px;font-size:17px;font-weight:600;margin:14px 0 6px"><span style="width:8px;height:8px;border-radius:50%;background:{dot}"></span>{title}</h1>
+<p style="color:#b4afa4;margin:0;font-size:13px">{body}</p></main></body>"##
     ))
 }
 
@@ -288,6 +298,8 @@ pub fn router(app: Arc<App>) -> Router<Arc<App>> {
         .route("/accounts/{id}/reset", post(reset_account))
         .route("/accounts/{id}/banked-resets", get(banked_resets).post(apply_banked_reset))
         .route("/accounts/{id}/quota/refresh", post(refresh_quota))
+        .route("/accounts/{id}/activity", get(account_activity))
+        .route("/routes", get(routes))
         .route("/keys", post(add_key))
         .route("/vertex", post(import_vertex))
         .route("/requests", get(requests))
@@ -397,6 +409,7 @@ async fn overview(State(app): State<Arc<App>>) -> Json<Value> {
         "routing": cfg.routing,
         "banked_resets": cfg.banked_resets,
         "session_affinity": cfg.session_affinity,
+        "request_retry": cfg.request_retry.max(1),
         "management_key": !cfg.management_key.is_empty(),
         "totals": *app.stats.totals.lock(),
         "active": app.stats.active.load(Ordering::Relaxed),
@@ -415,6 +428,78 @@ async fn accounts(State(app): State<Arc<App>>) -> Json<Value> {
 async fn requests(State(app): State<Arc<App>>) -> Json<Value> {
     let recent = app.stats.recent.lock();
     Json(serde_json::to_value(recent.iter().rev().collect::<Vec<_>>()).unwrap_or_default())
+}
+
+/// One account's last hour, and the coding sessions pinned to it. Session details
+/// (client, model, requests) come from the recent request log, so older ones show none.
+async fn account_activity(State(app): State<Arc<App>>, Path(id): Path<String>) -> Response {
+    if app.pool.get(&id).is_none() {
+        return err(StatusCode::NOT_FOUND, "unknown account");
+    }
+    #[derive(Default)]
+    struct Seen {
+        session: String,
+        since: Option<chrono::DateTime<chrono::Utc>>,
+        client: &'static str,
+        client_app: Option<&'static str>,
+        model: String,
+        requests: u64,
+        cache_tokens: u64,
+    }
+    let mut seen: std::collections::HashMap<String, Seen> = Default::default();
+    for log in app.stats.recent.lock().iter().filter(|l| l.account_id == id) {
+        let Some(session) = &log.session_id else { continue };
+        let s = seen.entry(crate::affinity::owner_of(session)).or_default();
+        s.session.clone_from(session);
+        s.since = Some(s.since.map_or(log.ts, |t| t.min(log.ts)));
+        (s.client, s.client_app) = (log.client, log.client_app);
+        s.model.clone_from(&log.model);
+        s.requests += 1;
+        s.cache_tokens += log.cache_tokens;
+    }
+    let sessions: Vec<Value> = app
+        .sessions
+        .pinned(&id, app.cfg().session_affinity_idle_seconds)
+        .into_iter()
+        .map(|p| {
+            let s = seen.remove(&p.owner).unwrap_or_default();
+            json!({
+                "session": Some(s.session).filter(|s| !s.is_empty()),
+                "last_seen": chrono::DateTime::from_timestamp(p.last_seen, 0).map(|t| t.to_rfc3339()),
+                "active": p.active,
+                "since": s.since.map(|t| t.to_rfc3339()),
+                "client": Some(s.client).filter(|c| !c.is_empty()),
+                "client_app": s.client_app,
+                "model": Some(s.model).filter(|m| !m.is_empty()),
+                "requests": s.requests,
+                "cache_tokens": s.cache_tokens,
+            })
+        })
+        .collect();
+    Json(json!({ "series": app.stats.account_series(&id), "sessions": sessions })).into_response()
+}
+
+/// For every public model, the accounts new sessions would try, in order.
+async fn routes(State(app): State<Arc<App>>) -> Json<Value> {
+    let cfg = app.cfg();
+    let load = app.sessions.account_load(&cfg);
+    let models: serde_json::Map<String, Value> = app
+        .pool
+        .models()
+        .into_iter()
+        .map(|(id, _)| {
+            let (only, model) = app.pool.route(&id);
+            let model = app.pool.canonical(&model, only.as_ref());
+            let steps = app.pool.route_order(&model, &cfg, only.as_ref(), &load);
+            (id, serde_json::to_value(steps).unwrap_or_default())
+        })
+        .collect();
+    Json(json!({
+        "routing": cfg.routing,
+        "session_affinity": cfg.session_affinity,
+        "request_retry": cfg.request_retry.max(1),
+        "models": models,
+    }))
 }
 
 async fn models(State(app): State<Arc<App>>) -> Json<Value> {
@@ -823,7 +908,7 @@ mod tests {
 
     #[tokio::test]
     async fn key_edits_fall_back_to_a_rewrite_when_formatting_cannot_be_kept() {
-        let dir = std::env::temp_dir().join(format!("cliproxyapi-edit-{}", uuid::Uuid::new_v4()));
+        let dir = std::env::temp_dir().join(format!("fusebox-edit-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("config.yaml");
         let original = format!(
@@ -854,7 +939,7 @@ mod tests {
 
     #[tokio::test]
     async fn structured_saves_validate_and_reject_stale_edits() {
-        let dir = std::env::temp_dir().join(format!("cliproxyapi-settings-{}", uuid::Uuid::new_v4()));
+        let dir = std::env::temp_dir().join(format!("fusebox-settings-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("config.yaml");
         let original = format!("# Keep this comment\nport: 8317 # port note\nauth-dir: {}\n", dir.display());

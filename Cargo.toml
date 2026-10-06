@@ -1,12 +1,12 @@
 [package]
-name = "cliproxyapi-rust"
+name = "fusebox"
 version = "0.3.2"
 edition = "2024"
 rust-version = "1.88"
 description = "One fast binary that turns your Claude, ChatGPT, Gemini, Antigravity, Grok, Kimi, Meta, Devin and Vertex accounts into OpenAI, Anthropic and Gemini compatible APIs."
 license = "Unlicense"
-repository = "https://github.com/IuCC123/CLIProxyAPI-Rust"
-homepage = "https://github.com/IuCC123/CLIProxyAPI-Rust"
+repository = "https://github.com/DigitalPals/Fusebox"
+homepage = "https://github.com/DigitalPals/Fusebox"
 keywords = ["llm", "proxy", "claude", "openai", "gemini"]
 categories = ["command-line-utilities", "web-programming::http-server"]
 readme = "README.md"

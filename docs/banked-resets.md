@@ -12,7 +12,7 @@ While off, nothing contacts these endpoints and no journal is created. While on,
 
 ## Using a reset
 
-Overview and Accounts show a compact badge beside the account name for native Codex and Claude OAuth subscriptions that have resets. Accounts with none, or whose reset status can't be read, show no badge; unresolved operations keep a review badge so recovery remains accessible. Click the badge to open a modal with grant expiry, scopes, and current eligibility. Purchased monetary credits are separate.
+Overview and Accounts show “↻ 2 resets banked” under the status of native Codex and Claude OAuth subscriptions that have resets, and the account drawer and account page add a “Use 1 reset” button. Accounts with none, or whose reset status can't be read, show nothing; unresolved operations keep “↻ Review reset” so recovery remains accessible. Click it to open a modal with grant expiry, scopes, and current eligibility. Purchased monetary credits are separate.
 
 In the modal, select **Refresh** to fetch current provider usage, including after a reset made outside this proxy. Select **Use 1 reset**, review the account and grant, and confirm. Claude defaults to the provider's recommended usable grant, then the earliest expiry; you can choose another usable grant. Codex selects its grant on the provider side. Applying a reset is always manual. API keys, custom endpoints, and disabled accounts cannot redeem.
 
