@@ -175,9 +175,10 @@ mod tests {
         .unwrap();
         {
             let mut state = registry.lock();
-            state
-                .bindings
-                .insert("task".into(), Binding { session: "owner".into(), account: "first".into(), last_seen: 0 });
+            state.bindings.insert(
+                "task".into(),
+                Binding { session: "owner".into(), account: "first".into(), last_seen: 0, inferred: false },
+            );
             state.dirty = true;
         }
         worker.schedule();

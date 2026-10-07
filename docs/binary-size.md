@@ -112,6 +112,63 @@ Panic unwinding remains enabled. Aborting on any task panic would change the
 proxy's failure behavior. All providers, compression formats, HTTP/2, SOCKS,
 SQLite, analytics, imports, timezones, and dashboard assets remain available.
 
+## Dependency trims and identical-code folding
+
+A second pass on 2026-10-07 removed code that Fusebox linked but did not need,
+and folds identical functions at link time. All builds below use rustc 1.96.1,
+full LTO and level 3, and pack relative relocations.
+
+| Build | Executable bytes | Smaller than the live build |
+| --- | ---: | ---: |
+| Live build before this pass | 16,135,696 | — |
+| Dependency trims | 15,453,680 | 4.23% |
+| Dependency trims + `--icf=all` (default Linux x86-64 packaging) | 15,345,520 | 4.90% |
+
+Measured one change at a time against a 17,192,360-byte build without packed
+relocations, the trims were:
+
+| Change | Smaller |
+| --- | ---: |
+| Log filtering by target instead of `EnvFilter`, which removes a regex engine | 3.02% |
+| No Brotli response decoding in the HTTP client | 1.20% |
+| `--icf=all` | 0.68% |
+
+- **Logging.** `RUST_LOG` still takes `target=level` directives such as
+  `fusebox=debug,hyper=warn`. Span and field filters are no longer supported; a
+  value that can't be read logs a warning and uses the default.
+- **Brotli.** Upstreams still compress responses with gzip, zstd or deflate,
+  which Fusebox advertises instead. Request bodies already accepted only gzip
+  and zstd.
+- **Identical-code folding.** lld merges functions whose machine code is
+  identical. `--icf=safe` saved nothing, because rustc emits no
+  address-significance table. Rust does not promise distinct function
+  addresses, and the folded build passed all 12 real-process acceptance checks.
+  The flag needs lld, which Rust uses by default on x86-64 Linux since 1.90, so
+  it is passed only in the Docker build and the x86-64 Linux release, like the
+  relocation flag.
+
+Two trims were measured and left out. Switching `idna` to its smaller-sounding
+`unicode-rs` backend made this binary 0.7% larger, and dropping clap's colours
+and suggestions saved 0.1%.
+
+Sequential loopback benchmarks over two alternating rounds showed no
+difference beyond noise:
+
+| Build | Proxy request, analytics off | Proxy request, analytics on | Import 10,000 records | Dashboard query |
+| --- | ---: | ---: | ---: | ---: |
+| Live build | 0.796 ms | 0.790 ms | 0.744 s | 9.26 ms |
+| Dependency trims | 0.802 ms | 0.872 ms | 0.746 s | 9.04 ms |
+| Dependency trims + `--icf=all` | 0.847 ms | 0.837 ms | 0.743 s | 9.46 ms |
+
+No run dropped or rejected a usage observation.
+
+To build the default Linux x86-64 package locally:
+
+```sh
+cargo rustc --release --locked --bin fusebox -- \
+  -C link-arg=-Wl,-z,pack-relative-relocs -C link-arg=-Wl,--icf=all
+```
+
 ## Reproducing comparisons
 
 Keep a copy of the old executable before rebuilding. Use the same compiler,

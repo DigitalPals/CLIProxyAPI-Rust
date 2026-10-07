@@ -964,12 +964,14 @@ const ROUTING_WARNING = {
   connection_only: ['Connection only', 'This assignment lasts for the WebSocket connection. A reconnect without a stable session identifier may use another account.'],
   response_id_only: ['Response ID only', 'This assignment relies on a previous response ID held in memory. A stable session identifier is needed to preserve it across server restarts.'],
   affinity_disabled: ['Affinity off', 'Session affinity is disabled. Requests from this session may use different accounts.'],
+  inferred_session: ['Inferred session', 'The client sent no session ID, so this conversation was recognised by its first message. Conversations that start the same way share an account; send x-fusebox-session-id to keep them apart.'],
 };
 const SESSION_SOURCE = {
   previous_response_id: 'a previous response ID',
   websocket_connection: 'this WebSocket connection',
   generated_response: 'a generated response ID',
   prompt_cache_key: 'the prompt cache key',
+  conversation_start: 'the conversation’s first message, as the client sent no session ID',
 };
 const STRATEGY_PICK = {
   'least-used': 'the account with the most quota left',

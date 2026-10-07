@@ -494,7 +494,11 @@ async fn connect(acct: &Arc<Account>, client_headers: &HeaderMap) -> Result<Upst
             req.headers_mut().insert(name, val);
         }
     }
-    let (ws, _) = tokio::time::timeout(Duration::from_secs(20), tokio_tungstenite::connect_async(req))
+    // The shared TLS setup: roots are read once, sessions resume, and frames go out
+    // without waiting for Nagle's algorithm.
+    let tls = Some(tokio_tungstenite::Connector::Rustls(crate::tls::websocket()));
+    let connecting = tokio_tungstenite::connect_async_tls_with_config(req, None, true, tls);
+    let (ws, _) = tokio::time::timeout(Duration::from_secs(20), connecting)
         .await
         .map_err(|_| UpstreamFailure::timeout("handshake"))?
         .map_err(|e| UpstreamFailure::socket("handshake", &e))?;

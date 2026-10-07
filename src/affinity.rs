@@ -14,6 +14,7 @@ use sha2::{Digest, Sha256};
 
 use crate::accounts::{Account, Only, PROVIDERS, Pick, Pool, Provider};
 use crate::config::{Config, Routing};
+use crate::ir::Format;
 
 mod persistence;
 use persistence::Persistence;
@@ -24,6 +25,10 @@ const MAX_RESPONSE_BYTES: usize = 8 * 1024 * 1024;
 const MAX_RESPONSES: usize = 1_000;
 /// Recent assignments count immediately, including the gaps between coding turns.
 const LOAD_IDLE_SECONDS: i64 = 5 * 60;
+/// Session source for a client that sent no session id: the conversation's first user message.
+pub const INFERRED_SOURCE: &str = "conversation_start";
+/// Provider prompt caches last an hour at most, so an inferred assignment is not kept longer.
+const INFERRED_IDLE_SECONDS: u64 = 60 * 60;
 
 fn digest(parts: &[&str]) -> String {
     let mut h = Sha256::new();
@@ -115,6 +120,86 @@ pub fn session_identity(headers: &HeaderMap, body: &Value) -> Option<SessionIden
     Some(SessionIdentity { key: digest(&[&client_scope(headers), "session", id]), source })
 }
 
+/// Identify a request without a session id by the start of its conversation. Every turn
+/// repeats the first user message, so a conversation's turns share an account and with
+/// it the provider's prompt cache. Cache markers are ignored because clients move them
+/// from turn to turn. Conversations that start identically simply share an account.
+pub fn inferred_identity(headers: &HeaderMap, format: Format, body: &Value) -> Option<SessionIdentity> {
+    let content = first_user_content(format, body)?;
+    let mut hasher = Sha256::new();
+    if !hash_content(content, &mut hasher) {
+        return None;
+    }
+    let start = hex::encode(hasher.finalize());
+    Some(SessionIdentity { key: digest(&[&client_scope(headers), "conversation", &start]), source: INFERRED_SOURCE })
+}
+
+fn first_user_content(format: Format, body: &Value) -> Option<&Value> {
+    let is_user = |m: &&Value| m["role"] == "user";
+    match format {
+        Format::Claude | Format::Chat => body["messages"].as_array()?.iter().find(is_user).map(|m| &m["content"]),
+        Format::Responses => match &body["input"] {
+            text @ Value::String(_) => Some(text),
+            Value::Array(items) => items.iter().find(is_user).map(|m| &m["content"]),
+            _ => None,
+        },
+        Format::Gemini => body["contents"]
+            .as_array()?
+            .iter()
+            .find(|c| c["role"] == "user" || c["role"].is_null())
+            .map(|c| &c["parts"]),
+    }
+}
+
+/// Feed a message's text (and any other parts, without cache markers) to the hasher.
+/// A plain string and a single text block hash the same. Returns whether anything was fed.
+fn hash_content(content: &Value, hasher: &mut Sha256) -> bool {
+    let mut feed = |bytes: &[u8]| {
+        hasher.update((bytes.len() as u64).to_le_bytes());
+        hasher.update(bytes);
+    };
+    match content {
+        Value::String(text) if !text.is_empty() => feed(text.as_bytes()),
+        Value::Array(parts) => {
+            let mut fed = false;
+            for part in parts {
+                match &part["text"] {
+                    Value::String(text) => feed(text.as_bytes()),
+                    _ if part.is_object() => {
+                        let mut part = part.clone();
+                        strip_cache_markers(&mut part);
+                        feed(&serde_json::to_vec(&part).unwrap_or_default());
+                    }
+                    _ => continue,
+                }
+                fed = true;
+            }
+            return fed;
+        }
+        _ => return false,
+    }
+    true
+}
+
+fn strip_cache_markers(value: &mut Value) {
+    match value {
+        Value::Object(object) => {
+            object.remove("cache_control");
+            object.remove("prompt_cache_breakpoint");
+            object.values_mut().for_each(strip_cache_markers);
+        }
+        Value::Array(items) => items.iter_mut().for_each(strip_cache_markers),
+        _ => {}
+    }
+}
+
+/// A provider cache key for a session: stable per session, never the session key itself.
+/// Shaped like the UUIDs Codex sends as its own `prompt_cache_key`.
+pub fn prompt_cache_key(session: &str) -> String {
+    let d = digest(&["prompt-cache-key", session]);
+    format!("{}-{}-{}-{}-{}", &d[..8], &d[8..12], &d[12..16], &d[16..20], &d[20..32])
+}
+
 pub fn session_key(headers: &HeaderMap, body: &Value) -> Option<String> {
     session_identity(headers, body).map(|identity| identity.key)
 }
@@ -154,6 +239,9 @@ struct Binding {
     session: String,
     account: String,
     last_seen: i64,
+    /// Made for a client without a session id; expires sooner and is evicted first.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    inferred: bool,
 }
 
 struct Conversation {
@@ -326,6 +414,21 @@ impl Sessions {
         exclude: &[String],
         only: Option<&Only>,
     ) -> Result<Selected, (u16, String)> {
+        self.pick_session(pool, cfg, model, session, false, exclude, only)
+    }
+
+    /// [`Self::pick_with_reason`], recording whether a new assignment's session was inferred.
+    #[allow(clippy::too_many_arguments)]
+    pub fn pick_session(
+        &self,
+        pool: &Pool,
+        cfg: &Config,
+        model: &str,
+        session: Option<&str>,
+        inferred: bool,
+        exclude: &[String],
+        only: Option<&Only>,
+    ) -> Result<Selected, (u16, String)> {
         let Some(session) = session.filter(|_| cfg.session_affinity) else {
             let (account, model) = selection(self.pick_unbound(pool, cfg, model, exclude, None, only), model)?;
             return Ok(Selected {
@@ -386,12 +489,13 @@ impl Sessions {
                 excluded.push(acct.id.clone());
             }
         } else if registry.bindings.len() >= MAX_SESSIONS {
-            // Make room by forgetting the longest-idle assignment with nothing in flight.
+            // Make room by forgetting the longest-idle assignment with nothing in flight,
+            // inferred ones first: an explicit session id is the stronger claim.
             let oldest = registry
                 .bindings
                 .iter()
                 .filter(|(_, b)| !registry.active.contains_key(&b.session))
-                .min_by_key(|(_, b)| b.last_seen)
+                .min_by_key(|(_, b)| (!b.inferred, b.last_seen))
                 .map(|(k, _)| k.clone());
             match oldest {
                 Some(oldest) => {
@@ -419,6 +523,7 @@ impl Sessions {
                 session: digest(&["owner", session]),
                 account: acct.id.clone(),
                 last_seen: Utc::now().timestamp(),
+                inferred,
             },
         );
         if let Some(old) = &previous {
@@ -481,9 +586,13 @@ impl Sessions {
     }
 
     fn prune_locked(registry: &mut Registry, idle: u64) {
-        let cutoff = Utc::now().timestamp().saturating_sub(idle.clamp(1, i64::MAX as u64) as i64);
+        let now = Utc::now().timestamp();
+        let cutoff = now.saturating_sub(idle.clamp(1, i64::MAX as u64) as i64);
+        let inferred_cutoff = cutoff.max(now - INFERRED_IDLE_SECONDS as i64);
         let count = registry.bindings.len();
-        registry.bindings.retain(|_, b| b.last_seen > cutoff || registry.active.contains_key(&b.session));
+        registry.bindings.retain(|_, b| {
+            b.last_seen > if b.inferred { inferred_cutoff } else { cutoff } || registry.active.contains_key(&b.session)
+        });
         registry.dirty |= count != registry.bindings.len();
         registry.responses.retain(|_, c| c.last_seen > cutoff);
         registry.history_bytes = registry.responses.values().map(|c| c.bytes).sum();
@@ -952,6 +1061,153 @@ mod tests {
     }
 
     #[test]
+    fn inferred_sessions_follow_the_first_user_message_across_turns_and_formats() {
+        let client = |key: &str| {
+            let mut headers = HeaderMap::new();
+            headers.insert("authorization", format!("Bearer {key}").parse().unwrap());
+            headers
+        };
+        let headers = client("first");
+        let key = |format, body: Value| inferred_identity(&headers, format, &body).map(|i| i.key);
+        // Responses: a string, a text block and a later turn all start the same way.
+        let first = key(Format::Responses, json!({"input":"question"})).unwrap();
+        assert_eq!(
+            key(
+                Format::Responses,
+                json!({"input":[{"role":"user","content":[{"type":"input_text","text":"question"}]}]})
+            )
+            .unwrap(),
+            first
+        );
+        let later = json!({"instructions":"changed","input":[
+            {"role":"developer","content":"context"},
+            {"role":"user","content":"question"},
+            {"type":"message","role":"assistant","content":[{"type":"output_text","text":"answer"}]},
+            {"type":"function_call_output","call_id":"c","output":"ok"},
+            {"role":"user","content":"next"}
+        ]});
+        assert_eq!(key(Format::Responses, later).unwrap(), first);
+        assert_ne!(key(Format::Responses, json!({"input":"another question"})).unwrap(), first);
+        // Claude: the moving cache marker on the latest turn does not change the key.
+        let marked = json!({"messages":[{"role":"user","content":[
+            {"type":"text","text":"task","cache_control":{"type":"ephemeral"}},
+            {"type":"image","source":{"type":"base64","media_type":"image/png","data":"AAA"},"cache_control":{"type":"ephemeral"}}
+        ]}]});
+        let claude = key(Format::Claude, marked).unwrap();
+        let next = json!({"system":"s","messages":[
+            {"role":"user","content":[{"type":"text","text":"task"},{"type":"image","source":{"type":"base64","media_type":"image/png","data":"AAA"}}]},
+            {"role":"assistant","content":"done"},
+            {"role":"user","content":[{"type":"text","text":"more","cache_control":{"type":"ephemeral"}}]}
+        ]});
+        assert_eq!(key(Format::Claude, next).unwrap(), claude);
+        let other_image = json!({"messages":[{"role":"user","content":[
+            {"type":"text","text":"task"},{"type":"image","source":{"type":"base64","media_type":"image/png","data":"BBB"}}
+        ]}]});
+        assert_ne!(key(Format::Claude, other_image).unwrap(), claude);
+        // Chat and Gemini.
+        let chat =
+            key(Format::Chat, json!({"messages":[{"role":"system","content":"s"},{"role":"user","content":"hello"}]}));
+        assert_eq!(
+            chat,
+            key(
+                Format::Chat,
+                json!({"messages":[{"role":"user","content":[{"type":"text","text":"hello"}]},{"role":"assistant","content":"hi"}]})
+            )
+        );
+        let gemini = key(Format::Gemini, json!({"contents":[{"parts":[{"text":"hello"}]}]}));
+        assert_eq!(
+            gemini,
+            key(
+                Format::Gemini,
+                json!({"contents":[{"role":"user","parts":[{"text":"hello"}]},{"role":"model","parts":[{"text":"hi"}]}]})
+            )
+        );
+        // Every client key has its own sessions, and nothing to go on means no session.
+        let second = inferred_identity(&client("second"), Format::Responses, &json!({"input":"question"}));
+        assert_ne!(second.unwrap().key, first);
+        for (format, body) in [
+            (Format::Responses, json!({"input":""})),
+            (Format::Responses, json!({"input":[{"type":"function_call_output","call_id":"c","output":"ok"}]})),
+            (Format::Claude, json!({"messages":[{"role":"user","content":[]}]})),
+            (Format::Chat, json!({"messages":[{"role":"system","content":"only instructions"}]})),
+            (Format::Gemini, json!({})),
+        ] {
+            assert!(key(format, body).is_none());
+        }
+        let identity = inferred_identity(&headers, Format::Responses, &json!({"input":"question"})).unwrap();
+        assert_eq!(identity.source, INFERRED_SOURCE);
+        // Never the same as an explicit session with the same text.
+        assert_ne!(Some(identity.key), session_key(&headers, &json!({"prompt_cache_key":"question"})));
+    }
+
+    #[test]
+    fn prompt_cache_keys_are_stable_uuid_shaped_and_not_the_session_key() {
+        let key = prompt_cache_key("session");
+        assert_eq!(key, prompt_cache_key("session"));
+        assert_ne!(key, prompt_cache_key("other"));
+        assert_eq!(key.split('-').map(str::len).collect::<Vec<_>>(), [8, 4, 4, 4, 12]);
+        assert!(key.chars().all(|c| c == '-' || c.is_ascii_hexdigit()));
+        assert!(!digest(&["owner", "session"]).contains(&key.replace('-', "")));
+    }
+
+    #[test]
+    fn inferred_assignments_expire_within_the_cache_lifetime_and_are_evicted_first() {
+        let cfg = config(Routing::RoundRobin);
+        let pool = Pool::default();
+        pool.reload(&cfg);
+        let sessions = Sessions::memory();
+        let pick = |session, inferred| {
+            sessions.pick_session(&pool, &cfg, "gpt-6.1-sol", Some(session), inferred, &[], None).unwrap()
+        };
+        let guessed = pick("guessed", true);
+        let explicit = pick("explicit", false);
+        assert_eq!(pick("guessed", true).account.id, guessed.account.id);
+        assert_eq!(pick("guessed", true).reason, "session_reused");
+        {
+            let registry = sessions.registry.lock();
+            assert_eq!(registry.bindings.values().filter(|b| b.inferred).count(), 1);
+            let stored = serde_json::to_string(&registry.bindings).unwrap();
+            assert_eq!(stored.matches("\"inferred\":true").count(), 1);
+            assert!(!stored.contains("\"inferred\":false"), "explicit assignments keep their old format");
+        }
+        // Two hours idle: past a prompt cache's lifetime, well inside the one-day expiry.
+        sessions.registry.lock().bindings.values_mut().for_each(|b| b.last_seen -= 2 * 3600);
+        sessions.prune(cfg.session_affinity_idle_seconds);
+        let registry = sessions.registry.lock();
+        assert_eq!(registry.bindings.len(), 1);
+        assert!(registry.bindings.values().all(|b| !b.inferred && b.account == explicit.account.id));
+        drop(registry);
+        assert_eq!(pick("guessed", true).reason, "new_session");
+
+        // A full table gives up an inferred assignment before an older explicit one.
+        let sessions = Sessions::memory();
+        {
+            let mut registry = sessions.registry.lock();
+            let now = Utc::now().timestamp();
+            for i in 0..MAX_SESSIONS {
+                registry.bindings.insert(
+                    format!("old-{i}"),
+                    Binding {
+                        session: format!("owner-{i}"),
+                        account: "gone".into(),
+                        last_seen: now - 600 + i as i64,
+                        inferred: i == MAX_SESSIONS - 1,
+                    },
+                );
+            }
+        }
+        sessions.pick_session(&pool, &cfg, "gpt-6.1-sol", Some("new"), false, &[], None).unwrap();
+        let registry = sessions.registry.lock();
+        assert!(registry.bindings.contains_key("old-0"));
+        assert!(!registry.bindings.contains_key(&format!("old-{}", MAX_SESSIONS - 1)));
+        assert!(registry.bindings.values().all(|b| !b.inferred));
+        // Assignments written before this change still load.
+        let old: HashMap<String, Binding> =
+            serde_json::from_str(r#"{"k":{"session":"s","account":"a","last_seen":1}}"#).unwrap();
+        assert!(!old["k"].inferred);
+    }
+
+    #[test]
     fn a_full_table_forgets_the_longest_idle_session_instead_of_failing() {
         let cfg = config(Routing::RoundRobin);
         let pool = Pool::default();
@@ -967,6 +1223,7 @@ mod tests {
                         session: format!("owner-{i}"),
                         account: "gone".into(),
                         last_seen: now - 20_000 + i as i64,
+                        inferred: false,
                     },
                 );
             }

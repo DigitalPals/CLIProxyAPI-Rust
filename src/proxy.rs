@@ -144,6 +144,7 @@ impl Tracker {
         } else {
             match source {
                 None | Some("generated_response") => Some("missing_session_id"),
+                Some(crate::affinity::INFERRED_SOURCE) => Some("inferred_session"),
                 Some("websocket_connection") => Some("connection_only"),
                 Some("previous_response_id") => Some("response_id_only"),
                 _ => None,
@@ -238,9 +239,9 @@ impl Tracker {
         }
     }
 
-    fn observe_quota_event(&self, data: &str) {
+    fn observe_quota_value(&self, value: &Value) {
         if let Some(acct) = &self.acct {
-            observe_quota_event(acct, &self.log.model, data);
+            observe_quota_value(acct, &self.log.model, value);
         }
     }
 
@@ -452,10 +453,7 @@ pub fn mark_quota_exhausted(acct: &Account, model: &str, headers: &reqwest::head
     acct.exhaust(model, until, &format!("subscription quota exhausted: {}", error_message(body)));
 }
 
-fn observe_quota_event(acct: &Account, model: &str, data: &str) {
-    let Ok(v) = serde_json::from_str::<Value>(data) else {
-        return;
-    };
+fn observe_quota_value(acct: &Account, model: &str, v: &Value) {
     let error = if v["response"]["error"].is_object() { &v["response"]["error"] } else { &v["error"] };
     if error.is_object() {
         let status = v["status"].as_u64().unwrap_or(429) as u16;
@@ -568,6 +566,15 @@ pub async fn execute(app: Arc<App>, mut call: Call) -> Reply {
         }
         call.session = Some(session);
     }
+    // Without a session id, a conversation is recognised by its first user message.
+    // A continuation by response id already has its session, or names one we don't know.
+    if call.session.is_none()
+        && !call.body["previous_response_id"].is_string()
+        && let Some(identity) = crate::affinity::inferred_identity(&call.headers, call.format, &call.body)
+    {
+        call.session = Some(identity.key);
+        call.session_source = Some(identity.source);
+    }
     if call.format == Format::Responses && call.session.is_none() {
         // A response id can identify subsequent turns even without client session metadata.
         call.session = Some(crate::affinity::connection_key(&call.headers, &uuid::Uuid::new_v4().to_string()));
@@ -650,6 +657,13 @@ async fn execute_inner(app: Arc<App>, call: Call) -> Reply {
     // Same-account retries for blips (capacity errors, soft rate limits).
     let mut soft_tries: HashMap<String, u32> = HashMap::new();
     let attempts = cfg.request_retry.max(1) as usize;
+    let inferred = call.session_source == Some(crate::affinity::INFERRED_SOURCE);
+    // A per-request random id would split the provider's cache rather than route to it.
+    let cache_key = call
+        .session
+        .as_deref()
+        .filter(|_| call.session_source != Some("generated_response"))
+        .map(crate::affinity::prompt_cache_key);
 
     while tried.len() < attempts {
         let pin = retry_same.take();
@@ -672,7 +686,7 @@ async fn execute_inner(app: Arc<App>, call: Call) -> Reply {
         let picked = if let Some(retry) = retry {
             Ok(retry)
         } else if cfg.session_affinity && call.session.is_some() && call.session_source != Some("generated_response") {
-            app.sessions.pick_with_reason(&app.pool, &cfg, &model, call.session.as_deref(), &tried, only.as_ref())
+            app.sessions.pick_session(&app.pool, &cfg, &model, call.session.as_deref(), inferred, &tried, only.as_ref())
         } else {
             match app.sessions.pick_unbound(&app.pool, &cfg, &model, &tried, pin.as_deref(), only.as_ref()) {
                 Pick::Ok(a, m) => Ok(crate::affinity::Selected {
@@ -721,7 +735,11 @@ async fn execute_inner(app: Arc<App>, call: Call) -> Reply {
             selected.previous_account = pending.previous_account;
         }
         tracker.selected(&selected);
-        app.sessions.persist_selection(&selected).await;
+        // An inferred assignment is a best guess: it is written in the background, not
+        // before the request, so requests without a session id never wait for the disk.
+        if !inferred {
+            app.sessions.persist_selection(&selected).await;
+        }
         let (acct, upstream_model) = (selected.account, selected.model);
 
         if let Err(e) = crate::oauth::ensure_ready(&app, &acct).await {
@@ -838,6 +856,7 @@ async fn execute_inner(app: Arc<App>, call: Call) -> Reply {
                 passthrough,
                 stream: upstream_stream,
                 count_tokens: false,
+                cache_key: cache_key.as_deref(),
             },
             body,
         );
@@ -1126,18 +1145,19 @@ fn event_stream(
                     return;
                 }
             };
-            observe_quota_event(&acct, &model, &text);
-            if let Some(c)=&usage_tap {c.text(&text);}
             let evs = match serde_json::from_str::<Value>(&text) {
-                Ok(v) => checked_full_events(native, &v),
+                Ok(v) => {
+                    observe_quota_value(&acct, &model, &v);
+                    if let Some(c) = &usage_tap { c.wire(&v); }
+                    checked_full_events(native, &v)
+                }
                 // Mislabelled stream: decode it as SSE after all.
                 Err(_) => {
                     let mut dec = SseDecoder::default();
                     let mut parser = formats::parser(native);
                     let mut out = Vec::new();
                     for sse in dec.push(text.as_bytes()).into_iter().chain(dec.finish()) {
-                        observe_quota_event(&acct, &model, &sse.data);
-                        if let Some(c)=&usage_tap {c.text(&sse.data);}
+                        observe_sse(&acct, &model, usage_tap.as_ref(), &sse);
                         parser.feed(&sse, &mut out);
                     }
                     out
@@ -1158,8 +1178,7 @@ fn event_stream(
             match body.next().await {
                 Some(Ok(chunk)) => {
                     for sse in dec.push(&chunk) {
-                        observe_quota_event(&acct, &model, &sse.data);
-                        if let Some(c)=&usage_tap {c.text(&sse.data);}
+                        observe_sse(&acct, &model, usage_tap.as_ref(), &sse);
                         parser.feed(&sse, &mut out);
                     }
                 }
@@ -1172,8 +1191,7 @@ fn event_stream(
                 }
                 None => {
                     for sse in dec.finish() {
-                        observe_quota_event(&acct, &model, &sse.data);
-                        if let Some(c)=&usage_tap {c.text(&sse.data);}
+                        observe_sse(&acct, &model, usage_tap.as_ref(), &sse);
                         parser.feed(&sse, &mut out);
                     }
                     for ev in out.drain(..) { yield rename(ev); }
@@ -1186,6 +1204,21 @@ fn event_stream(
             }
         }
     })
+}
+
+/// Quota and usage both read the event's JSON; parse it once for the two of them.
+fn observe_sse(
+    acct: &Account,
+    model: &str,
+    usage_tap: Option<&crate::usage::capture::Capture>,
+    sse: &crate::sse::SseEvent,
+) {
+    if let Ok(v) = serde_json::from_str::<Value>(&sse.data) {
+        observe_quota_value(acct, model, &v);
+        if let Some(c) = usage_tap {
+            c.wire(&v);
+        }
+    }
 }
 
 fn is_content(ev: &Event) -> bool {
@@ -1262,27 +1295,28 @@ fn passthrough_stream(resp: reqwest::Response, native: Format, mut tracker: Trac
                     yield Frame::data("[DONE]");
                     return;
                 }
-                tracker.observe_quota_event(&sse.data);
-                tracker.observe_usage_text(&sse.data);
+                // Quota, usage, the stop check and Antigravity's unwrap share one parse.
+                let parsed = serde_json::from_str::<Value>(&sse.data).ok();
+                if let Some(v) = &parsed {
+                    tracker.observe_quota_value(v);
+                    tracker.observe_wire(v);
+                }
                 parser.feed(&sse, &mut evs);
                 for ev in evs.drain(..) {
                     tracker.observe_stream_event(&ev);
                 }
                 let claude_stop = native == Format::Claude
                     && (sse.event.as_deref() == Some("message_stop")
-                        || serde_json::from_str::<Value>(&sse.data).is_ok_and(|v| v["type"] == "message_stop"));
+                        || parsed.as_ref().is_some_and(|v| v["type"] == "message_stop"));
                 if claude_stop && !tracker.stream_finished && tracker.stream_error.is_none() {
                     tracker.observe_stream_event(&premature_end());
                     tracker.finish_stream();
                     yield stream_error_frame(native, 502, PREMATURE_END);
                     return;
                 }
-                let data = if unwrap {
-                    serde_json::from_str::<Value>(&sse.data)
-                        .map(|v| crate::antigravity::unwrap(v).to_string())
-                        .unwrap_or(sse.data)
-                } else {
-                    sse.data
+                let data = match parsed {
+                    Some(v) if unwrap => crate::antigravity::unwrap(v).to_string(),
+                    _ => sse.data,
                 };
                 yield Frame { event: sse.event.map(std::borrow::Cow::Owned), data };
             }
@@ -1310,14 +1344,17 @@ async fn collect_passthrough(mut body: ByteStream, native: Format, mut tracker: 
     let mut final_obj: Option<Value> = None;
     let mut evs = Vec::new();
     let mut handle = |sse: crate::sse::SseEvent, agg: &mut Aggregate, final_obj: &mut Option<Value>| {
-        tracker.observe_quota_event(&sse.data);
-        tracker.observe_usage_text(&sse.data);
+        let parsed = serde_json::from_str::<Value>(&sse.data).ok();
+        if let Some(v) = &parsed {
+            tracker.observe_quota_value(v);
+            tracker.observe_wire(v);
+        }
         parser.feed(&sse, &mut evs);
         evs.drain(..).for_each(|e| agg.push(&e));
-        if let Ok(v) = serde_json::from_str::<Value>(&sse.data)
+        if let Some(mut v) = parsed
             && matches!(v["type"].as_str(), Some("response.completed" | "response.incomplete" | "response.done"))
         {
-            *final_obj = Some(v["response"].clone());
+            *final_obj = Some(v["response"].take());
         }
     };
     while let Some(chunk) = body.next().await {
@@ -1387,6 +1424,7 @@ pub async fn count_tokens(app: Arc<App>, headers: HeaderMap, body: Value) -> (Va
                 passthrough: true,
                 stream: false,
                 count_tokens: true,
+                cache_key: None,
             },
             body.clone(),
         );

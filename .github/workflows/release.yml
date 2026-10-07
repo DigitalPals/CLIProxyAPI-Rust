@@ -33,7 +33,7 @@ jobs:
         run: |
           if [[ "${{ matrix.target }}" == "x86_64-unknown-linux-gnu" ]]; then
             cargo rustc --release --locked --bin fusebox --target ${{ matrix.target }} -- \
-              -C link-arg=-Wl,-z,pack-relative-relocs
+              -C link-arg=-Wl,-z,pack-relative-relocs -C link-arg=-Wl,--icf=all
           else
             cargo build --release --locked --target ${{ matrix.target }}
           fi

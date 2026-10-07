@@ -771,9 +771,12 @@ async fn quota_headers_and_stream_errors_trigger_migration_on_the_next_call() {
 async fn response_ids_continue_the_task_without_session_headers_and_replay_full_input() {
     let fixture = Fixture::new(Routing::RoundRobin, false).await;
     let first = fixture.request(None, prompt()).await.1;
+    assert_eq!(answer(&first), "a");
     let first_log = fixture.logs(1).await.pop().unwrap();
-    assert_eq!(first_log.session_source, Some("generated_response"));
-    assert_eq!(first_log.routing_warning, Some("missing_session_id"));
+    // No session id: the conversation is recognised by its first message and assigned.
+    assert_eq!(first_log.session_source, Some(crate::affinity::INFERRED_SOURCE));
+    assert_eq!(first_log.routing_warning, Some("inferred_session"));
+    assert_eq!(first_log.routing_reason, Some("new_session"));
     fixture.mock.mode.store(1, Ordering::Relaxed);
     let body = json!({"model":"gpt-6.1-sol","previous_response_id":first["id"],"input":"next"});
     let (status, next) = fixture.request(None, body).await;
@@ -783,8 +786,8 @@ async fn response_ids_continue_the_task_without_session_headers_and_replay_full_
     assert_eq!(next_log.session_id, first_log.session_id);
     assert_eq!(next_log.session_source, Some("previous_response_id"));
     assert_eq!(next_log.routing_warning, Some("response_id_only"));
-    // The first turn had no session id, so the continuation makes the first assignment.
-    assert_eq!(next_log.routing_reason, Some("new_session"));
+    // The continuation found the first turn's assignment used up and moved it.
+    assert_eq!(next_log.routing_reason, Some("quota_exhausted"));
     {
         let calls = fixture.mock.calls.lock();
         let (_, sent, _) = calls.last().unwrap();
@@ -795,6 +798,15 @@ async fn response_ids_continue_the_task_without_session_headers_and_replay_full_
         fixture.request(None, json!({"model":"gpt-6.1-sol","previous_response_id":"external", "input":"next"})).await.0,
         200
     );
+    // With no user message to go on, a generated id still threads later continuations.
+    let tool_output =
+        json!({"model":"gpt-6.1-sol","input":[{"type":"function_call_output","call_id":"call","output":"ok"}]});
+    assert_eq!(fixture.request(None, tool_output).await.0, 200);
+    let logs = fixture.logs(4).await;
+    for log in &logs[2..] {
+        assert_eq!(log.session_source, Some("generated_response"));
+        assert_eq!(log.routing_warning, Some("missing_session_id"));
+    }
 }
 
 #[tokio::test]
@@ -1241,17 +1253,27 @@ async fn diagnostics_distinguish_agent_threads_and_missing_or_disabled_affinity(
     assert!(threads.iter().all(|thread| !serialized.contains(*thread)));
     assert!(!serialized.contains("client-one"));
 
-    for _ in 0..2 {
-        assert_eq!(fixture.request(None, prompt()).await.0, 200);
+    // Without a session id, a conversation keeps its account by its first message;
+    // a conversation that starts differently is assigned on its own.
+    let second_turn = json!({"model":"gpt-6.1-sol","input":[
+        {"role":"user","content":"question"},
+        {"type":"message","role":"assistant","content":[{"type":"output_text","text":"a"}]},
+        {"role":"user","content":"follow-up"}
+    ]});
+    for body in [prompt(), second_turn, json!({"model":"gpt-6.1-sol","input":"another question"})] {
+        assert_eq!(fixture.request(None, body).await.0, 200);
     }
-    let logs = fixture.logs(6).await;
-    assert_ne!(logs[4].session_id, logs[5].session_id);
-    assert_ne!(logs[4].account, logs[5].account);
+    let logs = fixture.logs(7).await;
+    assert_eq!(logs[4].session_id, logs[5].session_id);
+    assert_eq!(logs[4].account, logs[5].account);
+    assert_eq!((logs[4].routing_reason, logs[5].routing_reason), (Some("new_session"), Some("session_reused")));
+    assert_ne!(logs[6].session_id, logs[4].session_id);
+    assert_eq!(logs[6].routing_reason, Some("new_session"));
     for log in &logs[4..] {
-        assert_eq!(log.session_source, Some("generated_response"));
-        assert_eq!(log.routing_reason, Some("missing_session"));
-        assert_eq!(log.routing_warning, Some("missing_session_id"));
+        assert_eq!(log.session_source, Some(crate::affinity::INFERRED_SOURCE));
+        assert_eq!(log.routing_warning, Some("inferred_session"));
     }
+    assert!(!serde_json::to_string(&logs).unwrap().contains("another question"));
 
     let mut cfg = fixture.cfg.clone();
     cfg.session_affinity = false;
@@ -1259,9 +1281,9 @@ async fn diagnostics_distinguish_agent_threads_and_missing_or_disabled_affinity(
     for _ in 0..2 {
         assert_eq!(fixture.request(Some(threads[0]), prompt()).await.0, 200);
     }
-    let logs = fixture.logs(8).await;
-    assert_ne!(logs[6].account, logs[7].account);
-    for log in &logs[6..] {
+    let logs = fixture.logs(9).await;
+    assert_ne!(logs[7].account, logs[8].account);
+    for log in &logs[7..] {
         assert_eq!(log.session_id, logs[0].session_id);
         assert_eq!(log.session_source, Some("thread-id"));
         assert_eq!(log.routing_reason, Some("affinity_disabled"));
@@ -1408,6 +1430,48 @@ async fn translated_responses_preserve_cache_controls_and_reject_unsupported_pre
     assert_eq!(status, 400, "{response}");
     assert!(response["error"]["message"].as_str().unwrap().contains("prewarming"));
     assert_eq!(fixture.mock.calls.lock().len(), 1, "unsupported cache controls reached the upstream");
+}
+
+#[tokio::test]
+async fn openai_backends_get_a_session_cache_key_and_custom_endpoints_do_not() {
+    // ChatGPT subscriptions: OpenAI's own backend, here at a local address.
+    let fixture = Fixture::new(Routing::RoundRobin, true).await;
+    let claude = |messages: Value| json!({"model":"gpt-6.1-sol","max_tokens":32,"messages":messages});
+    let turns = [
+        claude(json!([{"role":"user","content":"translate this task"}])),
+        claude(json!([
+            {"role":"user","content":"translate this task"},
+            {"role":"assistant","content":"done"},
+            {"role":"user","content":"and the next one"}
+        ])),
+    ];
+    for body in turns {
+        let response = reqwest::Client::new()
+            .post(format!("{}/v1/messages", fixture.proxy.url))
+            .header("x-api-key", "client-one")
+            .json(&body)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), 200);
+    }
+    let sent_key = |i: usize| fixture.mock.calls.lock()[i].1["prompt_cache_key"].clone();
+    // Both turns of the translated conversation carry the same key, shaped like Codex's own.
+    let key = sent_key(0);
+    assert_eq!(key, sent_key(1));
+    assert_eq!(key.as_str().unwrap().split('-').count(), 5);
+    let accounts: Vec<_> = fixture.mock.calls.lock().iter().map(|(a, _, _)| a.clone()).collect();
+    assert_eq!(accounts[0], accounts[1]);
+    // A key the client chose is passed on unchanged; another session gets its own.
+    fixture.request(Some("task"), json!({"model":"gpt-6.1-sol","input":"q","prompt_cache_key":"client-key"})).await;
+    assert_eq!(sent_key(2), "client-key");
+    fixture.request(Some("task"), prompt()).await;
+    assert!(sent_key(3).is_string() && sent_key(3) != key && sent_key(3) != "client-key");
+
+    // API keys on a custom endpoint may not accept the field: it is not added there.
+    let fixture = Fixture::new(Routing::RoundRobin, false).await;
+    assert_eq!(fixture.request(Some("task"), prompt()).await.0, 200);
+    assert!(fixture.mock.calls.lock()[0].1.get("prompt_cache_key").is_none());
 }
 
 #[tokio::test]

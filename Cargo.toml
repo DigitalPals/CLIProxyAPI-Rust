@@ -35,7 +35,8 @@ parking_lot = "0.12"
 rand = "0.9"
 ring = "0.17"
 rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
-reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "stream", "json", "gzip", "brotli", "zstd", "deflate", "socks", "http2"] }
+rustls-native-certs = "0.8"
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "stream", "json", "gzip", "zstd", "deflate", "socks", "http2"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = { version = "1", features = ["preserve_order"] }
 serde_yaml = "0.9"
@@ -45,9 +46,10 @@ tokio-util = { version = "0.7", features = ["io"] }
 tokio-tungstenite = { version = "0.29", features = ["rustls-tls-native-roots"] }
 tower-http = { version = "0.6", features = ["cors"] }
 tracing = "0.1"
-tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+tracing-subscriber = "0.3"
 url = "2"
 uuid = { version = "1", features = ["v4"] }
+webpki-roots = "1"
 zstd = "0.14"
 yaml-edit = { version = "0.3.2", default-features = false }
 

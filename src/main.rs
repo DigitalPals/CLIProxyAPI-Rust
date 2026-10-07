@@ -21,6 +21,7 @@ mod schema;
 mod server;
 mod sse;
 mod state;
+mod tls;
 mod token_count;
 mod upstream;
 mod usage;
@@ -99,15 +100,7 @@ async fn main() -> Result<()> {
         return check(&path);
     }
     let cfg = Config::load(&path)?;
-    let filter = std::env::var("RUST_LOG")
-        .unwrap_or_else(|_| if cfg.debug { "fusebox=debug".into() } else { "fusebox=info".into() });
-    use std::io::IsTerminal;
-    tracing_subscriber::fmt()
-        .with_env_filter(filter)
-        .with_target(false)
-        .with_ansi(std::io::stdout().is_terminal())
-        .compact()
-        .init();
+    init_logging(cfg.debug);
     if cfg.legacy_auth_dir {
         tracing::info!(
             "using sign-ins from {} because {} doesn't exist; set auth-dir in config.yaml to choose",
@@ -123,6 +116,35 @@ async fn main() -> Result<()> {
             login(app, &provider, no_browser, file, &location).await
         }
         _ => serve(app).await,
+    }
+}
+
+/// `RUST_LOG` takes `target=level` directives (`fusebox=debug,hyper=warn`). Span and
+/// field filters are not supported; a value that can't be read falls back to the default.
+fn log_filter(value: Option<&str>, debug: bool) -> (tracing_subscriber::filter::Targets, bool) {
+    let default = if debug { "fusebox=debug" } else { "fusebox=info" };
+    match value.map(str::parse) {
+        Some(Ok(targets)) => (targets, true),
+        Some(Err(_)) => (default.parse().expect("default log filter"), false),
+        None => (default.parse().expect("default log filter"), true),
+    }
+}
+
+fn init_logging(debug: bool) {
+    use std::io::IsTerminal;
+    use tracing_subscriber::Layer;
+    use tracing_subscriber::layer::SubscriberExt;
+    use tracing_subscriber::util::SubscriberInitExt;
+    let value = std::env::var("RUST_LOG").ok();
+    let (targets, understood) = log_filter(value.as_deref(), debug);
+    let layer = tracing_subscriber::fmt::layer()
+        .with_target(false)
+        .with_ansi(std::io::stdout().is_terminal())
+        .compact()
+        .with_filter(targets);
+    tracing_subscriber::registry().with(layer).init();
+    if !understood {
+        tracing::warn!("RUST_LOG takes target=level directives such as fusebox=debug; using the default instead");
     }
 }
 
@@ -188,6 +210,8 @@ async fn serve(app: Arc<App>) -> Result<()> {
     println!();
 
     let service = server::router(app.clone()).into_make_service_with_connect_info::<SocketAddr>();
+    // Streamed answers are many small writes; without TCP_NODELAY, Nagle's algorithm
+    // holds each one back until the client acknowledges the previous one.
     let result = if let Some(tls) = tls {
         let handle = axum_server::Handle::new();
         let stop = handle.clone();
@@ -195,8 +219,18 @@ async fn serve(app: Arc<App>) -> Result<()> {
             shutdown_signal().await;
             stop.graceful_shutdown(Some(Duration::from_secs(10)));
         });
-        axum_server::from_tcp_rustls(listener.into_std()?, tls)?.handle(handle).serve(service).await
+        axum_server::from_tcp_rustls(listener.into_std()?, tls)?
+            .map(|acceptor| acceptor.acceptor(axum_server::accept::NoDelayAcceptor::new()))
+            .handle(handle)
+            .serve(service)
+            .await
     } else {
+        use axum::serve::ListenerExt;
+        let listener = listener.tap_io(|tcp| {
+            if let Err(e) = tcp.set_nodelay(true) {
+                tracing::debug!("could not set TCP_NODELAY on a client connection: {e}");
+            }
+        });
         axum::serve(listener, service).with_graceful_shutdown(shutdown_signal()).await
     };
     if let Some(task) = import_task {
@@ -424,6 +458,24 @@ fn check(path: &Path) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn log_filter_reads_target_directives_and_falls_back_on_unsupported_syntax() {
+        use tracing::Level;
+        use tracing_subscriber::filter::Targets;
+        let enabled = |t: &Targets, target, level| t.would_enable(target, &level);
+        let (t, ok) = log_filter(None, false);
+        assert!(ok && enabled(&t, "fusebox::proxy", Level::INFO) && !enabled(&t, "fusebox::proxy", Level::DEBUG));
+        let (t, ok) = log_filter(None, true);
+        assert!(ok && enabled(&t, "fusebox", Level::DEBUG) && !enabled(&t, "hyper", Level::INFO));
+        let (t, ok) = log_filter(Some("fusebox=debug,hyper=warn"), false);
+        assert!(ok && enabled(&t, "fusebox", Level::DEBUG) && enabled(&t, "hyper", Level::WARN));
+        assert!(!enabled(&t, "hyper", Level::INFO));
+        let (t, ok) = log_filter(Some("info"), false);
+        assert!(ok && enabled(&t, "anything", Level::INFO));
+        let (t, ok) = log_filter(Some("fusebox[span{field=1}]=debug"), false);
+        assert!(!ok && enabled(&t, "fusebox", Level::INFO) && !enabled(&t, "fusebox", Level::DEBUG));
+    }
 
     #[test]
     fn config_path_prefers_the_flag_then_the_new_variable_then_the_old_one() {

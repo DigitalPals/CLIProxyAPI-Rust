@@ -110,6 +110,7 @@ fn openai_base(app: &App, acct: &Account, headers: &HeaderMap, model: &str) -> (
         passthrough: true,
         stream: false,
         count_tokens: false,
+        cache_key: None,
     };
     let p = upstream::prepare(&t, json!({}));
     let base = p.url.trim_end_matches("/chat/completions").trim_end_matches("/responses").to_string();
@@ -283,6 +284,7 @@ async fn imagen(app: &App, acct: &Account, headers: &HeaderMap, model: &str, bod
         passthrough: true,
         stream: false,
         count_tokens: false,
+        cache_key: None,
     };
     let p = upstream::prepare(&t, json!({}));
     let url = p.url.replace(":generateContent", ":predict");
@@ -335,6 +337,7 @@ async fn gemini_image(app: &App, acct: &Account, headers: &HeaderMap, model: &st
         passthrough: true,
         stream: false,
         count_tokens: false,
+        cache_key: None,
     };
     let n = body["n"].as_u64().unwrap_or(1).clamp(1, 4);
     let mut images = Vec::new();

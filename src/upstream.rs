@@ -40,6 +40,8 @@ pub struct Target<'a> {
     pub passthrough: bool,
     pub stream: bool,
     pub count_tokens: bool,
+    /// A stable per-session key for providers that route their prompt cache by one.
+    pub cache_key: Option<&'a str>,
 }
 
 /// Headers never copied from the client to an upstream.
@@ -300,8 +302,13 @@ fn cloak_body(body: &mut Value, acct: &Account, account_uuid: Option<&str>, coun
     }
     // An extra 5m breakpoint could exceed Anthropic's four-breakpoint limit or
     // precede the caller's 1h breakpoint. Respect explicit and automatic caching.
+    // Without any, cache the shared tools and system prompt, and let automatic caching
+    // follow the growing conversation (which now holds the caller's instructions too).
     if !configured_cache {
         body["system"][1]["cache_control"] = json!({"type": "ephemeral"});
+        if !count_tokens {
+            body["cache_control"] = json!({"type": "ephemeral"});
+        }
     }
 
     if let Some(idx) = first_user.filter(|_| !caller.is_empty()) {
@@ -382,14 +389,16 @@ fn cloaked_system_in_original_order(original: &[Value], identity: &Value, caller
     Value::Array(system)
 }
 
+/// Any cache marker, at any depth (tool results can carry them on their inner blocks):
+/// adding ours on top could exceed Anthropic's four breakpoints.
 fn has_claude_cache_control(body: &Value) -> bool {
-    !body["cache_control"].is_null()
-        || ["tools", "system"]
-            .iter()
-            .any(|field| body[field].as_array().into_iter().flatten().any(|block| !block["cache_control"].is_null()))
-        || body["messages"].as_array().into_iter().flatten().any(|message| {
-            message["content"].as_array().into_iter().flatten().any(|block| !block["cache_control"].is_null())
-        })
+    match body {
+        Value::Object(object) => {
+            object.get("cache_control").is_some_and(|c| !c.is_null()) || object.values().any(has_claude_cache_control)
+        }
+        Value::Array(items) => items.iter().any(has_claude_cache_control),
+        _ => false,
+    }
 }
 
 // ----------------------------------------------------------------------- codex
@@ -485,6 +494,15 @@ fn codex(t: &Target, mut body: Value) -> Prepared {
     } else {
         body["model"] = t.model.into();
         body["stream"] = t.stream.into();
+    }
+    // OpenAI routes cache lookups by prefix and this key. Codex always sends one; other
+    // clients (and translated requests) get the session's. Custom endpoints may reject it.
+    let official = oauth || base.trim_end_matches('/') == OPENAI_API;
+    if official
+        && body["prompt_cache_key"].is_null()
+        && let Some(key) = t.cache_key
+    {
+        body["prompt_cache_key"] = key.into();
     }
     let mut headers = codex_headers(t.client_headers, &token, account_id.as_deref(), oauth);
     if let Some(key) = body["prompt_cache_key"].as_str().filter(|_| oauth)
@@ -686,7 +704,8 @@ fn responses_api(t: &Target, mut body: Value) -> Prepared {
         headers.push(("x-client-id".into(), "tbh:tui".into()));
         base.unwrap_or_else(|| device::meta::API_BASE.into())
     } else {
-        if let Some(key) = body["prompt_cache_key"].as_str() {
+        // xAI routes its prompt cache by conversation id.
+        if let Some(key) = body["prompt_cache_key"].as_str().or(t.cache_key) {
             headers.push(("x-grok-conv-id".into(), key.to_string()));
         }
         let official = base.as_deref().is_none_or(|b| b.trim_end_matches('/') == device::xai::API_BASE);
@@ -776,9 +795,17 @@ mod tests {
         cloak_body(&mut automatic, &acct, None, false);
         assert!(automatic["system"][1]["cache_control"].is_null());
         assert_eq!(automatic["cache_control"], json!({"type":"ephemeral","ttl":"1h"}));
-        let mut default = request;
+        let mut default = request.clone();
         cloak_body(&mut default, &acct, None, false);
         assert_eq!(default["system"][1]["cache_control"], json!({"type":"ephemeral"}));
+        // The conversation, which now holds the caller's instructions, is cached too.
+        assert_eq!(default["cache_control"], json!({"type":"ephemeral"}));
+        assert_eq!(default["messages"][0]["content"][0]["text"], "<system-reminder>\ninstructions\n</system-reminder>");
+        assert!(default["messages"][0]["content"][0]["cache_control"].is_null());
+        // Token counting has nothing to cache.
+        let mut counted = request;
+        cloak_body(&mut counted, &acct, None, true);
+        assert!(counted["cache_control"].is_null());
     }
 
     #[test]
@@ -876,10 +903,25 @@ mod tests {
                 passthrough: true,
                 stream: false,
                 count_tokens: false,
+                cache_key: None,
             },
             body.clone(),
         );
         assert_eq!(prepared.body, body);
+    }
+
+    #[test]
+    fn claude_cloak_adds_no_breakpoints_when_the_caller_marked_a_nested_block() {
+        let acct = claude_account();
+        let mut body = json!({"system":"instructions","messages":[
+            {"role":"assistant","content":[{"type":"tool_use","id":"t","name":"lookup","input":{}}]},
+            {"role":"user","content":[{"type":"tool_result","tool_use_id":"t","content":[
+                {"type":"text","text":"result","cache_control":{"type":"ephemeral"}}
+            ]}]}
+        ]});
+        cloak_body(&mut body, &acct, None, false);
+        assert!(body["cache_control"].is_null());
+        assert!(body["system"][1]["cache_control"].is_null());
     }
 
     #[test]

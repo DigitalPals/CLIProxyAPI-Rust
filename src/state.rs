@@ -64,6 +64,8 @@ impl App {
         } else {
             (None, None)
         };
+        // Read the system's TLS roots now, not on the first request's worker thread.
+        crate::tls::warm();
         Arc::new(Self {
             usage,
             usage_error,
@@ -93,13 +95,19 @@ impl App {
     pub fn set_config(&self, cfg: Config) {
         self.http.set_default_proxy(&cfg.proxy_url);
         self.pool.reload(&cfg);
+        self.retain_account_pools();
         self.cfg.store(Arc::new(cfg));
         self.broadcast("accounts", serde_json::Value::Null);
     }
 
     pub fn reload_accounts(&self) {
         self.pool.reload(&self.cfg());
+        self.retain_account_pools();
         self.broadcast("accounts", serde_json::Value::Null);
+    }
+
+    fn retain_account_pools(&self) {
+        self.http.retain_accounts(&self.pool.all().iter().map(|a| a.id.clone()).collect());
     }
 
     pub fn suppress_reload(&self) {
@@ -125,6 +133,17 @@ pub struct Http {
     clients: Mutex<HashMap<String, reqwest::Client>>,
 }
 
+/// Separates the parts of a pool key; never valid in a proxy URL or an account id.
+const SEP: char = '\0';
+
+/// How long a TCP connection may be silent before the OS checks it is still alive,
+/// then how often it asks and how many unanswered checks close it. A connection
+/// dropped by a NAT or load balancer is found in about a minute instead of waiting
+/// for the next request to hang until the read timeout.
+const KEEPALIVE_IDLE: Duration = Duration::from_secs(30);
+const KEEPALIVE_INTERVAL: Duration = Duration::from_secs(10);
+const KEEPALIVE_RETRIES: u32 = 3;
+
 impl Http {
     fn new(proxy: &str) -> Self {
         Self { default_proxy: Mutex::new(proxy.to_string()), clients: Mutex::new(HashMap::new()) }
@@ -136,57 +155,78 @@ impl Http {
 
     /// Client for the given proxy (falls back to the configured default).
     pub fn client(&self, proxy: Option<&str>) -> reqwest::Client {
-        self.build(proxy, None, false, false)
+        self.build(proxy, Sharing::Shared, false, false)
     }
 
     /// Short, bounded requests for credentials, discovery and usage data.
     pub fn control(&self, proxy: Option<&str>) -> reqwest::Client {
-        self.build(proxy, None, false, true)
+        self.build(proxy, Sharing::Shared, false, true)
     }
 
     pub fn control_for_account(&self, acct: &crate::accounts::Account) -> reqwest::Client {
-        let h1_pool = (acct.provider == crate::accounts::Provider::Antigravity).then_some(acct.id.as_str());
-        self.build(acct.proxy_url.as_deref(), h1_pool, false, true)
+        let pool = if acct.provider == crate::accounts::Provider::Antigravity {
+            Sharing::Http1(&acct.id)
+        } else {
+            Sharing::Shared
+        };
+        self.build(acct.proxy_url.as_deref(), pool, false, true)
     }
 
     /// Spending requests must never follow redirects or retry in the HTTP layer.
     pub fn for_reset(&self, proxy: Option<&str>) -> reqwest::Client {
-        self.build(proxy, None, true, false)
+        self.build(proxy, Sharing::Shared, true, false)
     }
 
-    /// Antigravity accounts each get their own HTTP/1.1 pool, as the IDE does;
-    /// Google's backend treats shared HTTP/2 connections less kindly.
+    /// Each signed-in subscription gets its own connections, as its own CLI would:
+    /// requests for different accounts never share one HTTP/2 connection. Antigravity
+    /// accounts use HTTP/1.1, as the IDE does; Google's backend treats shared HTTP/2
+    /// connections less kindly. API keys share a pool per proxy.
     pub fn for_account(&self, acct: &crate::accounts::Account) -> reqwest::Client {
-        match acct.provider {
-            crate::accounts::Provider::Antigravity => {
-                self.build(acct.proxy_url.as_deref(), Some(&acct.id), false, false)
-            }
-            _ => self.build(acct.proxy_url.as_deref(), None, false, false),
-        }
+        let pool = match acct.provider {
+            crate::accounts::Provider::Antigravity => Sharing::Http1(&acct.id),
+            _ if acct.is_oauth() => Sharing::Account(&acct.id),
+            _ => Sharing::Shared,
+        };
+        self.build(acct.proxy_url.as_deref(), pool, false, false)
     }
 
-    fn build(&self, proxy: Option<&str>, h1_pool: Option<&str>, reset: bool, control: bool) -> reqwest::Client {
+    /// Close the pools of accounts that no longer exist.
+    pub fn retain_accounts(&self, ids: &std::collections::HashSet<String>) {
+        self.clients.lock().retain(|key, _| {
+            key.split(SEP)
+                .find_map(|part| part.strip_prefix("acct:").or_else(|| part.strip_prefix("h1:")))
+                .is_none_or(|id| ids.contains(id))
+        });
+    }
+
+    fn build(&self, proxy: Option<&str>, pool: Sharing, reset: bool, control: bool) -> reqwest::Client {
         let proxy =
             proxy.filter(|p| !p.is_empty()).map(String::from).unwrap_or_else(|| self.default_proxy.lock().clone());
-        let mut key = match h1_pool {
-            Some(id) => format!("{proxy}\0h1:{id}"),
-            None => proxy.clone(),
-        };
+        let mut key = proxy.clone();
+        match pool {
+            Sharing::Shared => {}
+            Sharing::Account(id) => key.extend([SEP.to_string(), format!("acct:{id}")]),
+            Sharing::Http1(id) => key.extend([SEP.to_string(), format!("h1:{id}")]),
+        }
         if reset {
-            key.push_str("\0reset");
+            key.extend([SEP.to_string(), "reset".into()]);
         }
         if control {
-            key.push_str("\0control");
+            key.extend([SEP.to_string(), "control".into()]);
         }
         let mut clients = self.clients.lock();
         if let Some(c) = clients.get(&key) {
             return c.clone();
         }
+        let http1 = matches!(pool, Sharing::Http1(_));
         let mut b = reqwest::Client::builder()
+            .use_preconfigured_tls(crate::tls::http(http1))
             .connect_timeout(Duration::from_secs(20))
             .read_timeout(Duration::from_secs(600))
             .pool_idle_timeout(Duration::from_secs(90))
-            .tcp_keepalive(Duration::from_secs(30));
+            .tcp_keepalive(KEEPALIVE_IDLE)
+            .tcp_keepalive_interval(KEEPALIVE_INTERVAL)
+            .tcp_keepalive_retries(KEEPALIVE_RETRIES);
         if control {
             b = b
                 .connect_timeout(Duration::from_secs(10))
@@ -205,13 +245,23 @@ impl Http {
                 Err(e) => tracing::error!("invalid proxy-url {proxy}: {e}"),
             }
         }
-        if h1_pool.is_some() {
+        if http1 {
             b = b.http1_only().pool_idle_timeout(Duration::from_secs(200));
         }
         let c = b.build().expect("http client");
         clients.insert(key, c.clone());
         c
     }
+}
+
+/// Which connection pool a client draws from.
+#[derive(Clone, Copy)]
+enum Sharing<'a> {
+    Shared,
+    /// One account's own HTTP/2-capable pool.
+    Account(&'a str),
+    /// One account's own HTTP/1.1 pool.
+    Http1(&'a str),
 }
 
 // ----------------------------------------------------------------------- stats
@@ -427,6 +477,42 @@ mod tests {
             attempts: 1,
             error: None,
         }
+    }
+
+    #[test]
+    fn subscriptions_get_their_own_pools_and_removed_accounts_close_them() {
+        let cfg = Config {
+            auth_dir: "/nonexistent".into(),
+            claude_api_key: ["one", "two", "three"]
+                .map(|key| crate::config::KeyEntry { api_key: key.into(), ..Default::default() })
+                .to_vec(),
+            ..Default::default()
+        };
+        let pool = Pool::default();
+        pool.reload(&cfg);
+        let accounts = pool.all();
+        for a in &accounts[..2] {
+            *a.cred.write() = crate::accounts::Credential::OAuth(crate::accounts::OAuth {
+                access_token: "token".into(),
+                ..Default::default()
+            });
+        }
+        let http = Http::new("");
+        let count = || http.clients.lock().len();
+        http.for_account(&accounts[0]);
+        http.for_account(&accounts[1]);
+        assert_eq!(count(), 2, "each subscription has its own pool");
+        http.for_account(&accounts[2]);
+        http.client(None);
+        assert_eq!(count(), 3, "API keys share the default pool");
+        http.for_account(&accounts[0]);
+        http.control_for_account(&accounts[0]);
+        assert_eq!(count(), 4, "pools are reused; control requests stay shared");
+        http.retain_accounts(&[accounts[1].id.clone(), accounts[2].id.clone()].into());
+        assert_eq!(count(), 3);
+        assert!(http.clients.lock().keys().all(|k| !k.contains(&accounts[0].id)));
+        http.retain_accounts(&Default::default());
+        assert_eq!(count(), 2, "shared pools are never pruned");
     }
 
     #[test]

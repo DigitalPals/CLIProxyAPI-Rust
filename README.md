@@ -314,7 +314,9 @@ five-hour-reserve-percent: 30 # 0 turns the reserve off; other strategies ignore
 
 In a v8 file both go under `routing` (`strategy: smart-quota`).
 
-Sessions are recognised from what clients already send: Claude Code's session metadata, Codex's `session_id` and `thread-id` headers, a Responses `conversation` id or `prompt_cache_key`. Writing your own client? Send one stable `x-fusebox-session-id` per task (the older `x-cliproxy-session-id` still works). Each client API key has its own sessions. Requests without any of these are routed one by one, and a WebSocket without one keeps its account for the connection.
+Sessions are recognised from what clients already send: Claude Code's session metadata, Codex's `session_id` and `thread-id` headers, a Responses `conversation` id or `prompt_cache_key`. Writing your own client? Send one stable `x-fusebox-session-id` per task (the older `x-cliproxy-session-id` still works). Each client API key has its own sessions. A WebSocket without any of these keeps its account for the connection.
+
+An HTTP request without any of them is recognised by its conversation's first user message, which every turn repeats, so the conversation's turns still share one account and its prompt cache. Cache markers are ignored for this, since clients move them from turn to turn. Conversations that start with the same message share an account. These inferred assignments are written to disk in the background and forgotten after an hour without requests, when no provider cache would still be warm. The Requests page marks them as **Inferred session**. A request with no user message at all is routed on its own.
 
 Assignments are saved to `.routing-sessions.state` in the auth directory (hashed ids, owner-only permissions), so they survive restarts, and forgotten after `session-affinity-idle-seconds` without requests (a day by default). Send `x-fusebox-session-end: true` (or `x-cliproxy-session-end: true`) with a task's last request to release it early. Responses history for `previous_response_id` is kept in memory only, up to 64 MiB. Run one proxy per auth directory.
 
@@ -322,7 +324,9 @@ The Requests page shows each request's session fingerprint (click it to see the 
 
 Cache hints carry across formats: OpenAI cache settings and breakpoints between Chat Completions and Responses, and Claude's cache markers, in their TTL order, when a request is made to look like Claude Code. A hint that can't be carried over is dropped rather than failing the request.
 
-Requests translated to Anthropic use its automatic prompt caching when the caller has not supplied explicit cache controls. This covers the growing conversation, including caller instructions moved by OAuth cloaking. Explicit controls take precedence; cache hits still depend on the provider's minimum prompt size and reuse within its cache lifetime.
+Requests translated to Anthropic use its automatic prompt caching when the caller has not supplied explicit cache controls. So do requests that are made to look like Claude Code on a subscription account, which also cache the shared tools and system prompt. This covers the growing conversation, including caller instructions moved by OAuth cloaking. Explicit controls take precedence; cache hits still depend on the provider's minimum prompt size and reuse within its cache lifetime.
+
+OpenAI routes its prompt cache by a `prompt_cache_key`, which Codex always sends. Requests to ChatGPT accounts or to OpenAI's own API that arrive without one, including Claude-format requests translated for a GPT model, get a key derived from their session. xAI receives the same key as its conversation id. A key the client sends is passed on unchanged, and API keys with a custom `base-url` never get one added.
 
 Output limits are preserved during translation. Manual Claude thinking needs an output limit greater than 1,024 tokens; incompatible requests receive a `400` instead of silently increasing the limit. Gemini reasoning suffixes use the same mapping for native and translated requests.
 
