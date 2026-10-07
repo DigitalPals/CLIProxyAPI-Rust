@@ -30,7 +30,7 @@ A lean rewrite of CLIProxyAPI (Go): one binary, no runtime, an embedded dashboar
 - Providers: Claude (OAuth + key), Codex/ChatGPT (OAuth + key), Gemini (key), Vertex AI (service account + key), Antigravity (OAuth), Grok/xAI (device code + key), Kimi (device code + key), Meta (device code + key), Devin (OAuth), any OpenAI-compatible endpoint. Images through `/v1/images/*`, xAI video through `/v1/videos/*`.
 - Dashboard is vanilla HTML/CSS/JS embedded in the binary; no build step, no external requests (no CDNs, no hosted fonts: IBM Plex Sans, IBM Plex Sans Condensed and DM Mono are self-hosted from the binary).
 - Management API is localhost-only unless `management-key` is set.
-- Usage statistics are in-memory (reset on restart).
+- Live statistics are in-memory. Historical Usage & Costs uses embedded SQLite; local native history imports and metadata-only multi-machine collectors require explicit opt-in.
 
 ## Brand Commitments
 

@@ -465,7 +465,7 @@ async fn local_store(directory: PathBuf) -> Result<Store> {
         if database.exists() && fs::symlink_metadata(&database)?.file_type().is_symlink() {
             bail!("symlink outbox unsupported")
         }
-        for suffix in ["-wal", "-shm"] {
+        for suffix in ["-wal", "-shm", "-journal"] {
             let sidecar = directory.join(format!("outbox.sqlite3{suffix}"));
             if sidecar.exists() && fs::symlink_metadata(sidecar)?.file_type().is_symlink() {
                 bail!("symlink outbox sidecar unsupported")
@@ -479,11 +479,11 @@ async fn local_store(directory: PathBuf) -> Result<Store> {
             }
             fs::set_permissions(&database, fs::Permissions::from_mode(0o600))?;
         }
-        let store = Store::open(&database, 128, 3650, None)?;
+        let store = Store::open_collector(&database, MAX_LOCAL_DATABASE_BYTES)?;
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
-            for suffix in ["", "-wal", "-shm"] {
+            for suffix in ["", "-wal", "-shm", "-journal"] {
                 let file = directory.join(format!("outbox.sqlite3{suffix}"));
                 if file.exists() {
                     fs::set_permissions(file, fs::Permissions::from_mode(0o600))?;
@@ -493,28 +493,6 @@ async fn local_store(directory: PathBuf) -> Result<Store> {
         Ok(store)
     })
     .await??;
-    let bounded = store
-        .call(|conn| {
-            // This standalone database has one serialized writer and no dashboard
-            // workload. DELETE avoids unbounded WAL growth behind external readers.
-            let mode: String = conn.query_row("PRAGMA journal_mode=DELETE", [], |r| r.get(0))?;
-            if mode != "delete" {
-                bail!("collector journal mode unavailable")
-            }
-            conn.execute_batch("PRAGMA synchronous=FULL")?;
-            let page_size: u64 = conn.query_row("PRAGMA page_size", [], |r| r.get(0))?;
-            conn.pragma_update(None, "max_page_count", MAX_LOCAL_DATABASE_BYTES / page_size)?;
-            let limit: u64 = conn.query_row("PRAGMA max_page_count", [], |r| r.get(0))?;
-            if limit * page_size > MAX_LOCAL_DATABASE_BYTES {
-                bail!("collector database exceeds size limit; pending outbox preserved")
-            }
-            Ok(())
-        })
-        .await;
-    if let Err(error) = bounded {
-        let _ = store.shutdown().await;
-        return Err(error);
-    }
     imports::init(&store).await?;
     store.call(|conn|{conn.execute_batch("CREATE TABLE IF NOT EXISTS usage_collector_outbox(sequence INTEGER PRIMARY KEY AUTOINCREMENT,event_key TEXT NOT NULL UNIQUE,payload TEXT NOT NULL,created_at_ms INTEGER NOT NULL);
     CREATE TABLE IF NOT EXISTS usage_collector_local_meta(key TEXT PRIMARY KEY,value TEXT NOT NULL);

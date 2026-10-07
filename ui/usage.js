@@ -42,7 +42,7 @@ const ux = UsageTools.escape;
 const usageCount = (value) => value == null ? 'Unknown' : new Intl.NumberFormat('en-US').format(value);
 const usageSensitive = (value) => ux(UsageTools.privateLabel(value, S.private));
 const usageSource = (source) => ({ proxy: 'Proxy', claude_code: 'Claude Code history', codex: 'Codex history' }[source] || source || 'Unknown source');
-const usageTime = (value) => value == null ? 'Not reported' : Number.isFinite(new Date(value).getTime()) ? new Date(value).toLocaleString(undefined, { timeZone: Usage.timezone }) : 'Not reported';
+const usageTime = (value) => value == null || value === 0 ? 'Not reported' : Number.isFinite(new Date(value).getTime()) ? new Date(value).toLocaleString(undefined, { timeZone: Usage.timezone }) : 'Not reported';
 const usageButton = (act, label, extra = '', disabled = false) => `<button class="btn" type="button" data-usage-act="${act}" ${extra}${disabled || Usage.busy ? ' disabled' : ''}>${label}</button>`;
 
 function usageHTML() {
@@ -54,7 +54,7 @@ function usageHTML() {
     ${usageFiltersHTML()}
     ${u.loading ? '<p class="usage-message" role="status">Loading usage metadata…</p>' : ''}
     ${u.error ? `<div class="notice usage-message err" role="alert">${S.private ? 'Usage could not be loaded. Try refreshing.' : ux(u.error)} ${usageButton('refresh', 'Try again')}</div>` : ''}
-    <div id="usage-results" aria-busy="${u.loading}">${u.loaded && u.summary ? usageTotalsHTML() + usageTrendHTML() + usageObservationsHTML() : !u.loading && !u.error ? '<div class="card pad"><h2 class="h-sec">No usage loaded</h2><p class="meta">Refresh to read persisted metadata.</p></div>' : ''}</div>
+    <div id="usage-results" aria-busy="${u.loading}">${u.loaded && u.summary ? usageTotalsHTML() + usageTrendHTML() + usageBreakdownsHTML() + usageObservationsHTML() : !u.loading && !u.error ? '<div class="card pad"><h2 class="h-sec">No usage loaded</h2><p class="meta">Refresh to read persisted metadata.</p></div>' : ''}</div>
     ${usageAllowancesHTML()}
     ${usageSourcesHTML()}
   </div>`;
@@ -87,14 +87,14 @@ function usageFiltersHTML() {
 }
 
 function usageQualityHTML(t) {
-  return `<span class="meta">${usageCount(t.unpriced)} unpriced · ${usageCount(t.partial)} partial · ${usageCount(t.missing_usage)} missing usage${t.conflicts != null ? ` · ${usageCount(t.conflicts)} conflicts` : ''}</span>`;
+  return `<span class="meta">${usageCount(t.unpriced)} unpriced · ${usageCount(t.partial)} partial · ${usageCount(t.missing_usage)} missing usage · ${usageCount(t.pricing_partial)} estimates with assumptions${t.aggregation_overflow ? ' · Aggregate exceeds supported numeric range; amount unknown' : ''}${t.conflicts != null ? ` · ${usageCount(t.conflicts)} conflicts` : ''}</span>`;
 }
 function usageTotalsHTML() {
   const s = Usage.summary, p = s.proxy || {};
   const tokens = p.tokens || {};
   return `<section class="sec" aria-labelledby="usage-totals-title"><div class="sec-head"><h2 class="h-sec" id="usage-totals-title">Proxy accounting</h2></div>
     <div class="card pad"><dl class="usage-stats"><div><dt>Logical requests</dt><dd>${usageCount(p.logical_requests)}</dd></div><div><dt>Upstream attempts</dt><dd>${usageCount(p.attempts)}</dd></div><div><dt>Priced estimate</dt><dd>${ux(UsageTools.money(p.estimated_cost_nanos))}</dd></div><div><dt>Input / output tokens</dt><dd>${usageCount(tokens.input)} / ${usageCount(tokens.output)}</dd></div></dl><p class="meta">Attempts include retries. The estimate covers priced observations only; unknown usage and prices are excluded.</p>${usageQualityHTML(p)}</div>
-    <div class="usage-source-totals">${(s.sources || []).filter((t) => t.source !== 'proxy').map((t) => `<article class="card pad"><h3>${ux(usageSource(t.source))}</h3><dl class="usage-stats"><div><dt>Imported observations</dt><dd>${usageCount(t.observations)}</dd></div><div><dt>Priced estimate</dt><dd>${ux(UsageTools.money(t.estimated_cost_nanos))}</dd></div></dl>${usageQualityHTML(t)}<p class="meta">${t.possibly_overlapping === false ? 'Source-separated evidence.' : 'Possibly overlaps proxy or other histories.'} No cross-source grand total.</p></article>`).join('')}</div>
+    <div class="usage-source-totals">${(s.sources || []).filter((t) => t.source !== 'proxy').map((t) => `<article class="card pad"><h3>${ux(usageSource(t.source))}</h3><dl class="usage-stats"><div><dt>Source records</dt><dd>${usageCount(t.source_record_count)}</dd></div><div><dt>Selected accounting entries</dt><dd>${usageCount(t.observations)}</dd></div><div><dt>Priced estimate</dt><dd>${ux(UsageTools.money(t.estimated_cost_nanos))}</dd></div></dl>${usageQualityHTML(t)}<p class="meta">${t.source_record_count > t.observations ? 'Some matching records are revisions, superseded counters, or copied evidence selected under another origin. Excluded records remain in the detail list. ' : ''}${t.possibly_overlapping === false ? 'Source-separated evidence.' : 'Possibly overlaps proxy or other histories.'} No cross-source grand total.</p></article>`).join('')}</div>
     <p class="meta usage-pricing">Pricing catalogue ${ux(s.pricing?.version || Usage.status?.pricing?.version || 'unknown')} · ${ux(s.pricing?.basis || Usage.status?.pricing?.basis || 'Basis not reported')}. This is an API-equivalent estimate, not a subscription bill.</p>
   </section>`;
 }
@@ -102,15 +102,31 @@ function usageTotalsHTML() {
 function usageTrendHTML() {
   const trend = Usage.summary.trend || [];
   const groups = [...new Set(trend.map((t) => t.source))];
-  return `<section class="sec" aria-labelledby="usage-trend-title"><div class="sec-head"><h2 class="h-sec" id="usage-trend-title">Daily trend</h2><span class="meta">Sources shown separately</span></div>${!trend.length ? '<div class="card pad"><p class="meta">No observations in this date range. Change dates or configure an import below.</p></div>' : groups.map((source) => {
+  return `<section class="sec" aria-labelledby="usage-trend-title"><div class="sec-head"><h2 class="h-sec" id="usage-trend-title">Daily trend</h2><span class="meta">Sources shown separately</span></div>${!trend.length ? '<div class="card pad"><p class="meta">No selected accounting entries in this date range. Matching raw evidence, when present, remains in the detail list below.</p></div>' : groups.map((source) => {
     const rows = trend.filter((r) => r.source === source).sort((a, b) => a.date.localeCompare(b.date));
     const max = Math.max(1, ...rows.map((r) => r.observations || 0));
     return `<div class="card pad usage-trend"><h3>${ux(usageSource(source))}</h3><div class="usage-trend-scroll"><table class="usage-table"><caption class="sr-only">${ux(usageSource(source))} daily observations and estimates</caption><thead><tr><th scope="col">Local date</th><th scope="col">Observations</th><th scope="col">Priced estimate</th><th scope="col">Unpriced</th></tr></thead><tbody>${rows.map((r) => `<tr><th scope="row" class="mono">${ux(r.date)}</th><td><span class="usage-spark" aria-hidden="true"><i style="width:${Math.max(0, (r.observations || 0) / max * 100)}%"></i></span>${usageCount(r.observations)}</td><td class="mono">${ux(UsageTools.money(r.estimated_cost_nanos))}</td><td>${usageCount(r.unpriced)}</td></tr>`).join('')}</tbody></table></div></div>`;
   }).join('')}</section>`;
 }
 
+function usageBreakdownsHTML() {
+  return `<section class="sec"><div class="sec-head"><h2 class="h-sec">Breakdowns</h2><span class="meta">Selected accounting evidence · up to 500 groups each</span></div>${[['provider', 'Provider'], ['model', 'Actual model'], ['account', 'Account'], ['client', 'Client / collector']].map(([key, title]) => {
+    const rows = Usage.summary.breakdowns?.[key] || [];
+    return `<details class="card pad"><summary>${title} · ${rows.length} groups</summary><div class="usage-table-scroll" tabindex="0" role="region" aria-label="${title} breakdown"><table class="usage-table"><thead><tr><th>${title}</th><th>Source</th><th>Observations</th><th>Input / output</th><th>Priced estimate / coverage</th></tr></thead><tbody>${rows.map((r) => {
+      const facet = usageFacet(key).find((v) => typeof v === 'object' && v.id === r.id);
+      const name = facet?.label || r.id || 'Unknown';
+      return `<tr><th>${['account', 'client'].includes(key) ? usageSensitive(name) : ux(name)}</th><td>${ux(usageSource(r.source))}</td><td>${usageCount(r.observations)}</td><td>${usageCount(r.tokens?.input)} / ${usageCount(r.tokens?.output)}</td><td>${ux(UsageTools.money(r.estimated_cost_nanos))}${usageQualityHTML(r)}</td></tr>`;
+    }).join('')}</tbody></table>${rows.length ? '' : '<p class="meta">No matching observations.</p>'}</div></details>`;
+  }).join('')}</section>`;
+}
+
 function usageTokenHTML(t = {}) {
   return ['input', 'output', 'cache_read', 'cache_write', 'write_5m', 'write_1h', 'reasoning'].map((k) => `<span>${({ input: 'Input', output: 'Output', cache_read: 'Cache read', cache_write: 'Cache write', write_5m: 'Write 5m', write_1h: 'Write 1h', reasoning: 'Reasoning' })[k]} <span class="mono">${usageCount(t[k])}</span></span>`).join('');
+}
+function usagePriceDetails(p) {
+  if (!p) return '';
+  const url = p.rate?.source_url;
+  return `<details><summary>Pricing provenance${p.partial ? ' · partial estimate' : ''}</summary><p class="meta">${p.local_override ? 'Local override' : 'Published rate'} · ${ux(p.catalogue_version || 'Unknown catalogue')} · ${ux(p.service_tier || 'Tier not reported')}</p>${(p.assumptions || []).map((a) => `<p class="meta">Assumption: ${ux(a.replace(/_/g,' '))}</p>`).join('')}${url && /^https:\/\//.test(url) ? `<a href="${ux(url)}" target="_blank" rel="noopener noreferrer">Rate source</a>` : ''}</details>`;
 }
 function usageObservationsHTML() {
   const o = Usage.observations || { items: [], total: 0 }, items = o.items || [];
@@ -119,7 +135,7 @@ function usageObservationsHTML() {
     <p class="meta">Metadata only. Input excludes cache reads and writes; reasoning is already included in output. Cache TTL counts are subsets of cache writes. Unknown is not zero.</p>
     <div class="card usage-observations">${!items.length ? '<div class="pad"><p class="meta">No matching observations.</p></div>' : `<div class="usage-table-scroll" tabindex="0" role="region" aria-label="Usage observations table"><table class="usage-table"><thead><tr><th scope="col">Time / source</th><th scope="col">Provider / actual model</th><th scope="col">Account / client</th><th scope="col">Reported tokens</th><th scope="col">Estimate / coverage</th></tr></thead><tbody>${items.map((r) => {
       const collector = r.collector_label || (r.origin_id && r.origin_id !== 'local' ? r.origin_id : null);
-      return `<tr><td><span class="mono">${ux(usageTime(r.event_at_ms))}</span><span class="meta">${ux(usageSource(r.source))}</span></td><td><span>${ux(r.provider || 'Unknown')}</span><span class="mono">${ux(r.actual_model || 'Unknown')}</span></td><td><span>${usageSensitive(r.account_label || r.account_id)}</span><span class="meta">${usageSensitive(r.client_label || r.client_id || collector)}</span></td><td><details><summary>Input ${usageCount(r.tokens?.input)} · output ${usageCount(r.tokens?.output)}</summary><div class="usage-tokens">${usageTokenHTML(r.tokens)}</div></details></td><td><span class="mono">${ux(UsageTools.money(r.estimated_cost_nanos))}</span><span class="meta">${ux(r.completeness || 'Unknown coverage')} · ${ux(r.state || 'Unknown state')}</span><span class="meta">${ux(r.pricing_basis || 'Pricing basis not reported')}</span></td></tr>`;
+      return `<tr><td><span class="mono">${ux(usageTime(r.event_at_ms))}</span><span class="meta">${ux(usageSource(r.source))}</span></td><td><span>${ux(r.provider || 'Unknown')}</span><span class="mono">${ux(r.actual_model || 'Unknown')}</span></td><td><span>${usageSensitive(r.account_label || r.account_id)}</span><span class="meta">${usageSensitive(r.client_label || r.client_id || collector)}</span></td><td><details><summary>Input ${usageCount(r.tokens?.input)} · output ${usageCount(r.tokens?.output)}</summary><div class="usage-tokens">${usageTokenHTML(r.tokens)}</div></details></td><td><span class="mono">${ux(UsageTools.money(r.estimated_cost_nanos))}</span><span class="meta">${ux(r.completeness || 'Unknown coverage')} · ${r.superseded ? 'Excluded: superseded by per-response evidence' : ux(r.state || 'Recorded observation')}</span><span class="meta">${ux(r.pricing_basis || 'Pricing basis not reported')}</span>${usagePriceDetails(r.pricing_snapshot)}</td></tr>`;
     }).join('')}</tbody></table></div>`}</div>
     <div class="usage-pagination"><span class="meta" role="status">${count ? `${Usage.offset + 1}–${end} of ${usageCount(count)}` : '0 observations'} · ${Usage.limit} per page · exports contain this page only</span><span class="grow"></span>${usageButton('previous', 'Previous', '', Usage.offset === 0 || Usage.loading)}${usageButton('next', 'Next', '', end >= count || Usage.loading)}</div>
   </section>`;
@@ -128,7 +144,7 @@ function usageObservationsHTML() {
 function usageAllowancesHTML() {
   const accounts = (S.accounts || []).filter(metered);
   return `<section class="sec" aria-labelledby="usage-allowance-title"><div class="sec-head"><h2 class="h-sec" id="usage-allowance-title">Provider allowances</h2><span class="grow"></span>${quotaControlsHTML(false, false, false)}</div>
-    <p class="meta">Provider-reported subscription windows. These percentages are independent of API cost estimates.</p><div class="usage-allowances">${accounts.map((a) => `<article class="card pad"><div class="usage-allowance-head">${acctLogo(a, 16)}<h3>${usageSensitive(a.label)}</h3></div>${metersHTML(a)}<p class="meta">Source: ${ux(provName(a))} account quota · updated ${ux(usageTime(a.quota?.updated_at))}</p></article>`).join('') || '<div class="card pad"><p class="meta">No provider allowances reported. Connected API keys do not report subscription limits.</p></div>'}</div>
+    <p class="meta">Provider-reported subscription windows. These percentages are independent of API cost estimates. Subscription credit estimation is unsupported; API dollars are not converted into credits.</p><div class="usage-allowances">${accounts.map((a) => `<article class="card pad"><div class="usage-allowance-head">${acctLogo(a, 16)}<h3>${usageSensitive(a.label)}</h3></div>${metersHTML(a)}<p class="meta">Source: ${ux(provName(a))} account quota · updated ${ux(usageTime(a.quota?.updated_at))}</p></article>`).join('') || '<div class="card pad"><p class="meta">No provider allowances reported. Connected API keys do not report subscription limits.</p></div>'}</div>
   </section>`;
 }
 
@@ -136,18 +152,19 @@ function usageSourcesHTML() {
   const status = Usage.status, health = status?.health;
   return `<section class="sec" aria-labelledby="usage-sources-title"><div class="sec-head"><h2 class="h-sec" id="usage-sources-title">Sources &amp; collection</h2></div>
     ${Usage.actionError ? `<p class="usage-message err" role="alert">${S.private ? 'The action failed. Retry or check server logs.' : ux(Usage.actionError)}</p>` : ''}
-    <div class="card pad usage-health"><h3>Analytics health</h3><p>${ux(health?.state || 'Not loaded')}${health?.message ? ` · ${S.private ? 'See server status for details' : ux(health.message)}` : ''}</p><p class="meta">Queue ${usageCount(health?.queue_depth)} · dropped ${usageCount(health?.dropped)} · writer errors ${usageCount(health?.writer_errors)} · last commit ${ux(usageTime(health?.last_commit_at_ms))}</p><p class="meta">Enqueued proxy observations become durable after commit. Gaps and writer errors can make totals incomplete.</p></div>
-    <div class="usage-management"><div class="card pad"><h3>Local history imports</h3><p class="meta">Opt in with a root on the Fusebox server. Imports read usage metadata from Claude Code or Codex histories. No transcript content is stored.</p>${['claude_code', 'codex'].map((source) => {
-      const item = (status?.imports || []).find((r) => r.source === source);
-      return `<form class="usage-import" data-usage-import="${source}"><h4>${ux(usageSource(source))}</h4><p class="meta">${ux(item?.state || 'Not configured')} · ${item?.enabled ? 'Enabled' : 'Disabled'} · imported ${usageCount(item?.imported)} · last scan ${ux(usageTime(item?.last_scan_at_ms))}</p>${item?.root ? `<p class="mono usage-path">${usageSensitive(item.root)}</p>` : ''}${item?.last_error ? `<p class="err meta">${S.private ? 'Import error; details hidden' : ux(item.last_error)}</p>` : ''}<label class="usage-field"><span>History root on server</span><input name="root" type="${S.private ? 'password' : 'text'}" autocomplete="off" spellcheck="false" placeholder="${S.private ? 'Path hidden · enter a root to replace it' : source === 'claude_code' ? '/path/to/.claude/projects' : '/path/to/.codex/sessions'}" value="${S.private ? '' : ux(Usage.roots[source] ?? item?.root ?? '')}"${Usage.busy ? ' disabled' : ''}></label><div class="usage-actions"><button class="btn" type="submit"${Usage.busy ? ' disabled' : ''}>${item?.enabled ? 'Save root' : 'Enable import'}</button>${usageButton('toggle-import', item?.enabled ? 'Disable' : 'Enable saved root', `data-source="${source}"`, !item?.root)}${usageButton('scan', 'Scan now', `data-source="${source}"`, !item?.enabled)}</div></form>`;
-    }).join('')}</div>
+    <div class="card pad usage-health"><h3>Analytics health</h3><p>${ux(health?.state || 'Not loaded')}${health?.message ? ` · ${S.private ? 'See server status for details' : ux(health.message)}` : ''}</p><p class="meta">Queue ${usageCount(health?.queue_depth)} · dropped ${usageCount(health?.dropped)} · writer errors ${usageCount(health?.writer_errors)} · rejected ${usageCount(health?.rejected)} · last commit ${ux(usageTime(health?.last_commit_at_ms))}</p><p class="meta">${Object.values(health?.historical_gap || {}).some((n) => n > 0) ? 'Historical analytics gaps are recorded. ' : ''}${health?.recovery_warning ? 'An earlier or concurrent writer may have uncommitted usage. ' : ''}Enqueued proxy observations become durable after commit. Gaps and writer errors can make totals incomplete.</p></div>
+    <div class="usage-management"><div class="card pad"><h3>Local history imports</h3><p class="meta">Opt in with a root on the Fusebox server. Imports read usage metadata from Claude Code or Codex histories. No transcript content is stored.</p>${['claude_code', 'codex'].map(usageImportHTML).join('')}</div>
     <div class="card pad"><h3>Collectors</h3><p class="meta">A collector sends metadata from another machine. Each credential is shown once. Last contact is a health signal; last sync reports durable ingestion.</p>
     <form id="usage-enroll" class="usage-enroll"><label class="usage-field"><span>Friendly label</span><input name="label" type="${S.private ? 'password' : 'text'}" value="${S.private ? '' : ux(Usage.collectorDraft)}" placeholder="${S.private ? 'Label hidden' : 'Work laptop'}" maxlength="120" required autocomplete="off"${Usage.busy ? ' disabled' : ''}></label><button class="btn" type="submit"${Usage.busy ? ' disabled' : ''}>Enroll collector</button></form>
     ${usageCredentialHTML()}
-    <div class="usage-collectors">${(status?.collectors || []).map((c, i) => `<article class="usage-collector"><div class="usage-collector-head"><h4>${usageSensitive(c.label || c.id)}</h4><span class="meta">${c.revoked ? 'Revoked' : ux(c.state || 'Not yet contacted')}</span></div><p class="meta">Last contact ${ux(usageTime(c.last_contact_at_ms))}<br>Last sync ${ux(usageTime(c.last_sync_at_ms))} · pending ${usageCount(c.pending)}</p><div class="usage-actions">${usageButton('rotate', 'Rotate credential', `data-index="${i}"`, !!c.revoked)}${usageButton('revoke', 'Revoke', `data-index="${i}"`, !!c.revoked)}</div></article>`).join('') || '<p class="meta">No collectors enrolled.</p>'}</div>
+    <div class="usage-collectors">${(status?.collectors || []).map((c, i) => `<article class="usage-collector"><div class="usage-collector-head"><h4>${usageSensitive(c.label || c.id)}</h4><span class="meta">${c.revoked ? 'Revoked' : ux(c.state || 'Not yet contacted')}</span></div><p class="meta">Last contact ${ux(usageTime(c.last_contact_at_ms))}<br>Last sync ${ux(usageTime(c.last_sync_at_ms))} · pending ${usageCount(c.pending)}</p><p class="meta">Covered sources: ${(c.covered_sources || []).map(usageSource).map(ux).join(', ') || 'Not yet reported'}<br>Observed range ${ux(usageTime(c.time_start_ms))} → ${ux(usageTime(c.time_end_ms))}</p>${(c.progress || []).map((p) => `<p class="meta">${ux(usageSource(p.source))} · ${ux(p.state)} · imported ${usageCount(p.imported)} · duplicates ${usageCount(p.duplicate)} · skipped ${usageCount(p.skipped)} · unsupported ${usageCount(p.unsupported)} · failed ${usageCount(p.failed)}<br>Last scan ${ux(usageTime(p.last_scan_at_ms))} · total historical coverage unknown</p>`).join('')}<div class="usage-actions">${usageButton('rotate', 'Rotate credential', `data-index="${i}"`, !!c.revoked)}${usageButton('revoke', 'Revoke', `data-index="${i}"`, !!c.revoked)}</div></article>`).join('') || '<p class="meta">No collectors enrolled.</p>'}</div>
     ${Usage.confirm ? `<div class="usage-confirm" role="alert"><h4>${Usage.confirm.action === 'revoke' ? 'Revoke' : 'Rotate credential for'} ${usageSensitive(Usage.confirm.label)}?</h4><p>${Usage.confirm.action === 'revoke' ? 'Revoke this collector? New uploads will be rejected; stored metadata remains.' : 'Rotate this credential? The old credential stops working immediately. Update the collector with the replacement.'}</p><div class="usage-actions">${usageButton('confirm', Usage.confirm.action === 'revoke' ? 'Confirm revoke' : 'Confirm rotation')}${usageButton('cancel', 'Cancel')}</div></div>` : ''}
     </div></div>
   </section>`;
+}
+function usageImportHTML(source) {
+  const roots = (Usage.status?.imports || []).map((item, index) => ({ item, index })).filter(({ item }) => item.source === source);
+  return `<div class="usage-import"><h4>${ux(usageSource(source))}</h4>${roots.map(({ item, index }) => `<article><p class="mono usage-path">${usageSensitive(item.root)}</p><p class="meta">${ux(item.state || 'Not configured')} · ${item.enabled ? 'Enabled' : 'Disabled'} · imported ${usageCount(item.imported)} · duplicates ${usageCount(item.duplicate)} · skipped ${usageCount(item.skipped)} · unsupported ${usageCount(item.unsupported)} · failed ${usageCount(item.failed)} · last scan ${ux(usageTime(item.last_scan_at_ms))}</p>${item.last_error ? `<p class="err meta">${S.private ? 'Import error; details hidden' : ux(item.last_error)}</p>` : ''}<div class="usage-actions">${usageButton('toggle-import', item.enabled ? 'Disable root' : 'Enable root', `data-index="${index}"`)}${usageButton('scan', 'Scan source now', `data-source="${source}"`, !item.enabled)}</div></article>`).join('') || '<p class="meta">Not configured · Disabled</p>'}<form data-usage-import="${source}"><label class="usage-field"><span>History root on server</span><input name="root" type="${S.private ? 'password' : 'text'}" autocomplete="off" spellcheck="false" placeholder="${S.private ? 'Path hidden · enter a root' : source === 'claude_code' ? '/path/to/.claude/projects' : '/path/to/.codex/sessions'}" value="${S.private ? '' : ux(Usage.roots[source] || '')}"${Usage.busy ? ' disabled' : ''}></label><button class="btn" type="submit"${Usage.busy ? ' disabled' : ''}>Enable import</button></form></div>`;
 }
 function usageCredentialHTML() {
   if (!Usage.credential) return '';
@@ -253,8 +270,7 @@ if (typeof document !== 'undefined') {
       usageMutate('/usage/collectors', { label }, (r) => { Usage.credential = r.credential || null; Usage.collectorDraft = ''; });
     } else {
       const source = form.dataset.usageImport;
-      const current = (Usage.status?.imports || []).find((r) => r.source === source);
-      const root = String(values.get('root') || Usage.roots[source] || current?.root || '').trim();
+      const root = String(values.get('root') || Usage.roots[source] || '').trim();
       if (!root) { Usage.actionError = 'Enter a history root on the server.'; usageRender(); return; }
       usageMutate('/usage/imports', { source, root, enabled: true }, () => { delete Usage.roots[source]; });
     }
@@ -274,7 +290,7 @@ if (typeof document !== 'undefined') {
     if (act.startsWith('export-')) return usageExport(act.slice(7));
     if (act === 'scan') return usageMutate('/usage/imports/scan', { source: el.dataset.source });
     if (act === 'toggle-import') {
-      const item = (Usage.status?.imports || []).find((r) => r.source === el.dataset.source);
+      const item = Usage.status?.imports?.[Number(el.dataset.index)];
       if (item) return usageMutate('/usage/imports', { source: item.source, root: item.root, enabled: !item.enabled });
     }
     if (act === 'revoke' || act === 'rotate') {

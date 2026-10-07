@@ -25,6 +25,8 @@ pub struct App {
     pub refresh_tasks: crate::oauth::RefreshTasks,
     pub http: Http,
     pub stats: Stats,
+    pub usage: Option<crate::usage::store::Store>,
+    pub usage_error: Option<String>,
     pub logins: Mutex<HashMap<String, crate::mgmt::Login>>,
     pub reset_quotes: Mutex<HashMap<String, crate::banked_resets::Quote>>,
     #[cfg(test)]
@@ -41,7 +43,30 @@ impl App {
         pool.reload(&cfg);
         let (live, _) = broadcast::channel(512);
         let sessions = Arc::new(crate::affinity::Sessions::load(&cfg.auth_dir(), cfg.session_affinity_idle_seconds));
+        // Tests opt in with an explicit isolated database; never touch a user's default DB.
+        let usage_enabled = cfg.usage.enabled && (!cfg!(test) || cfg.usage.database.is_some());
+        let (usage, usage_error) = if usage_enabled {
+            match crate::usage::store::Store::open(
+                &crate::usage::database_path(&cfg, &cfg_path),
+                cfg.usage.queue_capacity,
+                cfg.usage.retention_days,
+                cfg.usage.pricing_overrides.as_deref().map(std::path::Path::new),
+            ) {
+                Ok(store) => (Some(store), None),
+                Err(_) => {
+                    tracing::error!("usage database unavailable; proxy remains available with an analytics gap");
+                    (
+                        None,
+                        Some("Usage database unavailable; check file access, disk space and migration version".into()),
+                    )
+                }
+            }
+        } else {
+            (None, None)
+        };
         Arc::new(Self {
+            usage,
+            usage_error,
             http: Http::new(&cfg.proxy_url),
             startup_config: cfg.clone(),
             cfg: ArcSwap::from_pointee(cfg),

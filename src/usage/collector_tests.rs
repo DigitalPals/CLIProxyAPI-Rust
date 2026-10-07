@@ -64,6 +64,19 @@ async fn server(store: Store) -> (String, tokio::task::JoinHandle<()>) {
 }
 
 #[tokio::test]
+#[cfg(unix)]
+async fn rollback_journal_symlink_is_rejected_before_database_open() {
+    let d = TestDir::new();
+    let outside = d.0.join("protected-fixture");
+    fs::write(&outside, b"untouched synthetic marker").unwrap();
+    let state = d.0.join("collector");
+    secure_dir(&state).unwrap();
+    std::os::unix::fs::symlink(&outside, state.join("outbox.sqlite3-journal")).unwrap();
+    assert!(local_store(state.clone()).await.is_err());
+    assert!(!state.join("outbox.sqlite3").exists());
+    assert_eq!(fs::read(&outside).unwrap(), b"untouched synthetic marker");
+}
+#[tokio::test]
 async fn server_binds_identity_strips_claims_and_rotates() {
     let dir = TestDir::new();
     let store = dir.store();

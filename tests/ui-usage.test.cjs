@@ -29,6 +29,21 @@ test('presets use local calendar dates and inclusive today across a year boundar
   assert.deepEqual(helpers.range(1, new Date(2026, 9, 7, 23, 59)), { start: '2026-10-07', end: '2026-10-08', through: '2026-10-07' });
 });
 
+test('copied evidence, multiple roots, breakdown labels and collector progress remain clear and private', () => {
+  const d = dashboard();
+  d.seed({ loaded: true, summary: { proxy: {}, sources: [{source:'codex', source_record_count:2, observations:0}], breakdowns: {client:[{id:'collector:private-id',source:'codex',observations:1}]}, facets: {clients:[{id:'collector:private-id',label:'Private <laptop>'}]} }, status: {health:{historical_gap:{dropped:0}}, imports:[{source:'codex',root:'/private/root1',enabled:true},{source:'codex',root:'/private/root2',enabled:false}], collectors:[{id:'private-id',label:'Private <laptop>',progress:[{source:'codex',state:'attention',imported:2,failed:1}]}]} });
+  let html = d.run('usageHTML()');
+  assert.ok(html.includes('Source records') && html.includes('Selected accounting entries'));
+  assert.ok(html.includes('copied evidence selected under another origin'));
+  assert.ok(html.includes('/private/root1') && html.includes('/private/root2'));
+  assert.ok(html.includes('Private &lt;laptop&gt;') && !html.includes('Private <laptop>'));
+  assert.ok(html.includes('total historical coverage unknown'));
+  assert.ok(!html.includes('Historical analytics gaps are recorded'));
+  d.run('S.private = true'); html = d.run('usageHTML()');
+  for (const secret of ['private-id','Private &lt;laptop&gt;','/private/root1','/private/root2']) assert.ok(!html.includes(secret));
+  assert.equal(d.run('usageTime(0)'), 'Not reported');
+});
+
 test('DST calendar shifts work in Amsterdam and Los Angeles', () => {
   const script = `const h=require(${JSON.stringify(path.join(__dirname, '../ui/usage.js'))});process.stdout.write(JSON.stringify([h.range(7,new Date(2026,2,29,12)),h.shift('2026-10-25',1)]))`;
   for (const timezone of ['Europe/Amsterdam', 'America/Los_Angeles']) {

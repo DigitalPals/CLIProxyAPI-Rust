@@ -16,6 +16,8 @@ pub struct Config {
     /// Keys clients must send (Authorization: Bearer, x-api-key or x-goog-api-key).
     /// Empty means no client authentication.
     pub api_keys: Vec<String>,
+    pub named_clients: Vec<NamedClient>,
+    pub usage: crate::usage::types::UsageConfig,
     /// Protects the dashboard and management API. Empty means localhost-only access.
     /// A bcrypt hash (as CLIProxyAPI stores it) works too.
     pub management_key: String,
@@ -118,6 +120,14 @@ fn percentage<'de, D: Deserializer<'de>>(d: D) -> Result<u8, D::Error> {
     Ok(n)
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct NamedClient {
+    pub id: String,
+    pub label: String,
+    pub key: String,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 #[serde(rename_all = "kebab-case", default)]
 pub struct Tls {
@@ -209,6 +219,8 @@ impl Default for Config {
             port: 8317,
             auth_dir: DEFAULT_AUTH_DIR.into(),
             api_keys: vec![],
+            named_clients: vec![],
+            usage: Default::default(),
             management_key: String::new(),
             management_allow_remote: None,
             proxy_url: String::new(),
@@ -265,6 +277,20 @@ codex-websockets: true      # native upstream websocket for Codex websocket clie
 claude-cloak: true          # make non-Claude-Code clients look like Claude Code on OAuth accounts
 banked-resets: false        # show and spend banked Claude/ChatGPT limit resets (unofficial endpoints)
 debug: false
+
+# Persistent proxy usage; imports/collectors are opt-in. Storage changes need a restart.
+usage:
+  enabled: true
+  retention-days: 90
+  queue-capacity: 1024
+  # database: /path/to/usage.sqlite3  # default: beside config.yaml
+  # pricing-overrides: /path/to/rates.json
+
+# Optional named inference credentials; existing api-keys continue to work.
+named-clients: []
+#  - id: desktop
+#    label: Work desktop
+#    key: choose-a-distinct-random-key
 
 # API keys (optional). Accounts (Claude, Codex, Antigravity, Kimi, xAI, Meta, Devin, Vertex)
 # are added with `fusebox login <provider>` or from the dashboard.
@@ -380,6 +406,25 @@ impl Config {
         if !explicit && default_auth_dir() == LEGACY_AUTH_DIR {
             cfg.auth_dir = LEGACY_AUTH_DIR.into();
             cfg.legacy_auth_dir = true;
+        }
+        if cfg.usage.queue_capacity == 0
+            || cfg.usage.queue_capacity > 65536
+            || cfg.usage.retention_days == 0
+            || cfg.usage.retention_days > 36500
+        {
+            anyhow::bail!("invalid usage queue capacity or retention");
+        }
+        let mut ids = std::collections::HashSet::new();
+        for client in &cfg.named_clients {
+            if client.id.is_empty()
+                || client.key.is_empty()
+                || client.key.starts_with("fbxc_")
+                || !ids.insert(&client.id)
+            {
+                anyhow::bail!("named-clients require unique ids and nonempty inference keys");
+            }
+            crate::usage::types::valid_label(&client.id).map_err(anyhow::Error::msg)?;
+            crate::usage::types::valid_label(&client.label).map_err(anyhow::Error::msg)?;
         }
         Ok(cfg)
     }

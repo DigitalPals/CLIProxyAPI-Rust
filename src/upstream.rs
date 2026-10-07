@@ -58,6 +58,8 @@ const HOP: &[&str] = &[
     "keep-alive",
     "proxy-authorization",
     "proxy-connection",
+    "x-fusebox-usage-request",
+    "x-fusebox-usage-client",
     "x-forwarded-for",
     "x-forwarded-host",
     "x-forwarded-proto",

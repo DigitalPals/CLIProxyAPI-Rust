@@ -383,6 +383,7 @@ async fn with_accounts<F, Fut>(
     model: &str,
     kind: &'static str,
     session: Option<crate::affinity::SessionIdentity>,
+    client_headers: &HeaderMap,
     mut op: F,
 ) -> Outcome
 where
@@ -395,6 +396,7 @@ where
     let (only, model) = app.pool.route(model);
     let model = app.pool.canonical(&model, only.as_ref());
     let mut tracker = Tracker::new(app, Format::Chat, false, kind, &model);
+    tracker.client_app(client_headers);
     tracker.session(session_key, session.as_ref().map(|s| s.source), &cfg);
     let mut tried: Vec<String> = Vec::new();
     let mut last: Option<(u16, Value)> = None;
@@ -418,6 +420,7 @@ where
         }
         match op(acct.clone(), upstream_model).await {
             Ok(v) => {
+                tracker.observe_wire(&v);
                 acct.record_ok();
                 let usage = Usage {
                     input: v["usage"]["input_tokens"].as_u64().unwrap_or(0),
@@ -428,6 +431,10 @@ where
                 return Ok(v);
             }
             Err((status, body)) => {
+                tracker.observe_wire(&body);
+                if let Some(c) = tracker.usage_tap() {
+                    c.headers(&HeaderMap::new(), status);
+                }
                 let msg = error_message(&body.to_string());
                 if crate::proxy::quota_exhausted(&acct, &model, status, &body.to_string()) {
                     crate::proxy::mark_quota_exhausted(
@@ -467,7 +474,8 @@ pub async fn images(app: Arc<App>, headers: HeaderMap, body: Value, edit: bool) 
     let model = body["model"].as_str().filter(|m| !m.is_empty()).unwrap_or(DEFAULT_IMAGE_MODEL).to_string();
     let app2 = app.clone();
     let session = crate::affinity::session_identity(&headers, &body);
-    with_accounts(&app, &model, "images", session, move |acct, upstream_model| {
+    let client_headers = headers.clone();
+    with_accounts(&app, &model, "images", session, &client_headers, move |acct, upstream_model| {
         let (app, headers, body) = (app2.clone(), headers.clone(), body.clone());
         async move { image_once(&app, &acct, &headers, &upstream_model, &body, edit).await }
     })
@@ -516,7 +524,8 @@ pub async fn video_create(app: Arc<App>, headers: HeaderMap, body: Value, kind: 
     let app2 = app.clone();
     let kind = kind.to_string();
     let session = crate::affinity::session_identity(&headers, &body);
-    with_accounts(&app, &model, "video", session, move |acct, upstream_model| {
+    let client_headers = headers.clone();
+    with_accounts(&app, &model, "video", session, &client_headers, move |acct, upstream_model| {
         let (app, headers, body, kind) = (app2.clone(), headers.clone(), body.clone(), kind.clone());
         async move {
             if acct.provider != Provider::Xai {
@@ -578,7 +587,8 @@ pub async fn compact(app: Arc<App>, headers: HeaderMap, body: Value) -> Outcome 
     let (model, _) = crate::ir::split_model_suffix(&model);
     let app2 = app.clone();
     let session = crate::affinity::session_identity(&headers, &body);
-    with_accounts(&app, &model, "http", session, move |acct, upstream_model| {
+    let client_headers = headers.clone();
+    with_accounts(&app, &model, "compaction", session, &client_headers, move |acct, upstream_model| {
         let (app, headers, body) = (app2.clone(), headers.clone(), body.clone());
         async move {
             if !matches!(acct.provider, Provider::Codex | Provider::Xai) {

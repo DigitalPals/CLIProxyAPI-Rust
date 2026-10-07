@@ -3,7 +3,7 @@ use super::{pricing::Catalogue, types::Observation};
 use anyhow::{Context, Result, anyhow, bail};
 use chrono::{DateTime, LocalResult, NaiveDate, Offset, TimeZone, Utc};
 use chrono_tz::Tz;
-use rusqlite::{Connection, params, types::Value as SqlValue};
+use rusqlite::{Connection, OptionalExtension, params, types::Value as SqlValue};
 use serde::Deserialize;
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
@@ -11,7 +11,7 @@ use std::{
     collections::BTreeSet,
     path::{Path, PathBuf},
     sync::{
-        Arc, Mutex,
+        Arc, Mutex, RwLock,
         atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering},
     },
 };
@@ -41,7 +41,7 @@ struct Health {
     historical_errors: u64,
     prior_unclosed: u64,
     closed: AtomicBool,
-    gate: Mutex<()>,
+    gate: RwLock<()>,
 }
 #[derive(Clone)]
 pub struct Store {
@@ -149,7 +149,12 @@ impl Store {
             std::fs::create_dir_all(parent)?;
         }
         let catalogue = Catalogue::load(overrides)?;
-        Self::start(path, queue_capacity, retention_days, catalogue)
+        Self::start(path, queue_capacity, retention_days, catalogue, None)
+    }
+    /// Standalone outboxes install their allocation bound before migrations or
+    /// writer-session startup can allocate pages. They never switch through WAL.
+    pub(crate) fn open_collector(path: &Path, byte_limit: u64) -> Result<Self> {
+        Self::start(path, 128, 3650, Catalogue::load(None)?, Some(byte_limit))
     }
     /// Admin/import access preserves the configured retention horizon and catalogue.
     pub fn open_existing(path: &Path, queue_capacity: usize) -> Result<Self> {
@@ -158,9 +163,15 @@ impl Store {
             conn.query_row("SELECT value FROM usage_meta WHERE key='retention_days'", [], |r| r.get(0))?;
         let raw: String = conn.query_row("SELECT value FROM usage_meta WHERE key='catalogue'", [], |r| r.get(0))?;
         let catalogue: Catalogue = serde_json::from_str(&raw)?;
-        Self::start(path, queue_capacity, retention.parse().context("stored retention invalid")?, catalogue)
+        Self::start(path, queue_capacity, retention.parse().context("stored retention invalid")?, catalogue, None)
     }
-    fn start(path: &Path, queue_capacity: usize, retention_days: u32, catalogue: Catalogue) -> Result<Self> {
+    fn start(
+        path: &Path,
+        queue_capacity: usize,
+        retention_days: u32,
+        catalogue: Catalogue,
+        byte_limit: Option<u64>,
+    ) -> Result<Self> {
         if !(1..=65_536).contains(&queue_capacity) || !(1..=36_600).contains(&retention_days) {
             bail!("invalid stored usage settings");
         }
@@ -170,8 +181,27 @@ impl Store {
         let mut conn = Connection::open(path).context("open usage database")?;
         register_aggregates(&conn)?;
         conn.busy_timeout(std::time::Duration::from_secs(5))?;
+        conn.execute_batch("PRAGMA synchronous=FULL; PRAGMA foreign_keys=ON;")?;
+        if let Some(limit) = byte_limit {
+            let page_size: u64 = conn.query_row("PRAGMA page_size", [], |r| r.get(0))?;
+            let pages: u64 = conn.query_row("PRAGMA page_count", [], |r| r.get(0))?;
+            if limit < page_size || pages > limit / page_size {
+                bail!("collector database exceeds size limit; pending outbox preserved");
+            }
+            conn.pragma_update(None, "max_page_count", limit / page_size)?;
+            let effective: u64 = conn.query_row("PRAGMA max_page_count", [], |r| r.get(0))?;
+            if effective > limit / page_size {
+                bail!("collector database exceeds size limit; pending outbox preserved");
+            }
+            let mode: String = conn.query_row("PRAGMA journal_mode=DELETE", [], |r| r.get(0))?;
+            if mode != "delete" {
+                bail!("collector journal mode unavailable");
+            }
+        }
         migrate(&mut conn)?;
-        conn.execute_batch("PRAGMA journal_mode=WAL; PRAGMA synchronous=FULL; PRAGMA foreign_keys=ON;")?;
+        if byte_limit.is_none() {
+            conn.execute_batch("PRAGMA journal_mode=WAL;")?;
+        }
         conn.execute("INSERT INTO usage_meta(key,value) VALUES('catalogue',?1) ON CONFLICT(key) DO UPDATE SET value=excluded.value",[serde_json::to_string(&catalogue)?])?;
         conn.execute("INSERT INTO usage_meta(key,value) VALUES('retention_days',?1) ON CONFLICT(key) DO UPDATE SET value=excluded.value",[retention_days.to_string()])?;
         let cutoff = (Utc::now().timestamp_millis() - i64::from(retention_days) * 86_400_000).max(0);
@@ -287,7 +317,7 @@ impl Store {
         if self.health.closed.load(Ordering::Acquire) {
             return false;
         }
-        let Ok(_guard) = self.health.gate.try_lock() else {
+        let Ok(_guard) = self.health.gate.try_read() else {
             self.health.dropped.fetch_add(1, Ordering::Relaxed);
             return false;
         };
@@ -361,7 +391,7 @@ impl Store {
             .shutdown_result
             .get_or_init(|| async {
                 {
-                    let _gate = self.health.gate.lock().unwrap();
+                    let _gate = self.health.gate.write().unwrap();
                     self.health.closed.store(true, Ordering::Release);
                 }
                 let id = self.session_id.clone();
@@ -380,6 +410,7 @@ impl Store {
             .await;
         result.clone().map_err(|e| anyhow!(e))
     }
+    #[cfg(test)]
     pub async fn flush(&self) -> Result<()> {
         self.call(|conn| {
             conn.execute_batch("PRAGMA wal_checkpoint(PASSIVE)")?;
@@ -694,6 +725,25 @@ fn range(q: &Query) -> Result<Range> {
     }
     Ok(Range { start, end, tz })
 }
+fn dimension(column: &str, alias: &str) -> String {
+    if column == "client_id" {
+        format!("COALESCE({alias}.client_id,CASE WHEN {alias}.origin_id LIKE 'collector:%' THEN {alias}.origin_id END)")
+    } else {
+        format!("{alias}.{column}")
+    }
+}
+fn collector_label(conn: &Connection, origin: &str) -> Result<Option<String>> {
+    let Some(id) = origin.strip_prefix("collector:") else { return Ok(None) };
+    let exists: bool = conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='usage_collectors')",
+        [],
+        |r| r.get(0),
+    )?;
+    if !exists {
+        return Ok(None);
+    }
+    Ok(conn.query_row("SELECT label FROM usage_collectors WHERE id=?1", [id], |r| r.get(0)).optional()?)
+}
 fn filter(q: &Query, r: &Range, alias: &str) -> (String, Vec<SqlValue>) {
     let mut sql = format!("{alias}.event_at_ms>=? AND {alias}.event_at_ms<?");
     let mut values = vec![r.start.into(), r.end.into()];
@@ -705,7 +755,7 @@ fn filter(q: &Query, r: &Range, alias: &str) -> (String, Vec<SqlValue>) {
         ("source", &q.source),
     ] {
         if let Some(value) = value {
-            sql.push_str(&format!(" AND {alias}.{column}=?"));
+            sql.push_str(&format!(" AND {}=?", dimension(column, alias)));
             values.push(value.clone().into());
         }
     }
@@ -833,6 +883,9 @@ fn summary(conn: &mut Connection, q: &Query) -> Result<Value> {
         totals["conflicts"] = json!(source_conflicts);
         totals["source"] = json!(source);
         totals["source_record_count"] = json!(records);
+        totals["coverage_basis"] = json!(
+            "Source records include revisions, superseded counters and copies; accounting entries are globally selected evidence. A filtered origin can have records whose accounting evidence is selected under another origin."
+        );
         totals["possibly_overlapping"] = json!(source != "proxy");
         sources.push(totals);
     }
@@ -886,7 +939,8 @@ fn summary(conn: &mut Connection, q: &Query) -> Result<Value> {
     for (name, column) in
         [("provider", "provider"), ("model", "model"), ("account", "account_id"), ("client", "client_id")]
     {
-        let mut statement=conn.prepare(&format!("SELECT o.{column},o.source,{AGG} FROM usage_source_entries o INDEXED BY usage_source_entries_event_time WHERE {where_sql} GROUP BY 1,2 ORDER BY COUNT(*) DESC,1,2 LIMIT 500"))?;
+        let column = dimension(column, "o");
+        let mut statement=conn.prepare(&format!("SELECT {column},o.source,{AGG} FROM usage_source_entries o INDEXED BY usage_source_entries_event_time WHERE {where_sql} GROUP BY 1,2 ORDER BY COUNT(*) DESC,1,2 LIMIT 500"))?;
         let rows = statement.query_map(rusqlite::params_from_iter(&values), |row| {
             let mut value = aggregate_row(row, 2)?;
             value["id"] = json!(row.get::<_, Option<String>>(0)?);
@@ -897,7 +951,7 @@ fn summary(conn: &mut Connection, q: &Query) -> Result<Value> {
         for row in rows {
             out.push(row?);
         }
-        let mut raw_statement=conn.prepare(&format!("SELECT o.{column},{REQUEST_COUNTS} FROM usage_observations o INDEXED BY usage_event_time WHERE {where_sql} AND o.source='proxy' GROUP BY 1 ORDER BY COUNT(*) DESC,1 LIMIT 500"))?;
+        let mut raw_statement=conn.prepare(&format!("SELECT {column},{REQUEST_COUNTS} FROM usage_observations o INDEXED BY usage_event_time WHERE {where_sql} AND o.source='proxy' GROUP BY 1 ORDER BY COUNT(*) DESC,1 LIMIT 500"))?;
         let rows = raw_statement.query_map(rusqlite::params_from_iter(&values), |row| {
             Ok((row.get::<_, Option<String>>(0)?, request_counts_row(row, 1)?))
         })?;
@@ -923,12 +977,18 @@ fn summary(conn: &mut Connection, q: &Query) -> Result<Value> {
         ("clients", "client_id", true),
         ("sources", "source", false),
     ] {
-        let mut statement=conn.prepare(&format!("SELECT DISTINCT o.{column} FROM usage_entries o INDEXED BY usage_entries_event_time WHERE {where_sql} AND o.{column} IS NOT NULL ORDER BY o.{column} LIMIT 500"))?;
+        let column = dimension(column, "o");
+        let mut statement=conn.prepare(&format!("SELECT DISTINCT {column} FROM usage_observations o INDEXED BY usage_event_time WHERE {where_sql} AND {column} IS NOT NULL ORDER BY {column} LIMIT 500"))?;
         let rows = statement.query_map(rusqlite::params_from_iter(&values), |row| row.get::<_, String>(0))?;
         let mut out = Vec::new();
         for value in rows {
             let value = value?;
-            out.push(if labelled { json!({"id":value,"label":value}) } else { json!(value) });
+            let label = if name == "clients" {
+                collector_label(conn, &value)?.unwrap_or_else(|| value.clone())
+            } else {
+                value.clone()
+            };
+            out.push(if labelled { json!({"id":value,"label":label}) } else { json!(value) });
         }
         facets.insert(name.into(), json!(out));
     }
@@ -977,6 +1037,11 @@ fn details(conn: &mut Connection, q: &Query) -> Result<Value> {
         value["pricing_snapshot"] = serde_json::from_str(&snapshot)?;
         value["canonical_key"] = json!(key);
         value["superseded"] = json!(suppressed);
+        if let Some(origin) = value["origin_id"].as_str()
+            && let Some(label) = collector_label(conn, origin)?
+        {
+            value["collector_label"] = json!(label);
+        }
         items.push(value);
     }
     Ok(json!({"items":items,"total":total,"limit":limit,"offset":offset}))

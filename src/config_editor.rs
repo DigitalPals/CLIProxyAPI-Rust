@@ -721,6 +721,9 @@ pub fn restart_fields(startup: &Config, current: &Config) -> Vec<&'static str> {
     {
         fields.push("HTTPS");
     }
+    if serde_json::to_value(&startup.usage).ok() != serde_json::to_value(&current.usage).ok() {
+        fields.push("usage storage");
+    }
     if startup.debug != current.debug {
         fields.push("debug logging");
     }

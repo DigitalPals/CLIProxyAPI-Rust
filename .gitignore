@@ -2,3 +2,9 @@
 /config.yaml
 /config.yaml.bak
 .routing-sessions.state
+
+/usage.sqlite3
+/usage.sqlite3-wal
+/usage.sqlite3-shm
+
+__pycache__/

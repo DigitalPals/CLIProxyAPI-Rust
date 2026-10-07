@@ -10,6 +10,10 @@ pub struct Catalogue {
     pub version: String,
     pub verified_at: String,
     pub rates: Vec<Rate>,
+    #[serde(default)]
+    pub local_override: bool,
+    #[serde(default = "usd")]
+    pub currency: String,
 }
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
@@ -26,6 +30,8 @@ pub struct Rate {
     pub cache_write_5m_nanos_per_token: Option<i64>,
     pub cache_write_1h_nanos_per_token: Option<i64>,
     pub output_nanos_per_token: i64,
+    #[serde(default)]
+    pub tier_multipliers: std::collections::BTreeMap<String, [i64; 2]>,
     #[serde(default)]
     pub threshold_input_tokens: Option<u64>,
     #[serde(default)]
@@ -45,6 +51,17 @@ pub struct Snapshot {
     pub rate: Option<Rate>,
     pub assumptions: Vec<String>,
     pub partial: bool,
+    #[serde(default)]
+    pub currency: String,
+    #[serde(default)]
+    pub service_tier: String,
+    #[serde(default)]
+    pub tier_multiplier: [i64; 2],
+    #[serde(default)]
+    pub local_override: bool,
+}
+fn usd() -> String {
+    "USD".into()
 }
 impl Catalogue {
     pub fn load(overrides: Option<&Path>) -> Result<Self> {
@@ -52,7 +69,16 @@ impl Catalogue {
             Some(p) => std::fs::read_to_string(p).context("read pricing catalogue")?,
             None => include_str!("rates.json").to_owned(),
         };
-        let catalogue: Self = serde_json::from_str(&raw).context("parse pricing catalogue")?;
+        let mut catalogue: Self = serde_json::from_str(&raw).context("parse pricing catalogue")?;
+        if overrides.is_some() {
+            use sha2::{Digest, Sha256};
+            catalogue.local_override = true;
+            catalogue.version =
+                format!("local:{}:{}", catalogue.version, &hex::encode(Sha256::digest(raw.as_bytes()))[..16]);
+        }
+        if catalogue.currency != "USD" {
+            bail!("only USD pricing is supported");
+        }
         if catalogue.version.is_empty() || catalogue.version.len() > 128 {
             bail!("invalid catalogue version");
         }
@@ -84,6 +110,13 @@ impl Catalogue {
                     bail!("negative pricing rate");
                 }
             }
+            if rate
+                .tier_multipliers
+                .iter()
+                .any(|(name, [n, d])| name.is_empty() || *n <= 0 || *d <= 0 || *n > 100 || *d > 100)
+            {
+                bail!("invalid service tier multiplier");
+            }
             if rate.threshold_input_tokens.is_some() != rate.above_threshold_input_nanos_per_token.is_some()
                 || rate.threshold_input_tokens.is_some() != rate.above_threshold_output_nanos_per_token.is_some()
             {
@@ -112,9 +145,13 @@ impl Catalogue {
             basis: "unknown_model".into(),
             rate: None,
             assumptions: Vec::new(),
-            partial: false,
+            partial: o.completeness != "complete",
+            currency: "USD".into(),
+            service_tier: o.service_tier.clone().unwrap_or_else(|| "standard (assumed)".into()),
+            tier_multiplier: [1, 1],
+            local_override: self.local_override,
         };
-        let Some(model) = o.actual_model.as_ref().or(o.requested_model.as_ref()) else {
+        let Some(model) = o.actual_model.as_ref() else {
             return snapshot;
         };
         let mut rates = self.rates.iter().filter(|r| r.provider == o.provider && r.models.contains(model));
@@ -135,6 +172,11 @@ impl Catalogue {
             return snapshot;
         };
         snapshot.rate = Some(rate.clone());
+        if o.source == "codex" && o.source_event_id.starts_with("counter:") {
+            snapshot.basis = "cumulative_usage_not_per_request".into();
+            snapshot.partial = true;
+            return snapshot;
+        }
         if o.service_tier.is_none() || o.service_tier.as_deref() == Some("auto") {
             snapshot.assumptions.push("standard_api_tier_assumed".into());
         }
@@ -144,7 +186,7 @@ impl Catalogue {
         if o.actual_model.is_none() {
             snapshot.assumptions.push("requested_model_rate_assumed".into());
         }
-        snapshot.partial = !snapshot.assumptions.is_empty();
+        snapshot.partial |= !snapshot.assumptions.is_empty();
         let regional = match o.inference_geo.as_deref() {
             None | Some("global") => false,
             Some("us" | "us-only") => true,
@@ -167,10 +209,16 @@ impl Catalogue {
             snapshot.basis = "unsupported_regional_model".into();
             return snapshot;
         }
-        if o.service_tier.as_deref().is_some_and(|t| !matches!(t, "default" | "standard" | "auto")) {
+        let tier = o.service_tier.as_deref().unwrap_or("standard");
+        let [tier_n, tier_d] = if matches!(tier, "default" | "standard" | "auto") {
+            [1, 1]
+        } else if let Some(m) = rate.tier_multipliers.get(tier) {
+            *m
+        } else {
             snapshot.basis = "unsupported_service_tier".into();
             return snapshot;
-        }
+        };
+        snapshot.tier_multiplier = [tier_n, tier_d];
         if o.numeric_metadata.iter().any(|(k, v)| {
             *v > 0
                 && matches!(k.as_str(), "audio_input_tokens" | "audio_output_tokens" | "image_tokens" | "tool_tokens")
@@ -221,10 +269,9 @@ impl Catalogue {
                     sum = sum.checked_add(mul(long, rate.cache_write_1h_nanos_per_token?)?)?;
                 }
             }
-            if regional {
-                sum = sum.checked_mul(11)?.checked_add(5)?.checked_div(10)?;
-            }
-            Some(sum)
+            let numerator = tier_n.checked_mul(if regional { 11 } else { 1 })?;
+            let denominator = tier_d.checked_mul(if regional { 10 } else { 1 })?;
+            sum.checked_mul(numerator)?.checked_add(denominator / 2)?.checked_div(denominator)
         })();
         snapshot.cost_nanos = cost;
         snapshot.basis = if snapshot.cost_nanos.is_some() {
@@ -238,6 +285,9 @@ impl Catalogue {
             "unsupported_rate_or_overflow"
         }
         .into();
+        if self.local_override {
+            snapshot.basis = format!("local_override:{}", snapshot.basis);
+        }
         snapshot
     }
 }
@@ -252,5 +302,73 @@ pub fn catalogue_info() -> serde_json::Value {
             serde_json::json!({"version":c.version,"verified_at":c.verified_at,"currency":"USD","unit":"integer nanodollars","rate_count":c.rates.len(),"effective_dates":"null means current-rate equivalent from verification day; older events unpriced","basis":"API list-price equivalent, standard tier/global region assumptions explicit; never subscription bill","sources":c.rates.iter().map(|r|r.source_url.clone()).collect::<std::collections::BTreeSet<_>>()})
         }
         Err(e) => serde_json::json!({"error":e.to_string()}),
+    }
+}
+
+#[cfg(test)]
+mod tier_tests {
+    use super::*;
+    use crate::usage::types::Tokens;
+    fn event(provider: &str, model: &str) -> Observation {
+        let mut o = Observation::new("proxy", "pricing-test".into(), provider, date_ms("2026-10-07").unwrap());
+        o.actual_model = Some(model.into());
+        o.inference_geo = Some("global".into());
+        o.completeness = "complete".into();
+        o.tokens = Tokens {
+            input: Some(1000),
+            cache_read: Some(200),
+            cache_write: Some(100),
+            write_5m: Some(50),
+            write_1h: Some(50),
+            output: Some(100),
+            reasoning: Some(60),
+        };
+        o
+    }
+    #[test]
+    fn tier_context_and_region_are_exact() {
+        let c = Catalogue::load(None).unwrap();
+        let mut o = event("openai", "gpt-6.1-sol");
+        o.service_tier = Some("standard".into());
+        assert_eq!(c.price(&o).cost_nanos, Some(3_270_000));
+        o.service_tier = Some("flex".into());
+        assert_eq!(c.price(&o).cost_nanos, Some(1_635_000));
+        o.service_tier = Some("priority".into());
+        assert_eq!(c.price(&o).cost_nanos, Some(6_540_000));
+        o.tokens.input = Some(272001);
+        assert_eq!(c.price(&o).cost_nanos, Some(2_180_088_000));
+        o.inference_geo = Some("us".into());
+        assert_eq!(c.price(&o).cost_nanos, Some(2_398_096_800));
+    }
+    #[test]
+    fn anthropic_batch_and_ttl_subsets() {
+        let c = Catalogue::load(None).unwrap();
+        let mut o = event("anthropic", "claude-sonnet-5-5");
+        o.service_tier = Some("batch".into());
+        assert_eq!(c.price(&o).cost_nanos, Some(1_682_500));
+        o.service_tier = Some("priority".into());
+        assert_eq!(c.price(&o).cost_nanos, None);
+        o.actual_model = None;
+        o.requested_model = Some("claude-sonnet-5-5".into());
+        assert_eq!(c.price(&o).basis, "unknown_model");
+    }
+    #[test]
+    fn override_is_distinct_and_historical_boundary_is_exclusive() {
+        let mut c = Catalogue::load(None).unwrap();
+        let rate = c.rates.iter_mut().find(|r| r.models.contains(&"gpt-6.1-sol".into())).unwrap();
+        rate.effective_from = Some("2025-01-01".into());
+        rate.effective_until = Some("2026-10-07".into());
+        let path = std::env::temp_dir().join(format!("fusebox-rates-{}.json", uuid::Uuid::new_v4()));
+        std::fs::write(&path, serde_json::to_vec(&c).unwrap()).unwrap();
+        let c = Catalogue::load(Some(&path)).unwrap();
+        std::fs::remove_file(path).unwrap();
+        let mut o = event("openai", "gpt-6.1-sol");
+        assert_eq!(c.price(&o).basis, "outside_effective_period");
+        o.event_at_ms -= 1;
+        let p = c.price(&o);
+        assert!(p.cost_nanos.is_some());
+        assert!(p.local_override);
+        assert!(p.catalogue_version.starts_with("local:"));
+        assert!(p.basis.starts_with("local_override:"));
     }
 }

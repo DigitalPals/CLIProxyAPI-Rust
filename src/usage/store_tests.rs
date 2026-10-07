@@ -28,6 +28,63 @@ fn all() -> Query {
     }
 }
 #[tokio::test]
+async fn collector_limit_precedes_startup_and_concurrent_open_preserves_delete_mode() {
+    let p = path("collector-startup-cap");
+    let limit = 512 * 1024;
+    let store = Store::open_collector(&p, limit).unwrap();
+    let second = Store::open_collector(&p, limit).unwrap();
+    for opened in [&store, &second] {
+        opened
+            .call(move |c| {
+                assert_eq!(c.query_row("PRAGMA journal_mode", [], |r| r.get::<_, String>(0))?, "delete");
+                let page: u64 = c.query_row("PRAGMA page_size", [], |r| r.get(0))?;
+                let max: u64 = c.query_row("PRAGMA max_page_count", [], |r| r.get(0))?;
+                assert_eq!(page * max, limit);
+                Ok(())
+            })
+            .await
+            .unwrap();
+    }
+    second.shutdown().await.unwrap();
+    drop(second);
+    store
+        .call(|c| {
+            c.execute_batch("CREATE TABLE cap_fixture(data BLOB)")?;
+            loop {
+                match c.execute("INSERT INTO cap_fixture VALUES(zeroblob(4096))", []) {
+                    Ok(_) => {}
+                    Err(e) => {
+                        assert_eq!(e.sqlite_error_code(), Some(rusqlite::ErrorCode::DiskFull));
+                        break;
+                    }
+                }
+            }
+            Ok(())
+        })
+        .await
+        .unwrap();
+    let _ = store.shutdown().await;
+    drop(store);
+    let reopened = Store::open_collector(&p, limit);
+    if let Ok(store) = reopened {
+        assert_eq!(
+            store.call(|c| Ok(c.query_row("PRAGMA journal_mode", [], |r| r.get::<_, String>(0))?)).await.unwrap(),
+            "delete"
+        );
+        let _ = store.shutdown().await;
+    }
+    assert!(std::fs::metadata(&p).unwrap().len() <= limit);
+    // A lower cap must reject before any catalogue/session/migration writes.
+    // Hold a shared read lock so a dropped writer's final health persistence
+    // cannot race this byte-for-byte nonmutation check.
+    let guard = Connection::open(&p).unwrap();
+    guard.execute_batch("BEGIN; SELECT COUNT(*) FROM usage_meta;").unwrap();
+    let before = Sha256::digest(std::fs::read(&p).unwrap());
+    let error = Store::open_collector(&p, limit / 2).err().unwrap().to_string();
+    assert!(error.contains("exceeds size limit"), "{error}");
+    assert_eq!(Sha256::digest(std::fs::read(&p).unwrap()), before);
+}
+#[tokio::test]
 async fn persists_more_than_ring_after_restart() {
     let p = path("restart");
     {
@@ -553,5 +610,146 @@ async fn large_exact_integer_cost_overflow_returns_explicit_null() {
     assert_eq!(source["tokens"]["output"], 200_000_000_000_000_u64);
     assert_eq!(store.details(all()).await.unwrap()["total"], 200);
     assert_eq!(store.health()["writer_errors"], 0);
+    store.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn simultaneous_publishers_share_ingress_gate_without_artificial_drops() {
+    const PRODUCERS: usize = 32;
+    const EVENTS_PER_PRODUCER: usize = 8;
+    let store = Store::open(&path("simultaneous-publishers"), 512, 90, None).unwrap();
+    let (started_tx, started_rx) = oneshot::channel();
+    let (release_tx, release_rx) = std::sync::mpsc::channel();
+    let blocker = store.clone();
+    let blocked = tokio::spawn(async move {
+        blocker
+            .call(move |_| {
+                started_tx.send(()).unwrap();
+                release_rx.recv().unwrap();
+                Ok(())
+            })
+            .await
+            .unwrap();
+    });
+    started_rx.await.unwrap();
+    let barrier = Arc::new(std::sync::Barrier::new(PRODUCERS));
+    let producers = (0..PRODUCERS)
+        .map(|producer| {
+            let store = store.clone();
+            let barrier = barrier.clone();
+            std::thread::spawn(move || {
+                let observations = (0..EVENTS_PER_PRODUCER)
+                    .map(|n| event("proxy", &format!("producer-{producer}-{n}")))
+                    .collect::<Vec<_>>();
+                observations
+                    .into_iter()
+                    .map(|observation| {
+                        barrier.wait();
+                        usize::from(store.enqueue(observation))
+                    })
+                    .sum::<usize>()
+            })
+        })
+        .collect::<Vec<_>>();
+    let accepted = producers.into_iter().map(|thread| thread.join().unwrap()).sum::<usize>();
+    let health = store.health();
+    // Release the worker before assertions so a failure cannot strand its task.
+    release_tx.send(()).unwrap();
+    blocked.await.unwrap();
+    assert_eq!(accepted, PRODUCERS * EVENTS_PER_PRODUCER);
+    assert_eq!(health["queue_depth"], PRODUCERS * EVENTS_PER_PRODUCER);
+    assert_eq!(health["dropped"], 0);
+    store.flush().await.unwrap();
+    assert_eq!(store.details(all()).await.unwrap()["total"], PRODUCERS * EVENTS_PER_PRODUCER);
+    store.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn sqlite_full_rolls_back_records_and_exposes_proxy_loss() {
+    let store = Store::open(&path("sqlite-full"), 512, 90, None).unwrap();
+    store
+        .call(|conn| {
+            let pages: i64 = conn.pragma_query_value(None, "page_count", |row| row.get(0))?;
+            conn.pragma_update(None, "max_page_count", pages)?;
+            Ok(())
+        })
+        .await
+        .unwrap();
+    let oversized = |id: &str| {
+        let mut observation = event("proxy", id);
+        let label = "x".repeat(256);
+        observation.requested_model = Some(label.clone());
+        observation.account_id = Some(label.clone());
+        observation.auth_type = Some(label.clone());
+        observation.client_id = Some(label.clone());
+        observation.logical_request_id = Some(label.clone());
+        observation.attempt_id = Some(label.clone());
+        observation.provider_request_id = Some(label.clone());
+        observation.response_id = Some(label.clone());
+        observation.session_id = Some(label.clone());
+        observation.service_tier = Some(label.clone());
+        observation.inference_geo = Some(label);
+        observation.validate().unwrap();
+        observation
+    };
+    let records = (0..200).map(|i| oversized(&format!("atomic-{i}"))).collect::<Vec<_>>();
+    let error = store.call(move |conn| insert_batch(conn, &records)).await.unwrap_err();
+    let code = error
+        .chain()
+        .find_map(|cause| cause.downcast_ref::<rusqlite::Error>().and_then(rusqlite::Error::sqlite_error_code));
+    assert_eq!(code, Some(rusqlite::ErrorCode::DiskFull));
+    assert_eq!(store.details(all()).await.unwrap()["total"], 0);
+    assert_eq!(store.query(all()).await.unwrap()["proxy"]["observations"], 0);
+    assert!(store.enqueue(oversized("failed-proxy")));
+    // A custom call is a queue barrier even though the earlier full-disk gap makes
+    // flush return an error. All three accounting tables must remain unchanged.
+    store
+        .call(|conn| {
+            for table in ["usage_observations", "usage_entries", "usage_source_entries"] {
+                let count: i64 = conn.query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |row| row.get(0))?;
+                assert_eq!(count, 0);
+            }
+            Ok(())
+        })
+        .await
+        .unwrap();
+    assert!(store.flush().await.is_err());
+    assert_eq!(store.health()["state"], "degraded");
+    assert_eq!(store.health()["dropped"], 1);
+    assert!(store.health()["writer_errors"].as_u64().unwrap() >= 2);
+    assert!(store.health()["message"].as_str().unwrap().contains("full"));
+    store
+        .call(|conn| {
+            conn.pragma_update(None, "max_page_count", 1_000_000_i64)?;
+            Ok(())
+        })
+        .await
+        .unwrap();
+    store.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn collector_filter_retains_raw_evidence_when_local_copy_wins_accounting() {
+    let store = Store::open(&path("collector-filter-evidence"), 8, 90, None).unwrap();
+    let mut local = event("claude_code", "native-copied-message");
+    local.provider = "anthropic".into();
+    local.actual_model = Some("claude-sonnet-4-6".into());
+    local.response_id = Some("native-copied-message".into());
+    let mut collector_x = local.clone();
+    collector_x.origin_id = "collector:X".into();
+    let mut collector_y = local.clone();
+    collector_y.origin_id = "collector:Y".into();
+    store.call(move |conn| insert_batch(conn, &[collector_x, collector_y, local])).await.unwrap();
+    let complete = store.query(all()).await.unwrap();
+    let source = complete["sources"].as_array().unwrap().iter().find(|entry| entry["source"] == "claude_code").unwrap();
+    assert_eq!(source["observations"], 1);
+    assert_eq!(source["source_record_count"], 3);
+    let query = Query { client: Some("collector:X".into()), ..all() };
+    let summary = store.query(query.clone()).await.unwrap();
+    let source = summary["sources"].as_array().unwrap().iter().find(|entry| entry["source"] == "claude_code").unwrap();
+    assert_eq!(source["observations"], 0);
+    assert_eq!(source["source_record_count"], 1);
+    assert_eq!(store.details(query).await.unwrap()["total"], 1);
+    assert!(summary["facets"]["clients"].as_array().unwrap().iter().any(|client| client["id"] == "collector:X"));
     store.shutdown().await.unwrap();
 }

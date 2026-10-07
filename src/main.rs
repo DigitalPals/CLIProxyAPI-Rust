@@ -22,6 +22,7 @@ mod sse;
 mod state;
 mod token_count;
 mod upstream;
+mod usage;
 mod vertex;
 mod ws;
 
@@ -53,6 +54,16 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Cmd {
+    /// Manage metadata-only local usage imports (explicit opt-in).
+    Usage {
+        #[command(subcommand)]
+        command: usage::imports::UsageCommand,
+    },
+    /// Synchronize local usage metadata without running a proxy.
+    Collector {
+        #[command(subcommand)]
+        command: usage::collector::CollectorCommand,
+    },
     /// Run the proxy server (default).
     Serve,
     /// Sign in to an account: claude, codex, antigravity, kimi, xai, meta, devin or vertex.
@@ -77,8 +88,13 @@ enum Cmd {
 async fn main() -> Result<()> {
     // CLIProxyAPI's Go-style flags (-config, -claude-login, ...) work too.
     let cli = Cli::parse_from(compat::translate_args(std::env::args().collect()));
+    let command = match cli.cmd {
+        Some(Cmd::Usage { command }) => return usage::imports::run_command(command).await,
+        Some(Cmd::Collector { command }) => return usage::collector::run_command(command).await,
+        other => other,
+    };
     let path = config_path(cli.config, |n| std::env::var(n).ok());
-    if matches!(cli.cmd, Some(Cmd::Check)) {
+    if matches!(command, Some(Cmd::Check)) {
         return check(&path);
     }
     let cfg = Config::load(&path)?;
@@ -94,8 +110,8 @@ async fn main() -> Result<()> {
     }
     std::fs::create_dir_all(cfg.auth_dir()).ok();
 
-    let app = App::new(cfg, path);
-    match cli.cmd {
+    let app = tokio::task::spawn_blocking(move || App::new(cfg, path)).await?;
+    match command {
         Some(Cmd::Login { provider, no_browser, file, location }) => {
             login(app, &provider, no_browser, file, &location).await
         }
@@ -111,7 +127,7 @@ fn config_path(flag: Option<PathBuf>, get: impl Fn(&str) -> Option<String>) -> P
 
 async fn serve(app: Arc<App>) -> Result<()> {
     let cfg = app.cfg();
-    if !cfg.is_loopback() && cfg.api_keys.is_empty() {
+    if !cfg.is_loopback() && cfg.api_keys.is_empty() && cfg.named_clients.is_empty() {
         tracing::warn!(
             "listening on {} without api-keys: anyone who can reach this port can use your accounts",
             cfg.host
@@ -135,6 +151,7 @@ async fn serve(app: Arc<App>) -> Result<()> {
         None
     };
 
+    let import_task = app.usage.clone().map(|s| tokio::spawn(usage::imports::poller(s)));
     let background = [
         tokio::spawn(oauth::refresher(app.clone())),
         tokio::spawn(antigravity::version_updater(app.clone())),
@@ -175,6 +192,10 @@ async fn serve(app: Arc<App>) -> Result<()> {
     } else {
         axum::serve(listener, service).with_graceful_shutdown(shutdown_signal()).await
     };
+    if let Some(task) = import_task {
+        task.abort();
+        let _ = task.await;
+    }
     for task in background {
         task.abort();
         let _ = task.await;
@@ -183,6 +204,11 @@ async fn serve(app: Arc<App>) -> Result<()> {
     // request. Let those bounded operations publish and persist before exiting.
     app.refresh_tasks.shutdown().await;
     app.sessions.save_async().await;
+    if let Some(store) = &app.usage
+        && store.shutdown().await.is_err()
+    {
+        tracing::error!("usage shutdown flush failed");
+    }
     result.context("serving requests")
 }
 
