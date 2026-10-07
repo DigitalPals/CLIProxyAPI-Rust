@@ -1,0 +1,360 @@
+{
+  "schema_version": 1,
+  "measured_at_date": "2026-10-07",
+  "compiler": "rustc 1.96.1 (31fca3adb 2026-06-26)",
+  "target": "x86_64-unknown-linux-gnu",
+  "host": "Linux-6.12.107+deb13-amd64-x86_64-with-glibc2.41",
+  "cpu_count": 64,
+  "source_snapshot_lock_sha256": "30090b3947b2afab97eddb5eb623113a015780c5faf51c4b4a78b90cb6d3bc0e",
+  "baseline_is_production_binary": true,
+  "release_settings": {
+    "codegen_units": 1,
+    "strip": true,
+    "panic": "unwind"
+  },
+  "variant_settings": {
+    "baseline": "original dependencies, thin LTO, opt-level=3",
+    "size-thin3": "deduplicated dependencies, thin LTO, opt-level=3",
+    "size-fat3": "deduplicated dependencies, fat LTO, opt-level=3",
+    "size-fats": "deduplicated dependencies, fat LTO, opt-level=s",
+    "size-fatz": "deduplicated dependencies, fat LTO, opt-level=z",
+    "suffix_-relr": "same profile with final-crate -C link-arg=-Wl,-z,pack-relative-relocs; requires glibc 2.36+"
+  },
+  "methodology": {
+    "script": "scripts/usage-benchmark.py",
+    "rounds_per_variant": 3,
+    "order": "listed order in rounds 1 and 3, reverse in round 2",
+    "http_per_run": "20 warmups, 3 samples of 200 sequential loopback requests per analytics mode; median of sample means",
+    "import_per_run": "10000 synthetic Claude Code observations",
+    "summary_per_run": "median of 10 HTTP summary queries",
+    "report_aggregation": "median across 3 runs; min_max across the same 3 per-run metrics",
+    "all_24_runs_passed": true,
+    "all_runs_dropped_observations": 0
+  },
+  "metric_columns": [
+    "http_analytics_off_ms",
+    "http_analytics_on_ms",
+    "import_10000_seconds",
+    "summary_query_ms"
+  ],
+  "variants": [
+    {
+      "variant": "baseline",
+      "bytes": 17653576,
+      "sha256": "266da33eec9595c700df0afb927d29f6e7ff9c213356ee826dfb03e1a571f760",
+      "reduction_percent_vs_production": 0.0,
+      "median": [
+        0.754818,
+        0.742501,
+        1.028688,
+        119.478054
+      ],
+      "min_max": [
+        [
+          0.742175,
+          0.804753
+        ],
+        [
+          0.723423,
+          0.804172
+        ],
+        [
+          1.028042,
+          1.058405
+        ],
+        [
+          114.886973,
+          120.899565
+        ]
+      ]
+    },
+    {
+      "variant": "size-thin3",
+      "bytes": 17629512,
+      "sha256": "8ebfbeb11543473cfc9d9373d174f573d9808e509a7e3ef75054e426338fefda",
+      "reduction_percent_vs_production": 0.1363,
+      "median": [
+        0.754214,
+        0.723373,
+        1.021783,
+        120.60627
+      ],
+      "min_max": [
+        [
+          0.709671,
+          0.773214
+        ],
+        [
+          0.696519,
+          0.784405
+        ],
+        [
+          1.002038,
+          1.095275
+        ],
+        [
+          114.907453,
+          122.909217
+        ]
+      ],
+      "build_wall_seconds": 98.653,
+      "build_kind": "clean isolated full build"
+    },
+    {
+      "variant": "size-fat3",
+      "bytes": 16880648,
+      "sha256": "1a5e10d5c2093b99c2b49f232208f036b7b7b469b547d3a01b526b461e955e96",
+      "reduction_percent_vs_production": 4.3783,
+      "median": [
+        0.714358,
+        0.756585,
+        1.040329,
+        113.622934
+      ],
+      "min_max": [
+        [
+          0.672032,
+          0.775132
+        ],
+        [
+          0.729493,
+          0.79778
+        ],
+        [
+          1.039434,
+          1.060661
+        ],
+        [
+          112.064273,
+          119.234965
+        ]
+      ],
+      "build_wall_seconds": 122.652,
+      "build_kind": "clean isolated full build"
+    },
+    {
+      "variant": "size-fats",
+      "bytes": 12728392,
+      "sha256": "b9144928304aa6a9715fd6bb418ae3dddef22b14fd0c05f73aa4de97fce13d86",
+      "reduction_percent_vs_production": 27.8991,
+      "median": [
+        0.725164,
+        0.770589,
+        1.111703,
+        125.880214
+      ],
+      "min_max": [
+        [
+          0.694851,
+          0.824502
+        ],
+        [
+          0.722672,
+          0.826627
+        ],
+        [
+          1.100189,
+          1.156944
+        ],
+        [
+          125.352141,
+          126.552705
+        ]
+      ],
+      "build_wall_seconds": 90.775,
+      "build_kind": "clean isolated full build"
+    },
+    {
+      "variant": "size-fatz",
+      "bytes": 11885960,
+      "sha256": "5b8c90f2c4702d6ad6b7904a788dc63baf224a18633060891dfc112af65cad11",
+      "reduction_percent_vs_production": 32.6711,
+      "median": [
+        0.821115,
+        0.83683,
+        1.171184,
+        123.663596
+      ],
+      "min_max": [
+        [
+          0.693688,
+          0.924533
+        ],
+        [
+          0.771096,
+          0.901168
+        ],
+        [
+          1.133135,
+          1.185235
+        ],
+        [
+          121.771927,
+          131.977098
+        ]
+      ],
+      "build_wall_seconds": 77.52,
+      "build_kind": "clean isolated full build"
+    },
+    {
+      "variant": "size-fat3-relr",
+      "bytes": 15828080,
+      "sha256": "afa3ef1261b0fc7d73024e5fb683da657d49e8182f1a1c0823b25fbb589288b2",
+      "reduction_percent_vs_production": 10.3407,
+      "median": [
+        0.722029,
+        0.712184,
+        1.033334,
+        114.900852
+      ],
+      "min_max": [
+        [
+          0.58335,
+          0.739726
+        ],
+        [
+          0.689056,
+          0.769105
+        ],
+        [
+          1.014923,
+          1.045528
+        ],
+        [
+          113.753526,
+          116.833354
+        ]
+      ],
+      "build_wall_seconds": 88.866,
+      "build_kind": "cached dependency final-crate relink"
+    },
+    {
+      "variant": "size-fats-relr",
+      "bytes": 11671728,
+      "sha256": "43ae6d65ac1783d1c2ff18fc54ea0374721fbe11f43b4d0e90fb1d8166a9bec4",
+      "reduction_percent_vs_production": 33.8846,
+      "median": [
+        0.73721,
+        0.76594,
+        1.136839,
+        125.165482
+      ],
+      "min_max": [
+        [
+          0.616684,
+          0.769153
+        ],
+        [
+          0.746015,
+          0.866867
+        ],
+        [
+          1.099032,
+          1.156478
+        ],
+        [
+          123.427536,
+          129.774867
+        ]
+      ],
+      "build_wall_seconds": 71.343,
+      "build_kind": "cached dependency final-crate relink"
+    },
+    {
+      "variant": "size-fatz-relr",
+      "bytes": 10812912,
+      "sha256": "9d1c65770e8d2bd905d963074292ba310445c40b46be5356fae528a13890c40b",
+      "reduction_percent_vs_production": 38.7495,
+      "median": [
+        0.779036,
+        0.80083,
+        1.189727,
+        123.088462
+      ],
+      "min_max": [
+        [
+          0.749629,
+          0.914401
+        ],
+        [
+          0.740567,
+          0.866622
+        ],
+        [
+          1.134755,
+          1.201523
+        ],
+        [
+          122.487119,
+          126.246715
+        ]
+      ],
+      "build_wall_seconds": 60.332,
+      "build_kind": "cached dependency final-crate relink"
+    }
+  ],
+  "limits": [
+    "Shared development host, no CPU pinning or isolation; unrelated workloads and run-order drift add noise.",
+    "Loopback synthetic provider, sequential small requests, no external API calls; not a production throughput/concurrency or streaming benchmark.",
+    "Import and query timings include local HTTP, SQLite and filesystem overhead.",
+    "Build wall times include contention from at most 2 simultaneous builds; native host compiler is 1.96.1.",
+    "Measurements use an isolated source snapshot with equivalent temporary profiles; final tracked builds and Docker with another compiler can differ. RELR is enabled by packaging commands, not a build script."
+  ],
+  "recommendation": "Keep full LTO opt-level=3 for standard release; enable RELR for supported modern GNU/Linux. Provide opt-level=z as explicit compact tradeoff; packed z saved 38.75% with observed +7.86% analytics-on latency and +15.65% import time versus baseline in this limited test.",
+  "final_validation": {
+    "native_artifacts": [
+      {
+        "profile": "release",
+        "bytes": 15828080,
+        "sha256": "afa3ef1261b0fc7d73024e5fb683da657d49e8182f1a1c0823b25fbb589288b2",
+        "version": "fusebox 0.3.2",
+        "relr_tags": [
+          "RELR",
+          "RELRSZ",
+          "RELRENT"
+        ],
+        "glibc_relr_abi_marker": true,
+        "required_glibc_max": "GLIBC_2.39",
+        "e2e_checks_passed": 9
+      },
+      {
+        "profile": "compact",
+        "bytes": 10812912,
+        "sha256": "9d1c65770e8d2bd905d963074292ba310445c40b46be5356fae528a13890c40b",
+        "version": "fusebox 0.3.2",
+        "relr_tags": [
+          "RELR",
+          "RELRSZ",
+          "RELRENT"
+        ],
+        "glibc_relr_abi_marker": true,
+        "required_glibc_max": "GLIBC_2.39",
+        "e2e_checks_passed": 9
+      }
+    ],
+    "docker": {
+      "image": "fusebox:size-optimized",
+      "build_compiler": "rustc 1.99.0 (b940084d7 2026-09-28)",
+      "build_os": "Debian 12",
+      "runtime": "distroless/cc-debian12",
+      "version": "fusebox 0.3.2",
+      "binary_bytes": 15568952,
+      "binary_sha256": "ad2ba585f2b5bcc82e861a862c40186080d65f9ae851e621a0006e560955ab33",
+      "glibc_highest_numeric_requirement": "2.34",
+      "relr": true,
+      "glibc_relr_marker": true,
+      "healthz": "ok",
+      "endpoints": {
+        "/": 200,
+        "/v1/models": 200
+      }
+    },
+    "rust_tests_passed": 282,
+    "dashboard_tests_passed": 21,
+    "operational_tests_passed": 30,
+    "clippy_all_targets_warnings_denied": "passed",
+    "format": "passed",
+    "dev_service_rebuilt_restarted_healthy": true,
+    "production_redeployed": false
+  }
+}

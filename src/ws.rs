@@ -873,17 +873,17 @@ mod tests {
     fn upstream_failure_diagnostics_exclude_frames_credentials_bodies_and_urls() {
         let secret = "private-prompt-token-account";
         let errors = [
-            tungstenite::Error::WriteBufferFull(tungstenite::Message::Text(secret.into())),
+            tungstenite::Error::WriteBufferFull(Box::new(tungstenite::Message::Text(secret.into()))),
             tungstenite::Error::Utf8(secret.into()),
             tungstenite::Error::Url(tungstenite::error::UrlError::UnableToConnect(secret.into())),
             tungstenite::Error::Io(std::io::Error::other(secret)),
-            tungstenite::Error::Http(
+            tungstenite::Error::Http(Box::new(
                 tungstenite::http::Response::builder()
                     .status(403)
                     .header("authorization", secret)
                     .body(Some(secret.as_bytes().to_vec()))
                     .unwrap(),
-            ),
+            )),
         ];
         for error in errors {
             let failure = UpstreamFailure::socket("send", &error);

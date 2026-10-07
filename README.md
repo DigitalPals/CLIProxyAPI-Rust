@@ -415,6 +415,9 @@ cargo run -- --config dev.yaml
 
 The dashboard lives in `ui/` and is embedded with `include_str!`, so rebuild after editing it.
 
+See [release binary size](docs/binary-size.md) for compiler comparisons, measured
+savings, and Linux packed-relocation compatibility.
+
 ## License
 
 [Unlicense](LICENSE): public domain. Copy it, change it, sell it, ship it, no attribution required.

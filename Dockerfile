@@ -6,7 +6,14 @@ WORKDIR /src
 COPY Cargo.toml Cargo.lock ./
 COPY src src
 COPY ui ui
-RUN cargo build --release --locked
+# GNU ld supports packed relative relocations on x86-64. Debian 12's glibc
+# supports RELR; keep other architectures on their usual linker settings.
+RUN case "$(uname -m)" in \
+      x86_64) cargo rustc --release --locked --bin fusebox -- \
+        -C link-arg=-Wl,-z,pack-relative-relocs ;; \
+      *) cargo build --release --locked ;; \
+    esac \
+ && target/release/fusebox --version
 # CLIProxyAPI's image runs ./CLIProxyAPI from /CLIProxyAPI and keeps sign-ins in
 # /root/.cli-proxy-api; keep both paths working.
 RUN mkdir -p /out/CLIProxyAPI /out/root/.cli-proxy-api \
