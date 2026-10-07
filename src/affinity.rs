@@ -263,12 +263,16 @@ struct Registry {
 
 impl Registry {
     fn account_load(&self, cfg: &Config) -> HashMap<String, usize> {
-        let mut load = HashMap::new();
         if !weighs_session_load(cfg) {
-            return load;
+            return HashMap::new();
         }
-        let cutoff = Utc::now().timestamp()
-            - LOAD_IDLE_SECONDS.min(cfg.session_affinity_idle_seconds.min(i64::MAX as u64) as i64);
+        self.recent_sessions(cfg.session_affinity_idle_seconds)
+    }
+
+    /// Sessions per account seen in the last few minutes or with a call in flight.
+    fn recent_sessions(&self, idle: u64) -> HashMap<String, usize> {
+        let mut load = HashMap::new();
+        let cutoff = Utc::now().timestamp() - LOAD_IDLE_SECONDS.min(idle.min(i64::MAX as u64) as i64);
         let mut seen = HashSet::new();
         for (key, b) in &self.bindings {
             let session = if b.session.is_empty() { key.as_str() } else { b.session.as_str() };
@@ -548,6 +552,12 @@ impl Sessions {
     /// Sessions per account that smart balancing counts right now (empty for other strategies).
     pub fn account_load(&self, cfg: &Config) -> HashMap<String, usize> {
         self.registry.lock().account_load(cfg)
+    }
+
+    /// Sessions per account seen in the last few minutes or with a call in flight,
+    /// whatever the routing strategy. The dashboard shows these as live sessions.
+    pub fn recent_sessions(&self, idle: u64) -> HashMap<String, usize> {
+        self.registry.lock().recent_sessions(idle)
     }
 
     /// Sessions currently assigned to `account`: their owner digest (see [`owner_of`]),
@@ -947,6 +957,25 @@ mod tests {
         assert_eq!(sessions.registry.lock().account_load(&cfg)[&a.id], 1); // recent after completion
         sessions.end("task");
         assert!(sessions.registry.lock().account_load(&cfg).is_empty());
+    }
+
+    #[test]
+    fn recent_sessions_count_for_every_strategy_until_idle() {
+        let cfg = config(Routing::RoundRobin);
+        let pool = Pool::default();
+        pool.reload(&cfg);
+        let sessions = Arc::new(Sessions::memory());
+        let a = sessions.pick(&pool, &cfg, "gpt-6.1-sol", Some("task"), &[], None).unwrap().0;
+        let idle = cfg.session_affinity_idle_seconds;
+        assert!(sessions.account_load(&cfg).is_empty()); // routing does not weigh it
+        assert_eq!(sessions.recent_sessions(idle)[&a.id], 1);
+        sessions.registry.lock().bindings.values_mut().for_each(|b| b.last_seen -= LOAD_IDLE_SECONDS + 1);
+        assert!(sessions.recent_sessions(idle).is_empty());
+        let lease = sessions.hold("task", idle);
+        assert_eq!(sessions.recent_sessions(idle)[&a.id], 1); // long-running stream
+        drop(lease);
+        sessions.end("task");
+        assert!(sessions.recent_sessions(idle).is_empty());
     }
 
     #[test]

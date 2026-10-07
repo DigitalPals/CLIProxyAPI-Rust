@@ -890,12 +890,39 @@ async fn login_code(State(app): State<Arc<App>>, Path(target): Path<String>, Jso
     }
 }
 
+/// What each busy account is doing right now: requests in flight (including
+/// streams that have not finished) and coding sessions seen in the last few minutes.
+fn account_load(app: &App) -> Value {
+    let sessions = app.sessions.recent_sessions(app.cfg().session_affinity_idle_seconds);
+    let mut load = serde_json::Map::new();
+    for a in app.pool.all() {
+        let in_flight = a.state.lock().active_requests.load(Ordering::Relaxed);
+        let sessions = sessions.get(&a.id).copied().unwrap_or(0);
+        if in_flight > 0 || sessions > 0 {
+            load.insert(a.id.clone(), json!({ "in_flight": in_flight, "sessions": sessions }));
+        }
+    }
+    Value::Object(load)
+}
+
 async fn live(State(app): State<Arc<App>>, ws: WebSocketUpgrade) -> Response {
     ws.on_upgrade(move |mut socket| async move {
         let mut rx = app.live.subscribe();
         let mut tick = tokio::time::interval(Duration::from_secs(5));
+        // Account load is checked every second but only sent when it changes.
+        let mut load_tick = tokio::time::interval(Duration::from_secs(1));
+        load_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        let mut sent_load = String::new();
         loop {
             tokio::select! {
+                _ = load_tick.tick() => {
+                    let load = account_load(&app).to_string();
+                    if load != sent_load {
+                        let msg = format!(r#"{{"type":"load","data":{load}}}"#);
+                        if socket.send(Message::Text(msg.into())).await.is_err() { break }
+                        sent_load = load;
+                    }
+                }
                 msg = rx.recv() => match msg {
                     Ok(m) => if socket.send(Message::Text(m.into())).await.is_err() { break },
                     Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,

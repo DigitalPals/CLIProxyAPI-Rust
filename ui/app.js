@@ -43,6 +43,7 @@ const S = {
   models: [],
   routes: null,
   activity: {}, // account id -> { series, sessions, at }
+  load: null, // account id -> { in_flight, sessions } for busy accounts; null while disconnected
   live: 'connecting',
   paused: false,
   pending: 0, // requests that arrived while paused
@@ -304,6 +305,7 @@ function connectLive() {
   ws = new WebSocket(`${proto}://${location.host}/api/live${q}`);
   ws.onopen = () => { wsDelay = 1000; setLive('live'); };
   ws.onclose = () => {
+    onLoad(null);
     setLive('offline');
     if (!S.locked) setTimeout(connectLive, wsDelay);
     wsDelay = Math.min(wsDelay * 2, 15000);
@@ -320,6 +322,7 @@ function setLive(state) {
 
 function onLive(msg) {
   if (msg.type === 'request') return onRequest(msg.data);
+  if (msg.type === 'load') return onLoad(msg.data);
   if (msg.type === 'accounts') return refreshAccounts();
   if (msg.type === 'login') return pollLogin();
   if (msg.type === 'tick' && S.overview) {
@@ -327,6 +330,28 @@ function onLive(msg) {
     S.overview.active = msg.data.active;
     if (S.route === 'overview') patch('figures', figuresHTML);
   }
+}
+
+// Puts the lamps and activity cells of accounts whose load changed right, without
+// re-rendering whole sections (that would restart every pulse).
+function onLoad(load) {
+  const prev = S.load || {};
+  S.load = load;
+  const next = load || {};
+  for (const id of new Set([...Object.keys(prev), ...Object.keys(next)])) {
+    const a = accountById(id);
+    if (!a) continue;
+    const was = prev[id] || {};
+    const now = next[id] || {};
+    const sel = CSS.escape(id);
+    if (was.in_flight !== now.in_flight) {
+      for (const el of $$(`[data-status="${sel}"]`)) el.outerHTML = statusHTML(a, el.dataset.size || '');
+    }
+    if (was.in_flight !== now.in_flight || was.sessions !== now.sessions) {
+      for (const el of $$(`[data-now="${sel}"]`)) el.innerHTML = nowHTML(a, 'inline' in el.dataset);
+    }
+  }
+  for (const el of $$('[data-subs-meta]')) el.textContent = subsMeta(el.dataset.subsMeta === 'short');
 }
 
 function onRequest(log) {
@@ -588,11 +613,32 @@ function acctState(a) {
   return { cls: 'ready', dot: 'ok', word: 'Ready' };
 }
 
+// Requests in flight on an account right now (0 while the live connection is down).
+const inFlight = (a) => (S.load && S.load[a.id] ? S.load[a.id].in_flight : 0);
+const liveSessions = (a) => (S.load && S.load[a.id] ? S.load[a.id].sessions : 0);
+
+// A ready account carrying requests lights its lamp and reads Serving.
 function statusHTML(a, size = '') {
   const st = acctState(a);
-  return `<span class="status ${st.cls}"><span class="dot ${st.dot}${size ? ` s${size}` : ''}"></span><span>${st.html || st.word}</span></span>`;
+  const n = st.cls === 'ready' ? inFlight(a) : 0;
+  const attrs = `data-status="${esc(a.id)}"${size ? ` data-size="${size}"` : ''}`;
+  const dot = (cls) => `<span class="dot ${cls}${size ? ` s${size}` : ''}"></span>`;
+  if (n) return `<span class="status serving" ${attrs} title="${plural(n, 'request')} in flight">${dot('ok lamp')}<span>Serving ${fmt(n)}</span></span>`;
+  return `<span class="status ${st.cls}" ${attrs}>${dot(st.dot)}<span>${st.html || st.word}</span></span>`;
 }
-const statusWord = (a) => { const st = acctState(a); return st.cls === 'cooling' ? `Cooling ${left(st.until)}` : st.word; };
+const statusWord = (a) => {
+  const st = acctState(a);
+  if (st.cls === 'cooling') return `Cooling ${left(st.until)}`;
+  return st.cls === 'ready' && inFlight(a) ? `Serving ${fmt(inFlight(a))}` : st.word;
+};
+
+// When an account was last busy, and how many coding sessions are on it.
+function nowHTML(a, inline = false) {
+  const n = liveSessions(a);
+  const last = inFlight(a) ? `<span class="now">${inline ? 'in use now' : 'Now'}</span>` : liveAgo(a.last_used);
+  const sessions = n ? `<span class="subs-line" title="Coding sessions active in the last 5 minutes">${plural(n, 'session')}</span>` : '';
+  return inline ? `${last}${n ? ` · ${plural(n, 'session')}` : ''}` : `${last}${sessions}`;
+}
 const modelScope = (m) => (m === '*' ? 'All models' : m);
 
 // Quota colours always describe how much is used, whichever percentage is displayed.
@@ -810,6 +856,14 @@ function routingSentence(short = false) {
   return text ? `${o.session_affinity === false ? 'requests' : 'new sessions'} ${text}` : '';
 }
 
+// "2 serving · 5 of 6 ready · smart routing…"; serving is left out while disconnected.
+function subsMeta(short = false) {
+  const subs = (S.accounts || []).filter(metered);
+  const ready = subs.filter((a) => acctState(a).cls === 'ready');
+  const serving = S.load ? `${fmt(ready.filter((a) => inFlight(a)).length)} serving · ` : '';
+  return `${serving}${fmt(ready.length)} of ${fmt(subs.length)} ready · ${routingSentence(short)}`;
+}
+
 function ovSubsHTML() {
   const list = S.accounts || [];
   if (!list.length) {
@@ -825,17 +879,16 @@ function ovSubsHTML() {
   }
   const subs = list.filter(metered);
   if (!subs.length) return '';
-  const live = subs.filter((a) => acctState(a).cls === 'ready').length;
   if (mob()) {
     const items = subs.map((a) => {
       const st = acctState(a);
       return `<div class="item click" data-open="${esc(a.id)}">
         <div class="item-top">${acctLogo(a, 18)}<div class="cell2"><button class="name-btn" type="button" data-act="open-acc" data-id="${esc(a.id)}">${esc(acctLabel(a))}</button><span>${esc(provName(a))} · ${esc(planName(a) || authName(a))}</span></div>${statusHTML(a, 7)}</div>
         <div class="meters indent">${meterRowHTML(a, true)}${meterRowHTML(a, false)}</div>
-        <div class="metaline indent">${st.cls === 'cooling' ? `<span class="fg2">${esc(modelScope(st.model))} · back ${esc(when(st.until))}</span>` : ''}${bankedLineHTML(a)}<span>${fmt(a.counters.requests)} requests · ${liveAgo(a.last_used)}</span></div>
+        <div class="metaline indent">${st.cls === 'cooling' ? `<span class="fg2">${esc(modelScope(st.model))} · back ${esc(when(st.until))}</span>` : ''}${bankedLineHTML(a)}<span>${fmt(a.counters.requests)} requests · <span data-now="${esc(a.id)}" data-inline>${nowHTML(a, true)}</span></span></div>
       </div>`;
     }).join('');
-    return `<div class="sec-head"><div class="stack"><h2 class="h-sec">Subscriptions</h2><span class="meta">${live} of ${subs.length} live · ${esc(routingSentence(true))}</span></div>${quotaControlsHTML(true, false, false)}</div>
+    return `<div class="sec-head"><div class="stack"><h2 class="h-sec">Subscriptions</h2><span class="meta" data-subs-meta="short">${esc(subsMeta(true))}</span></div>${quotaControlsHTML(true, false, false)}</div>
       <div class="card stack-list">${items}</div>`;
   }
   const rows = subs.map((a, i) => {
@@ -846,12 +899,12 @@ function ovSubsHTML() {
       ${metersHTML(a)}
       <div class="c-status">${statusHTML(a)}${st.cls === 'cooling' ? `<span class="subs-line">${esc(modelScope(st.model))} · back ${esc(when(st.until))}</span>` : ''}${bankedLineHTML(a)}</div>
       <span class="c-req r">${fmt(a.counters.requests)}</span>
-      <span class="c-last">${liveAgo(a.last_used)}</span>
+      <div class="c-last c-now" data-now="${esc(a.id)}">${nowHTML(a)}</div>
     </div>`;
   }).join('');
-  return `<div class="sec-head"><h2 class="h-sec">Subscriptions</h2><span class="meta">${live} of ${subs.length} live · ${esc(routingSentence())}</span><span class="grow"></span>${quotaControlsHTML()}</div>
+  return `<div class="sec-head"><h2 class="h-sec">Subscriptions</h2><span class="meta" data-subs-meta>${esc(subsMeta())}</span><span class="grow"></span>${quotaControlsHTML()}</div>
     <div class="card rivets table subs" role="table" aria-label="Subscriptions">
-      <div class="th" role="row"><span class="c-idx">#</span><span>Account</span><span>Limits · ${quotaWord()}</span><span>Status</span><span class="c-req r">Requests</span><span class="r">Last used</span></div>
+      <div class="th" role="row"><span class="c-idx">#</span><span>Account</span><span>Limits · ${quotaWord()}</span><span>Status</span><span class="c-req r">Requests</span><span class="r">Activity</span></div>
       ${rows}</div>`;
 }
 
