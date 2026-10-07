@@ -338,6 +338,9 @@ async fn turn(
     mut body: Value,
     tx: &mut ClientTx,
 ) -> Result<(), ClientGone> {
+    let mut request_headers = headers.clone();
+    request_headers.insert(crate::usage::capture::REQUEST_HEADER, uuid::Uuid::new_v4().to_string().parse().unwrap());
+    let headers = &request_headers;
     sess.pending_selection = None;
     // Full conversation for local history (and for providers without server state).
     let prev = body["previous_response_id"].as_str().map(String::from);
@@ -629,6 +632,7 @@ async fn native_turn(
             }
         };
         let v: Value = serde_json::from_str(&text).unwrap_or(Value::Null);
+        tracker.observe_wire(&v);
         let kind = v["type"].as_str().unwrap_or_default().to_string();
         crate::quota::observe_codex_event(&acct, &v, quota_epoch);
         parser.feed(&SseEvent { event: None, data: text.clone() }, &mut evs);
@@ -651,7 +655,7 @@ async fn native_turn(
                 if !forwarded {
                     sess.discard_upstream();
                     close_upstream(&mut up, &sess.connection_id, "quota_rejected").await;
-                    tracker.finish(status, &usage, Some(msg));
+                    tracker.finish_fallback(status, &usage, Some(msg));
                     return Native::Fallback;
                 }
             } else if !forwarded && matches!(status, 401 | 403) {

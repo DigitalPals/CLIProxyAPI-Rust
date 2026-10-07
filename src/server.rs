@@ -40,6 +40,7 @@ pub fn router(app: Arc<App>) -> Router {
 
     Router::new()
         .merge(api)
+        .route("/api/usage-ingest", post(crate::usage::api::ingest).layer(DefaultBodyLimit::max(512 << 10)))
         .nest("/api", crate::mgmt::router(app.clone()))
         .route("/", get(ui_index))
         .route("/ui/{file}", get(ui_asset))
@@ -64,12 +65,25 @@ async fn client_auth(State(app): State<Arc<App>>, mut req: Request, next: Next) 
                 url::form_urlencoded::parse(q.as_bytes()).find(|(k, _)| k == "key").map(|(_, v)| v.into_owned())
             })
         });
-    if cfg.api_keys.is_empty()
-        || provided.as_ref().is_some_and(|k| cfg.api_keys.iter().any(|a| crate::mgmt::constant_eq(a, k)))
+    // Collector credentials are ingestion-only even on an otherwise open proxy.
+    let collector_key = provided.as_deref().is_some_and(|k| k.starts_with("fbxc_"));
+    let named = provided.as_ref().and_then(|k| cfg.named_clients.iter().find(|c| crate::mgmt::constant_eq(&c.key, k)));
+    if !collector_key
+        && ((cfg.api_keys.is_empty() && cfg.named_clients.is_empty())
+            || named.is_some()
+            || provided.as_ref().is_some_and(|k| cfg.api_keys.iter().any(|a| crate::mgmt::constant_eq(a, k))))
     {
         // Never trust an incoming internal scope header. Query-string credentials
         // and header credentials get the same namespace without forwarding keys.
         let scope = crate::affinity::scope_for_key(provided.as_deref());
+        req.headers_mut().remove(crate::usage::capture::REQUEST_HEADER);
+        req.headers_mut().remove(crate::usage::capture::CLIENT_HEADER);
+        let identity = named
+            .map(|c| c.id.clone())
+            .or_else(|| provided.as_ref().filter(|_| !cfg.api_keys.is_empty()).map(|_| scope.clone()));
+        if let Some(identity) = identity.and_then(|v| HeaderValue::from_str(&v).ok()) {
+            req.headers_mut().insert(crate::usage::capture::CLIENT_HEADER, identity);
+        }
         req.headers_mut().remove(crate::affinity::LEGACY_SCOPE_HEADER);
         req.headers_mut().insert(crate::affinity::SCOPE_HEADER, HeaderValue::from_str(&scope).unwrap());
         return next.run(req).await;
@@ -465,6 +479,7 @@ async fn ui_index() -> Response {
 async fn ui_asset(Path(file): Path<String>) -> Response {
     let (body, ctype) = match file.as_str() {
         "app.js" => (APP_JS, "text/javascript; charset=utf-8"),
+        "usage.js" => (include_str!("../ui/usage.js"), "text/javascript; charset=utf-8"),
         "config.js" => (include_str!("../ui/config.js"), "text/javascript; charset=utf-8"),
         "style.css" => (STYLE, "text/css; charset=utf-8"),
         "icon.svg" => (ICON, "image/svg+xml"),

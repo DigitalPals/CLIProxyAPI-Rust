@@ -11,10 +11,10 @@ Point Claude Code, Codex, your editor or any SDK at one URL and stop caring whic
 [![CI](https://img.shields.io/github/actions/workflow/status/DigitalPals/Fusebox/ci.yml?branch=main&style=flat-square&labelColor=0b0b0a&label=ci)](https://github.com/DigitalPals/Fusebox/actions/workflows/ci.yml)
 [![License: Unlicense](https://img.shields.io/badge/license-Unlicense-f2efe8?style=flat-square&labelColor=0b0b0a)](LICENSE)
 [![Rust](https://img.shields.io/badge/rust-1.88%2B-f2efe8?style=flat-square&labelColor=0b0b0a&logo=rust&logoColor=white)](https://www.rust-lang.org)
-[![Binary](https://img.shields.io/badge/single%20binary-~8%20MB-f2efe8?style=flat-square&labelColor=0b0b0a)](https://github.com/DigitalPals/Fusebox/releases/latest)
+[![Binary](https://img.shields.io/badge/single%20binary-embedded%20dashboard-f2efe8?style=flat-square&labelColor=0b0b0a)](https://github.com/DigitalPals/Fusebox/releases/latest)
 [![Dashboard](https://img.shields.io/badge/dashboard-built%20in-f2efe8?style=flat-square&labelColor=0b0b0a)](#the-dashboard)
 
-[Quick start](#quick-start) · [Coming from CLIProxyAPI](#coming-from-cliproxyapi) · [Connect your tools](#connect-your-tools) · [Dashboard](#the-dashboard) · [Configuration](#configuration) · [FAQ](#faq)
+[Quick start](#quick-start) · [Coming from CLIProxyAPI](#coming-from-cliproxyapi) · [Connect your tools](#connect-your-tools) · [Dashboard](#the-dashboard) · [Usage and costs](#usage-and-costs) · [Configuration](#configuration) · [FAQ](#faq)
 
 </div>
 
@@ -26,7 +26,7 @@ Point Claude Code, Codex, your editor or any SDK at one URL and stop caring whic
 
 ## Why Fusebox
 
-- **One small binary.** About 8 MB with the dashboard inside, around 13 MB of memory in our tests. No Docker, no Node, no runtime to install.
+- **One small binary.** The dashboard and SQLite storage ship inside one executable. No Docker, no Node, no runtime to install.
 - **Any model from any tool.** Use GPT inside Claude Code, Claude inside Codex, or Gemini behind the OpenAI SDK. Requests are translated between formats automatically. When the client and the provider already speak the same format, the request passes through untouched.
 - **Ten providers.** Subscription sign-in for Claude, ChatGPT (Codex), Antigravity, Grok, Kimi, Meta and Devin; service accounts for Vertex AI; API keys for Anthropic, OpenAI, Gemini, Vertex, Kimi, xAI, Meta and anything OpenAI-compatible.
 - **Images and video too.** `/v1/images/generations` and `/v1/images/edits` work with ChatGPT accounts, OpenAI and xAI keys, Vertex Imagen and Gemini image models. xAI video generation is behind `/v1/videos`.
@@ -242,6 +242,10 @@ Choose **Used** or **Remaining** beside the quota meters (or press <kbd>U</kbd>)
 **Banked resets** (off by default). Claude and ChatGPT sometimes give subscribers saved resets that clear a usage limit early. Turn on `banked-resets` (Config, Connections) and subscriptions that have some show “↻ 2 resets banked” under their status; click it to see expiry dates and spend one, always with a confirmation. It relies on unofficial provider endpoints, checks every 30 minutes, and keeps a crash-safe journal so a reset is never spent twice. See [banked resets](docs/banked-resets.md).
 
 <sub>Screenshots use sample data.</sub>
+
+## Usage and costs
+
+The Usage page records proxy-reported tokens and can import metadata from opted-in Claude Code and Codex histories, including from a standalone collector on another machine. Source totals stay separate when histories may overlap. USD figures are local API list-price estimates; subscription quota meters remain separate and are never presented as API bills. See [Usage and costs](docs/usage-costs.md) for configuration, source coverage, privacy, import and collector setup, reconciliation limits, and SQLite backup and recovery.
 
 ## Configuration
 

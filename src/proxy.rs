@@ -58,6 +58,7 @@ pub struct Tracker {
     stream_finished: bool,
     load: Option<crate::accounts::RequestLoad>,
     done: bool,
+    analytics: Option<crate::usage::capture::RequestUsage>,
 }
 
 impl Tracker {
@@ -65,6 +66,7 @@ impl Tracker {
         app.stats.active.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         Self {
             app: app.clone(),
+            analytics: app.usage.clone().map(|store| crate::usage::capture::RequestUsage::new(store, model)),
             started: Instant::now(),
             acct: None,
             stream_usage: Usage::default(),
@@ -102,6 +104,9 @@ impl Tracker {
     }
 
     pub fn attempt(&mut self, acct: &Arc<Account>) {
+        if let Some(a) = &mut self.analytics {
+            a.attempt(acct);
+        }
         self.load = Some(crate::accounts::RequestLoad::new(acct));
         self.log.attempts += 1;
         self.log.provider = acct.provider.as_str().to_string();
@@ -113,10 +118,16 @@ impl Tracker {
     /// Names the client program from its User-Agent, for the dashboard.
     pub fn client_app(&mut self, headers: &HeaderMap) {
         self.log.client_app = client_app(headers);
+        if let Some(a) = &mut self.analytics {
+            a.client(headers);
+        }
     }
 
     pub fn session(&mut self, key: Option<&str>, source: Option<&'static str>, cfg: &crate::config::Config) {
         self.log.session_id = key.map(String::from);
+        if let Some(a) = &mut self.analytics {
+            a.session(key);
+        }
         self.log.session_source = source;
         self.log.routing_strategy = cfg.routing;
         self.log.routing_warning = if !cfg.session_affinity {
@@ -153,11 +164,31 @@ impl Tracker {
             previous_account: selected.previous_account.clone(),
         });
         self.attempt(&selected.account);
+        if let Some(c) = self.usage_tap() {
+            c.model(&selected.model);
+        }
+    }
+
+    pub(crate) fn usage_tap(&self) -> Option<crate::usage::capture::Capture> {
+        self.analytics.as_ref().and_then(|a| a.tap())
+    }
+    pub(crate) fn observe_wire(&self, value: &Value) {
+        if let Some(c) = self.usage_tap() {
+            c.wire(value);
+        }
+    }
+    fn observe_usage_text(&self, text: &str) {
+        if let Some(c) = self.usage_tap() {
+            c.text(text);
+        }
     }
 
     /// Drops the tracker without recording a request.
     pub fn cancel(&mut self) {
         if !self.done {
+            if let Some(a) = &mut self.analytics {
+                a.finish(None, None, false);
+            }
             self.done = true;
             self.load = None;
             self.app.stats.active.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
@@ -199,11 +230,22 @@ impl Tracker {
         }
     }
 
+    /// A native transport attempt failed before HTTP fallback; the logical request continues.
+    pub(crate) fn finish_fallback(&mut self, status: u16, usage: &Usage, error: Option<String>) {
+        if let Some(a) = &mut self.analytics {
+            a.finish(Some(status), Some(usage), false);
+        }
+        self.finish(status, usage, error);
+    }
+
     pub fn finish(&mut self, status: u16, usage: &Usage, error: Option<String>) {
         if self.done {
             return;
         }
         self.done = true;
+        if let Some(a) = &mut self.analytics {
+            a.finish(Some(status), Some(usage), true);
+        }
         self.load = None;
         self.app.stats.active.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
         let (input, output, cache) = crate::state::usage_tokens(usage);
@@ -789,7 +831,7 @@ async fn execute_inner(app: Arc<App>, call: Call) -> Reply {
             body,
         );
         if cfg.debug {
-            tracing::debug!(url = %prepared.url, body = %prepared.body, "upstream request");
+            tracing::debug!(provider = provider.as_str(), "upstream request prepared");
         }
 
         let client = app.http.for_account(&acct);
@@ -820,10 +862,14 @@ async fn execute_inner(app: Arc<App>, call: Call) -> Reply {
         };
 
         let status = resp.status().as_u16();
+        if let Some(c) = tracker.usage_tap() {
+            c.headers(resp.headers(), status);
+        }
         crate::quota::observe(&acct, resp.headers(), quota_epoch);
         if !resp.status().is_success() {
             let headers = resp.headers().clone();
             let text = resp.text().await.unwrap_or_default();
+            tracker.observe_usage_text(&text);
             let msg = error_message(&text);
             tracing::warn!(account = %acct.label, status, "upstream error: {msg}");
             let client_body = if passthrough {
@@ -933,6 +979,7 @@ async fn execute_inner(app: Arc<App>, call: Call) -> Reply {
             if unwrap {
                 v = crate::antigravity::unwrap(v);
             }
+            tracker.observe_wire(&v);
             let mut agg = Aggregate::default();
             checked_full_events(native, &v).iter().for_each(|e| agg.push(e));
             if let Some((status, message)) = &agg.error {
@@ -946,7 +993,7 @@ async fn execute_inner(app: Arc<App>, call: Call) -> Reply {
         let events = if devin {
             crate::devin::event_stream(resp, names)
         } else {
-            event_stream(resp, native, is_sse, names, acct.clone(), model.clone())
+            event_stream(resp, native, is_sse, names, acct.clone(), model.clone(), tracker.usage_tap())
         };
         let client_model = model.clone();
         if call.stream {
@@ -1037,6 +1084,7 @@ fn event_stream(
     names: HashMap<String, String>,
     acct: Arc<Account>,
     model: String,
+    usage_tap: Option<crate::usage::capture::Capture>,
 ) -> EventStream {
     let rename = move |ev: Event| match ev {
         Event::ToolStart { key, id, name } => {
@@ -1055,6 +1103,7 @@ fn event_stream(
                 }
             };
             observe_quota_event(&acct, &model, &text);
+            if let Some(c)=&usage_tap {c.text(&text);}
             let evs = match serde_json::from_str::<Value>(&text) {
                 Ok(v) => checked_full_events(native, &v),
                 // Mislabelled stream: decode it as SSE after all.
@@ -1064,6 +1113,7 @@ fn event_stream(
                     let mut out = Vec::new();
                     for sse in dec.push(text.as_bytes()).into_iter().chain(dec.finish()) {
                         observe_quota_event(&acct, &model, &sse.data);
+                        if let Some(c)=&usage_tap {c.text(&sse.data);}
                         parser.feed(&sse, &mut out);
                     }
                     out
@@ -1085,6 +1135,7 @@ fn event_stream(
                 Some(Ok(chunk)) => {
                     for sse in dec.push(&chunk) {
                         observe_quota_event(&acct, &model, &sse.data);
+                        if let Some(c)=&usage_tap {c.text(&sse.data);}
                         parser.feed(&sse, &mut out);
                     }
                 }
@@ -1097,6 +1148,7 @@ fn event_stream(
                 None => {
                     for sse in dec.finish() {
                         observe_quota_event(&acct, &model, &sse.data);
+                        if let Some(c)=&usage_tap {c.text(&sse.data);}
                         parser.feed(&sse, &mut out);
                     }
                     for ev in out.drain(..) { yield rename(ev); }
@@ -1142,6 +1194,7 @@ async fn collect(events: EventStream, format: Format, model: &str, req: &Request
     let mut events = require_completion(events);
     let mut agg = Aggregate::default();
     while let Some(ev) = events.next().await {
+        tracker.observe_stream_event(&ev);
         if is_content(&ev) {
             tracker.first_token();
         }
@@ -1184,6 +1237,7 @@ fn passthrough_stream(resp: reqwest::Response, native: Format, mut tracker: Trac
                     return;
                 }
                 tracker.observe_quota_event(&sse.data);
+                tracker.observe_usage_text(&sse.data);
                 parser.feed(&sse, &mut evs);
                 for ev in evs.drain(..) {
                     tracker.observe_stream_event(&ev);
@@ -1231,6 +1285,7 @@ async fn collect_passthrough(mut body: ByteStream, native: Format, mut tracker: 
     let mut evs = Vec::new();
     let mut handle = |sse: crate::sse::SseEvent, agg: &mut Aggregate, final_obj: &mut Option<Value>| {
         tracker.observe_quota_event(&sse.data);
+        tracker.observe_usage_text(&sse.data);
         parser.feed(&sse, &mut evs);
         evs.drain(..).for_each(|e| agg.push(&e));
         if let Ok(v) = serde_json::from_str::<Value>(&sse.data)

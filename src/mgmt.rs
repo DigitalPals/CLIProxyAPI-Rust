@@ -290,6 +290,7 @@ pub fn parse_pasted(input: &str) -> (String, Option<String>) {
 
 pub fn router(app: Arc<App>) -> Router<Arc<App>> {
     Router::new()
+        .merge(crate::usage::api::router())
         .route("/overview", get(overview))
         .route("/accounts", get(accounts))
         .route("/accounts/{id}", delete(delete_account))
@@ -319,6 +320,14 @@ async fn auth(
     next: Next,
 ) -> Response {
     let cfg = app.cfg();
+    let collector_key =
+        req.headers().get("authorization").and_then(|v| v.to_str().ok()).is_some_and(|v| v.starts_with("Bearer fbxc_"))
+            || req.uri().query().is_some_and(|q| {
+                url::form_urlencoded::parse(q.as_bytes()).any(|(k, v)| k == "key" && v.starts_with("fbxc_"))
+            });
+    if collector_key {
+        return err(StatusCode::UNAUTHORIZED, "collector credentials are ingestion-only");
+    }
     let key = cfg.management_key.clone();
     if key.is_empty() {
         if addr.ip().is_loopback() {
