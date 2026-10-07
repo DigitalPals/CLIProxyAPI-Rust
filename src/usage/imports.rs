@@ -74,14 +74,15 @@ pub async fn run_command(command: UsageCommand) -> Result<()> {
     let database = database.clone();
     let store = tokio::task::spawn_blocking(move || Store::open_existing(&database, 128)).await??;
     let result = match command {
-        UsageCommand::Status { .. } => status(&store).await?,
-        UsageCommand::Enable { source, root, .. } => configure(&store, &source, &root.to_string_lossy(), true).await?,
-        UsageCommand::Disable { source, root, .. } => {
-            configure(&store, &source, &root.to_string_lossy(), false).await?
-        }
-        UsageCommand::Scan { source, .. } => scan(&store, source).await?,
-        UsageCommand::Backfill { source, .. } => backfill(&store, source).await?,
+        UsageCommand::Status { .. } => status(&store).await,
+        UsageCommand::Enable { source, root, .. } => configure(&store, &source, &root.to_string_lossy(), true).await,
+        UsageCommand::Disable { source, root, .. } => configure(&store, &source, &root.to_string_lossy(), false).await,
+        UsageCommand::Scan { source, .. } => scan(&store, source).await,
+        UsageCommand::Backfill { source, .. } => backfill(&store, source).await,
     };
+    let shutdown = store.shutdown().await;
+    let result = result?;
+    shutdown?;
     println!("{}", serde_json::to_string_pretty(&result)?);
     Ok(())
 }

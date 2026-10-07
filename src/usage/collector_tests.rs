@@ -325,6 +325,30 @@ fn transport_and_protected_credentials() {
 }
 
 #[tokio::test]
+async fn standalone_commands_close_writer_even_when_offline() {
+    let dir = TestDir::new();
+    secure_dir(&dir.0).unwrap();
+    let state = LocalState {
+        version: 1,
+        id: Uuid::new_v4().to_string(),
+        destination: "http://127.0.0.1:0/api/usage-ingest".into(),
+        credential: credential(),
+    };
+    atomic_state(&dir.0.join("collector.json"), &state).unwrap();
+    for command in [
+        CollectorCommand::Status { state_dir: dir.0.clone() },
+        CollectorCommand::Sync { state_dir: dir.0.clone() },
+        CollectorCommand::Run { state_dir: dir.0.clone(), once: true },
+    ] {
+        let succeeds = matches!(&command, CollectorCommand::Status { .. });
+        assert_eq!(run_command(command).await.is_ok(), succeeds);
+        let reopened = local_store(dir.0.clone()).await.unwrap();
+        assert_eq!(reopened.health()["prior_unclosed_sessions"], 0);
+        reopened.shutdown().await.unwrap();
+    }
+}
+
+#[tokio::test]
 async fn full_outbox_preserves_checkpoint_and_restart_retries() {
     let dir = TestDir::new();
     let store = local_store(dir.0.clone()).await.unwrap();

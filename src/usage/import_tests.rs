@@ -48,6 +48,25 @@ async fn count(store: &Store) -> i64 {
     store.call(|c| Ok(c.query_row("SELECT COUNT(*) FROM usage_entries", [], |r| r.get(0))?)).await.unwrap()
 }
 
+#[tokio::test]
+async fn usage_commands_close_writer_on_success_and_failure() {
+    let dir = TestDir::new();
+    dir.store().shutdown().await.unwrap();
+    let database = dir.0.join("usage.sqlite3");
+    run_command(UsageCommand::Status { database: database.clone() }).await.unwrap();
+    let reopened = dir.store();
+    assert_eq!(reopened.health()["prior_unclosed_sessions"], 0);
+    reopened.shutdown().await.unwrap();
+    assert!(
+        run_command(UsageCommand::Enable { database, source: "invalid-source".into(), root: dir.0.clone() })
+            .await
+            .is_err()
+    );
+    let reopened = dir.store();
+    assert_eq!(reopened.health()["prior_unclosed_sessions"], 0);
+    reopened.shutdown().await.unwrap();
+}
+
 #[test]
 fn native_categories_and_missing_values() {
     let mut state = Context::default();

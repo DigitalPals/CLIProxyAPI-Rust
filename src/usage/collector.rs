@@ -510,6 +510,54 @@ async fn synchronize(store: &Store, state: &LocalState) -> Result<Value> {
     }
     Ok(json!({"sent":sent,"status":local_status(store,state).await?}))
 }
+async fn print_and_shutdown(store: &Store, result: Result<Value>) -> Result<()> {
+    let shutdown = store.shutdown().await;
+    let result = result?;
+    shutdown?;
+    println!("{}", serde_json::to_string_pretty(&result)?);
+    Ok(())
+}
+
+async fn stop_signal() -> Result<()> {
+    #[cfg(unix)]
+    {
+        let mut terminate = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
+        tokio::select! {
+            result = tokio::signal::ctrl_c() => result?,
+            _ = terminate.recv() => {},
+        }
+    }
+    #[cfg(not(unix))]
+    tokio::signal::ctrl_c().await?;
+    Ok(())
+}
+
+async fn run_loop(store: &Store, state: &LocalState, once: bool) -> Result<()> {
+    let mut delay = 1;
+    loop {
+        let scanned = imports::scan_outbox(store).await;
+        if scanned.is_err() {
+            record_failure(store, "native scan unavailable").await?
+        }
+        match synchronize(store, state).await {
+            Ok(result) => {
+                delay = 1;
+                if once {
+                    println!("{}", serde_json::to_string_pretty(&result)?);
+                    return Ok(());
+                }
+            }
+            Err(_) => {
+                if once {
+                    bail!("collector sync unavailable; durable outbox retained")
+                };
+                delay = (delay * 2).min(300);
+            }
+        }
+        tokio::time::sleep(Duration::from_secs(if delay == 1 { 30 } else { delay })).await;
+    }
+}
+
 pub async fn run_command(command: CollectorCommand) -> Result<()> {
     match command {
         CollectorCommand::Enroll { state_dir, destination, credential_file, codex_root, claude_root } => {
@@ -539,53 +587,41 @@ pub async fn run_command(command: CollectorCommand) -> Result<()> {
             })
             .await??;
             let store = local_store(state_dir).await?;
-            for root in codex_root {
-                imports::configure(&store, "codex", &root.to_string_lossy(), true).await?;
+            let result = async {
+                for root in codex_root {
+                    imports::configure(&store, "codex", &root.to_string_lossy(), true).await?;
+                }
+                for root in claude_root {
+                    imports::configure(&store, "claude_code", &root.to_string_lossy(), true).await?;
+                }
+                local_status(&store, &state).await
             }
-            for root in claude_root {
-                imports::configure(&store, "claude_code", &root.to_string_lossy(), true).await?;
-            }
-            println!("{}", serde_json::to_string_pretty(&local_status(&store, &state).await?)?);
+            .await;
+            print_and_shutdown(&store, result).await?;
         }
         CollectorCommand::Status { state_dir } => {
             let directory = state_dir.clone();
             let state = tokio::task::spawn_blocking(move || local_state(&directory)).await??;
             let store = local_store(state_dir).await?;
-            println!("{}", serde_json::to_string_pretty(&local_status(&store, &state).await?)?);
+            print_and_shutdown(&store, local_status(&store, &state).await).await?;
         }
         CollectorCommand::Sync { state_dir } => {
             let directory = state_dir.clone();
             let state = tokio::task::spawn_blocking(move || local_state(&directory)).await??;
             let store = local_store(state_dir).await?;
-            println!("{}", serde_json::to_string_pretty(&synchronize(&store, &state).await?)?);
+            print_and_shutdown(&store, synchronize(&store, &state).await).await?;
         }
         CollectorCommand::Run { state_dir, once } => {
             let directory = state_dir.clone();
             let state = tokio::task::spawn_blocking(move || local_state(&directory)).await??;
             let store = local_store(state_dir).await?;
-            let mut delay = 1;
-            loop {
-                let scanned = imports::scan_outbox(&store).await;
-                if scanned.is_err() {
-                    record_failure(&store, "native scan unavailable").await?
-                }
-                match synchronize(&store, &state).await {
-                    Ok(result) => {
-                        delay = 1;
-                        if once {
-                            println!("{}", serde_json::to_string_pretty(&result)?);
-                            return Ok(());
-                        }
-                    }
-                    Err(_) => {
-                        if once {
-                            bail!("collector sync unavailable; durable outbox retained")
-                        };
-                        delay = (delay * 2).min(300);
-                    }
-                }
-                tokio::select! {_=tokio::time::sleep(Duration::from_secs(if delay==1{30}else{delay}))=>{},_=tokio::signal::ctrl_c()=>return Ok(())}
-            }
+            let result = tokio::select! {
+                result = run_loop(&store, &state, once) => result,
+                result = stop_signal() => result,
+            };
+            let shutdown = store.shutdown().await;
+            result?;
+            shutdown?;
         }
     }
     Ok(())
