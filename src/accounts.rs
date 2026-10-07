@@ -952,6 +952,25 @@ pub enum Pick {
     None,
 }
 
+struct SmartQuotaScore {
+    five_hour_remaining: Option<f64>,
+    weekly_remaining: Option<f64>,
+    weekly_reset: Option<DateTime<Utc>>,
+    load: usize,
+    weight: f64,
+}
+
+impl SmartQuotaScore {
+    /// Reserves protect sessions already using an account, not idle allowance.
+    /// An idle account may admit a session below either reserve; that assignment
+    /// counts immediately, so subsequent new sessions protect its remaining quota.
+    fn needs_reserve(&self, five_hour_reserve: f64) -> bool {
+        self.load > 0
+            && (self.five_hour_remaining.is_some_and(|left| left < five_hour_reserve)
+                || self.weekly_remaining.is_some_and(|left| left < SMART_WEEKLY_RESERVE))
+    }
+}
+
 impl Pool {
     /// Resolve a pinned account without replacing it with a different provider.
     pub fn resolve_account(&self, a: &Account, model: &str, only: Option<&Only>) -> Option<String> {
@@ -1237,15 +1256,32 @@ impl Pool {
         match cfg.routing {
             Routing::FillFirst => 0,
             Routing::SmartQuota => {
-                let now = Utc::now();
-                let scores: Vec<_> = candidates.iter().map(|(a, up)| smart_score(a, up, now, session_load)).collect();
+                let scores: Vec<_> = candidates.iter().map(|(a, up)| smart_score(a, up, session_load)).collect();
                 let reserve = f64::from(cfg.five_hour_reserve_percent);
-                let protect = reserve > 0.0 && scores.iter().any(|(left, _)| left.is_some_and(|v| v >= reserve));
+                let needs_reserve = |s: &SmartQuotaScore| s.needs_reserve(reserve);
                 // This is an admission preference, not a cooldown: never refuse usable
-                // accounts merely because all are below the reserve (or quota is unknown).
-                let eligible = |i: usize| !protect || scores[i].0.is_some_and(|left| left >= reserve);
-                let best = (0..scores.len()).filter(|&i| eligible(i)).map(|i| scores[i].1).fold(0.0, f64::max);
-                let tied: Vec<_> = (0..scores.len()).filter(|&i| eligible(i) && scores[i].1 >= best - 1e-9).collect();
+                // accounts merely because all of them need their reserve.
+                let protect = scores.iter().any(|s| !needs_reserve(s));
+                let eligible = |s: &SmartQuotaScore| !protect || !needs_reserve(s);
+                // Drain the earliest eligible week. If every account needs its reserve,
+                // fall back to quota/load rather than refusing available allowance.
+                // Missing five-hour data must not suppress known weekly reset priority.
+                let earliest_reset = if protect {
+                    scores.iter().filter(|s| eligible(s)).filter_map(|s| s.weekly_reset).min()
+                } else {
+                    None
+                };
+                // Renewals within one hour compete on quota and load. A session count alone
+                // cannot send new work to an account that renews days later.
+                let preferred = |s: &SmartQuotaScore| {
+                    eligible(s)
+                        && earliest_reset.is_none_or(|first| {
+                            s.weekly_reset.is_some_and(|reset| reset <= first + chrono::Duration::hours(1))
+                        })
+                };
+                let best = scores.iter().filter(|s| preferred(s)).map(|s| s.weight).fold(0.0, f64::max);
+                let tied: Vec<_> =
+                    (0..scores.len()).filter(|&i| preferred(&scores[i]) && scores[i].weight >= best - 1e-9).collect();
                 tied[take_turn(tied.len())]
             }
             Routing::LeastUsed => {
@@ -1287,19 +1323,32 @@ impl Pool {
         let mut steps = Vec::new();
         if !first.is_empty() {
             let next = self.choose(&first, model, cfg, session_load, false);
-            let now = Utc::now();
-            let rank = |i: usize| -> f64 {
-                let (a, up) = &first[i];
-                match cfg.routing {
-                    Routing::SmartQuota => smart_score(a, up, now, session_load).1,
-                    Routing::LeastUsed => -least_used_score(a, model),
-                    // Turns continue from the next account, wrapping around.
-                    Routing::RoundRobin => -(((i + first.len() - next) % first.len()) as f64),
-                    Routing::FillFirst => -(i as f64),
-                }
-            };
             let mut order: Vec<usize> = (0..first.len()).filter(|&i| i != next).collect();
-            order.sort_by(|&x, &y| rank(y).total_cmp(&rank(x)));
+            if cfg.routing == Routing::SmartQuota {
+                // Accounts keeping a reserve come last, then the earliest weekly renewal;
+                // quota and load order the rest.
+                let reserve = f64::from(cfg.five_hour_reserve_percent);
+                let scores: Vec<_> = first.iter().map(|(a, up)| smart_score(a, up, session_load)).collect();
+                let renewal = |s: &SmartQuotaScore| s.weekly_reset.unwrap_or(DateTime::<Utc>::MAX_UTC);
+                order.sort_by(|&x, &y| {
+                    let (a, b) = (&scores[x], &scores[y]);
+                    a.needs_reserve(reserve)
+                        .cmp(&b.needs_reserve(reserve))
+                        .then(renewal(a).cmp(&renewal(b)))
+                        .then(b.weight.total_cmp(&a.weight))
+                });
+            } else {
+                let rank = |i: usize| -> f64 {
+                    let (a, _) = &first[i];
+                    match cfg.routing {
+                        Routing::LeastUsed => -least_used_score(a, model),
+                        // Turns continue from the next account, wrapping around.
+                        Routing::RoundRobin => -(((i + first.len() - next) % first.len()) as f64),
+                        Routing::FillFirst | Routing::SmartQuota => -(i as f64),
+                    }
+                };
+                order.sort_by(|&x, &y| rank(y).total_cmp(&rank(x)));
+            }
             for i in std::iter::once(next).chain(order) {
                 let (a, up) = &first[i];
                 let mut step = RouteStep::new(a, up.clone(), "ready", None);
@@ -1339,31 +1388,29 @@ impl RouteStep {
     }
 }
 
-/// Smart quota balancing: the 5-hour allowance left (if reported) and the account's weight.
-fn smart_score(
-    a: &Account,
-    upstream: &str,
-    now: DateTime<Utc>,
-    session_load: &HashMap<String, usize>,
-) -> (Option<f64>, f64) {
+/// Weekly quota (percent left) that smart routing keeps for sessions already on an account.
+const SMART_WEEKLY_RESERVE: f64 = 5.0;
+
+/// Smart quota balancing: what reserves and reset priority need, plus the weight that
+/// breaks ties between accounts renewing within an hour of each other.
+fn smart_score(a: &Account, upstream: &str, session_load: &HashMap<String, usize>) -> SmartQuotaScore {
     let st = a.state.lock();
     let remaining = st.quota.five_hour_remaining(upstream);
-    // Earlier weekly renewals get up to twice the weight, never unlimited
-    // priority. Missing/expired weekly dates receive the neutral weight.
-    let renewal = st
-        .quota
-        .weekly_reset(upstream)
-        .map_or(1.0, |reset| 2.0 - ((reset - now).num_seconds() as f64 / (7.0 * 86_400.0)).clamp(0.0, 1.0));
     // A busy session is already represented by its in-flight request;
     // take the larger count instead of charging that work twice.
     let load = session_load.get(&a.id).copied().unwrap_or(0).max(st.active_requests.load(Ordering::Relaxed));
     // Use known weekly/model-specific headroom when no 5-hour window is
-    // reported. The reserve below still applies only to real 5-hour data.
+    // reported. The reserve still applies only to real 5-hour data.
     let headroom = remaining.or_else(|| st.quota.remaining(upstream)).unwrap_or(crate::quota::UNKNOWN);
-    // Sessions on an account nearly out of its weekly allowance would soon
-    // have to move and lose their cache: fade over the last quarter.
-    let weekly = st.quota.weekly_remaining(upstream).map_or(1.0, |left| (left / 25.0).min(1.0));
-    (remaining, headroom * renewal * weekly / (1.0 + load as f64))
+    let weekly_remaining = st.quota.weekly_remaining(upstream);
+    let weekly = weekly_remaining.map_or(1.0, |left| (left / SMART_WEEKLY_RESERVE).min(1.0));
+    SmartQuotaScore {
+        five_hour_remaining: remaining,
+        weekly_remaining,
+        weekly_reset: st.quota.weekly_reset(upstream),
+        load,
+        weight: headroom * weekly / (1.0 + load as f64),
+    }
 }
 
 /// Least used: use of the tightest window (lower is better).
@@ -1416,7 +1463,7 @@ mod tests {
         use chrono::Duration;
         let cfg = Config {
             auth_dir: "/nonexistent".into(),
-            claude_api_key: ["cybex", "itpals", "digitalbrain"]
+            claude_api_key: ["early", "middle", "late"]
                 .map(|key| crate::config::KeyEntry { api_key: key.into(), ..Default::default() })
                 .to_vec(),
             ..Default::default()
@@ -1480,7 +1527,7 @@ mod tests {
     }
 
     #[test]
-    fn smart_quota_avoids_accounts_nearly_out_of_their_week() {
+    fn smart_quota_protects_busy_accounts_nearly_out_of_their_week() {
         use crate::quota::{Quota, Window};
         use chrono::Duration;
         let cfg = Config {
@@ -1495,7 +1542,7 @@ mod tests {
         pool.reload(&cfg);
         let accounts = pool.accounts.read().clone();
         let now = Utc::now();
-        // An earlier renewal must not outweigh a week that is almost used up.
+        // An earlier renewal must not spend the reserve of an existing session.
         for (account, (days, used)) in accounts.iter().zip([(2, 98.0), (6, 0.0)]) {
             account.state.lock().quota = Quota {
                 windows: vec![
@@ -1506,12 +1553,126 @@ mod tests {
                 ..Default::default()
             };
         }
+        let load = HashMap::from([(accounts[0].id.clone(), 1)]);
         for _ in 0..4 {
-            match pool.pick("claude-sonnet-4-6", &[], &cfg, None, None, &HashMap::new()) {
+            match pool.pick("claude-sonnet-4-6", &[], &cfg, None, None, &load) {
                 Pick::Ok(a, _) => assert_eq!(a.id, accounts[1].id),
                 _ => panic!("expected available account"),
             }
         }
+    }
+
+    #[test]
+    fn smart_quota_packs_earlier_renewals_until_quota_is_low() {
+        use crate::quota::{Quota, Window};
+        use chrono::Duration;
+        let cfg = Config {
+            auth_dir: "/nonexistent".into(),
+            claude_api_key: ["early", "middle", "late"]
+                .map(|key| crate::config::KeyEntry { api_key: key.into(), ..Default::default() })
+                .to_vec(),
+            routing: Routing::SmartQuota,
+            ..Default::default()
+        };
+        let pool = Pool::default();
+        pool.reload(&cfg);
+        let accounts = pool.all();
+        let now = Utc::now();
+        for (account, (hours, left)) in accounts.iter().zip([(57, 60.0), (79, 16.0), (104, 84.0)]) {
+            account.state.lock().quota = Quota {
+                windows: vec![
+                    Window { name: "5h".into(), used: 0.0, resets_at: Some(now + Duration::hours(4)), model: None },
+                    Window {
+                        name: "week".into(),
+                        used: 100.0 - left,
+                        resets_at: Some(now + Duration::hours(hours)),
+                        model: None,
+                    },
+                ],
+                updated_at: Some(now),
+                ..Default::default()
+            };
+        }
+        let load =
+            HashMap::from([(accounts[0].id.clone(), 30), (accounts[1].id.clone(), 1), (accounts[2].id.clone(), 1)]);
+        let pick = || match pool.pick("claude-opus-5-5", &[], &cfg, None, None, &load) {
+            Pick::Ok(a, _) => a.id.clone(),
+            _ => panic!("expected available account"),
+        };
+        assert_eq!(pick(), accounts[0].id); // even many sessions do not outweigh an earlier reset
+        let five_hour = accounts[0].state.lock().quota.windows[0].clone();
+        for a in &accounts {
+            a.state.lock().quota.windows.remove(0);
+        }
+        assert_eq!(pick(), accounts[0].id); // weekly-only quota keeps the same reset priority
+        for a in &accounts {
+            a.state.lock().quota.windows.insert(0, five_hour.clone());
+        }
+        accounts[0].state.lock().quota.windows[0].used = 70.0;
+        accounts[0].state.lock().quota.windows[1].used = 95.0;
+        assert_eq!(pick(), accounts[0].id); // exactly the reserves is still healthy
+        accounts[0].state.lock().quota.windows[0].used = 71.0;
+        assert_eq!(pick(), accounts[1].id); // the middle renewal is next despite only 16% of its week left
+        let order: Vec<_> =
+            pool.route_order("claude-opus-5-5", &cfg, None, &load).into_iter().map(|s| s.account).collect();
+        assert_eq!(order, [accounts[1].id.clone(), accounts[2].id.clone(), accounts[0].id.clone()]); // accounts keeping a reserve are listed last
+        accounts[0].state.lock().quota.windows[0].used = 0.0;
+        accounts[0].state.lock().quota.windows[1].used = 96.0;
+        assert_eq!(pick(), accounts[1].id); // protect the early account's remaining weekly quota
+        accounts[1].state.lock().quota.windows[1].used = 96.0;
+        assert_eq!(pick(), accounts[2].id); // the latest renewal is last
+        for a in &accounts {
+            a.state.lock().quota.windows[1].used = 96.0;
+        }
+        assert_ne!(pick(), accounts[0].id); // all low: quota and load decide, without refusing requests
+    }
+
+    #[test]
+    fn smart_quota_uses_load_for_close_or_unknown_renewals() {
+        use crate::quota::{Quota, Window};
+        use chrono::Duration;
+        let cfg = Config {
+            auth_dir: "/nonexistent".into(),
+            claude_api_key: ["a", "b"]
+                .map(|key| crate::config::KeyEntry { api_key: key.into(), ..Default::default() })
+                .to_vec(),
+            routing: Routing::SmartQuota,
+            ..Default::default()
+        };
+        let pool = Pool::default();
+        pool.reload(&cfg);
+        let accounts = pool.all();
+        let now = Utc::now();
+        for (a, minutes) in accounts.iter().zip([0, 30]) {
+            a.state.lock().quota = Quota {
+                windows: vec![
+                    Window { name: "5h".into(), used: 0.0, resets_at: Some(now + Duration::hours(4)), model: None },
+                    Window {
+                        name: "week".into(),
+                        used: 20.0,
+                        resets_at: Some(now + Duration::days(2) + Duration::minutes(minutes)),
+                        model: None,
+                    },
+                ],
+                updated_at: Some(now),
+                ..Default::default()
+            };
+        }
+        let load = HashMap::from([(accounts[0].id.clone(), 1)]);
+        let pick = || match pool.pick("claude-opus-5-5", &[], &cfg, None, None, &load) {
+            Pick::Ok(a, _) => a.id.clone(),
+            _ => panic!("expected available account"),
+        };
+        assert_eq!(pick(), accounts[1].id); // half an hour is a close tie
+        accounts[1].state.lock().quota.windows[1].resets_at = Some(now + Duration::days(2) + Duration::hours(1));
+        assert_eq!(pick(), accounts[1].id); // the one-hour boundary is included
+        accounts[1].state.lock().quota.windows[1].resets_at =
+            Some(now + Duration::days(2) + Duration::hours(1) + Duration::seconds(1));
+        assert_eq!(pick(), accounts[0].id); // beyond the tie, reset priority wins
+        accounts[1].state.lock().quota.windows[1].resets_at = None;
+        assert_eq!(pick(), accounts[0].id); // unknown renewal cannot outrank a known healthy reset
+        accounts[0].state.lock().quota.windows[1].resets_at = Some(now - Duration::seconds(1));
+        assert_eq!(pick(), accounts[1].id); // without a future renewal, load still spreads work
     }
 
     #[test]

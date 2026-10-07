@@ -799,7 +799,7 @@ function barsHTML(series = S.overview.series) {
 
 const ROUTING_TEXT = {
   'least-used': ['go to the account with the most quota left', 'go to the most quota left'],
-  'smart-quota': ['balance weekly resets, 5-hour quota and account load', 'balance quota, resets and load'],
+  'smart-quota': ['drain the earliest weekly reset, reserving quota for active sessions', 'drain the earliest weekly reset'],
   'round-robin': ['take turns across accounts', 'take turns across accounts'],
   'fill-first': ['go to the first available account', 'go to the first available account'],
 };
@@ -973,7 +973,7 @@ const SESSION_SOURCE = {
 };
 const STRATEGY_PICK = {
   'least-used': 'the account with the most quota left',
-  'smart-quota': 'the account with the best balance of quota left, weekly reset and load',
+  'smart-quota': 'the account whose weekly limit renews first',
   'round-robin': 'the next account in turn',
   'fill-first': 'the first available account',
 };

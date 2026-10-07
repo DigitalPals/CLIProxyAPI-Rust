@@ -31,7 +31,7 @@ pub struct Config {
     pub request_retry: u32,
     /// How new sessions choose an account.
     pub routing: Routing,
-    /// Smart routing prefers other accounts below this 5-hour remaining percentage.
+    /// Smart routing reserves this 5-hour remaining percentage for active/recent sessions.
     #[serde(deserialize_with = "percentage")]
     pub five_hour_reserve_percent: u8,
     /// Keep each coding session on its account until subscription quota is exhausted.
@@ -82,7 +82,7 @@ pub enum Routing {
     /// The account with the most subscription quota left (falls back to round-robin).
     #[default]
     LeastUsed,
-    /// Balance weekly renewal priority, 5-hour headroom and current account load.
+    /// Drain the earliest eligible weekly renewal; quota and load break close ties.
     SmartQuota,
     RoundRobin,
     FillFirst,
@@ -270,7 +270,7 @@ management-key: ""
 proxy-url: ""               # optional upstream proxy, e.g. socks5://127.0.0.1:1080
 request-retry: 3            # accounts to try before failing a request
 routing: least-used         # new sessions: least-used | smart-quota | round-robin | fill-first
-five-hour-reserve-percent: 30 # smart-quota: prefer other accounts below this remaining percentage
+five-hour-reserve-percent: 30 # smart-quota: keep this 5-hour share for sessions already on an account
 session-affinity: true      # keep a session on its subscription until quota is exhausted
 session-affinity-idle-seconds: 86400 # expire assignments after a day without requests
 codex-websockets: true      # native upstream websocket for Codex websocket clients
