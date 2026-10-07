@@ -193,6 +193,22 @@ function left(iso) {
   return `${s}s`;
 }
 
+// Compact quota countdown: at most two units, with no zero suffix or seconds.
+function compactLeft(iso) {
+  const remaining = Date.parse(iso) - Date.now();
+  if (remaining <= 0) return 'now';
+  const minutes = Math.floor(remaining / 60000);
+  if (minutes >= 1440) {
+    const hours = Math.floor((minutes % 1440) / 60);
+    return `${Math.floor(minutes / 1440)}d${hours ? ` ${hours}h` : ''}`;
+  }
+  if (minutes >= 60) {
+    const rest = minutes % 60;
+    return `${Math.floor(minutes / 60)}h${rest ? ` ${rest}m` : ''}`;
+  }
+  return minutes ? `${minutes}m` : '<1m';
+}
+
 function span(secs) {
   if (secs < 60) return `${Math.floor(secs)}s`;
   if (secs < 3600) return `${Math.floor(secs / 60)}m`;
@@ -203,9 +219,13 @@ function span(secs) {
 const clock = (iso) => new Date(iso).toLocaleTimeString('en-GB', { hour12: false });
 const hm = (iso) => new Date(iso).toLocaleTimeString('en-GB', { hour: '2-digit', minute: '2-digit', hour12: false });
 const weekday = (iso) => new Date(iso).toLocaleDateString('en-GB', { weekday: 'short' });
+const fullResetTime = (iso) => new Date(iso).toLocaleString('en-GB', {
+  weekday: 'long', day: 'numeric', month: 'long', year: 'numeric',
+  hour: '2-digit', minute: '2-digit', second: '2-digit', hour12: false, timeZoneName: 'short',
+});
 // Within a day "20:09", otherwise "Fri 14:58".
 const when = (iso) => (Date.parse(iso) - Date.now() < 20 * 3600e3 ? hm(iso) : `${weekday(iso)} ${hm(iso)}`);
-const liveLeft = (iso) => `<span data-until="${esc(iso)}">${left(iso)}</span>`;
+const liveLeft = (iso, compact = false) => `<span data-until="${esc(iso)}"${compact ? ' data-countdown="compact"' : ''}>${esc(compact ? compactLeft(iso) : left(iso))}</span>`;
 const liveAgo = (iso) => `<span data-ago="${esc(iso || '')}">${ago(iso)}</span>`;
 const plural = (n, word, many = `${word}s`) => `${fmt(n)} ${n === 1 ? word : many}`;
 const cap = (s) => String(s || '').charAt(0).toUpperCase() + String(s || '').slice(1);
@@ -593,12 +613,12 @@ function pctHTML(w) {
   return `<span class="pct ${q.cls}">${quotaPercent(q[S.quotaDisplay])}</span>`;
 }
 
-// One meter row: "5H [segments] 47% ↺ 20:09".
+// One meter row: "5H [segments] 47% ↺ 2h 14m"; full reset time on hover.
 function meterRowHTML(a, short) {
   const w = windowOf(a, short);
   const label = windowLabel(w, short);
-  const reset = w && w.resets_at ? `↺ ${short ? hm(w.resets_at) : weekday(w.resets_at)}` : '';
-  const title = w && w.resets_at ? ` title="${esc(windowTitle(w))} window resets ${esc(when(w.resets_at))}"` : '';
+  const reset = w && w.resets_at ? `↺ ${liveLeft(w.resets_at, true)}` : '';
+  const title = w && w.resets_at ? ` title="${esc(windowTitle(w))} window resets ${esc(fullResetTime(w.resets_at))}"` : '';
   return `<div class="mrow"><span class="capsm">${esc(label)}</span>${segsHTML(w, `${windowTitle(w || { name: short ? '5h' : 'week' })}`)}${pctHTML(w)}<span class="rst"${title}>${reset}</span></div>`;
 }
 const metersHTML = (a) => `<div class="meters">${meterRowHTML(a, true)}${meterRowHTML(a, false)}</div>`;
@@ -2573,7 +2593,7 @@ setInterval(() => {
   let expired = false;
   for (const el of $$('[data-until]')) {
     if (Date.parse(el.dataset.until) <= Date.now()) expired = true;
-    el.textContent = left(el.dataset.until);
+    el.textContent = el.dataset.countdown === 'compact' ? compactLeft(el.dataset.until) : left(el.dataset.until);
   }
   for (const el of $$('[data-reset-deadline]')) {
     if (Date.parse(el.dataset.resetDeadline) <= Date.now()) el.disabled = true;

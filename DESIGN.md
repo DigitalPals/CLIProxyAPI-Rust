@@ -173,7 +173,7 @@ Flat. Panels are `surface` with a 1px `line` hairline. The only shadow is on flo
 
 ## Components
 
-- **Segmented quota meter.** 20 segments of 5%, 9px tall (10px in the drawer, 20px on the account page), 2px gap, 180px at most. Lit segments are `meter` below 75% used, `warn` from 75% and `err` from 95%; the thresholds always measure used, even in Remaining mode. Off segments are `line`. To the right: the percentage ("<1%" and ">99%" at the ends), then "↺ 20:09" (5H) or "↺ Fri" (WK) in DM Mono.
+- **Segmented quota meter.** 20 segments of 5%, 9px tall (10px in the drawer, 20px on the account page), 2px gap, 180px at most. Lit segments are `meter` below 75% used, `warn` from 75% and `err` from 95%; the thresholds always measure used, even in Remaining mode. Off segments are `line`. To the right: the percentage ("<1%" and ">99%" at the ends), then a live reset countdown such as "↺ 2h 14m" or "↺ 3d 7h" in DM Mono for both 5H and WK. Use at most two units, omit zero suffixes, and show "↺ <1m" below one minute. Reserve 10ch for alignment; the full reset date, local time and timezone appear only in the hover tooltip.
 - **Status.** An 8px dot and a word: Ready (`ok` dot, `fg-2` word), Cooling 1h 41m (`warn`), Error (`err`), Disabled (`idle`).
 - **Rivets.** The Subscriptions, Accounts and Models panels carry four 6px `rivet` dots in their corners.
 - **Breaker.** Each account row ends with refresh, an on/off switch (`role="switch"`, square knob, `meter` track when on) and remove.

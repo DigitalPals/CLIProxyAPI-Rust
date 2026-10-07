@@ -350,9 +350,8 @@ h1, h2, h3, p { margin: 0; }
 .pct { width: 40px; flex: none; text-align: right; font-size: 13px; color: var(--fg); }
 .pct.warn { color: var(--warn); }
 .pct.err { color: var(--err); }
-.rst { width: 46px; flex: none; font: 400 11px/1 var(--mono); color: var(--fg-3); white-space: nowrap; }
+.rst { width: 10ch; flex: none; font: 400 11px/1 var(--mono); color: var(--fg-3); white-space: nowrap; }
 .acct-table .segs { max-width: 140px; min-width: 56px; }
-.acct-table .rst { width: auto; }
 .mini-meters { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; }
 .mini-meters .mrow { gap: 6px; }
 .mini-meters .capsm { width: auto; font-size: 10px; }
@@ -480,7 +479,6 @@ h1, h2, h3, p { margin: 0; }
 .stack-list .meters .segs { max-width: none; min-width: 0; }
 .stack-list .meters .capsm { width: 20px; }
 .stack-list .meters .pct { width: 38px; }
-.stack-list .meters .rst { width: 44px; }
 .metaline { display: flex; flex-wrap: wrap; gap: 2px 12px; font-size: 12px; color: var(--fg-3); }
 .metaline .fg2 { color: var(--fg-2); }
 .errline { font: 400 12px/1.5 var(--mono); color: var(--err); overflow-wrap: anywhere; text-wrap: pretty; }
