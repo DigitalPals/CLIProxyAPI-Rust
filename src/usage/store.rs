@@ -12,12 +12,12 @@ use std::{
     path::{Path, PathBuf},
     sync::{
         Arc, Mutex,
-        atomic::{AtomicI64, AtomicU64, Ordering},
+        atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering},
     },
 };
-use tokio::sync::{Semaphore, mpsc, oneshot};
+use tokio::sync::{OnceCell, Semaphore, mpsc, oneshot};
 
-const VERSION: i64 = 1;
+const VERSION: i64 = 2;
 const APPLICATION_ID: i64 = 0x46555345;
 const MAX_QUERY_DAYS: i64 = 3660;
 const ENTRY_COLUMNS: &str = "id,source,origin_id,source_event_id,canonical_key,association_key,event_at_ms,provider,model,account_id,client_id,logical_request_id,attempt_id,response_id,completeness,input,cache_read,cache_write,write_5m,write_1h,output,reasoning,cost_nanos,pricing_basis,catalogue_version,json_extract(snapshot_json,'$.partial') AS pricing_partial";
@@ -36,6 +36,12 @@ struct Health {
     errors: AtomicU64,
     last_commit: AtomicI64,
     error: Mutex<Option<String>>,
+    historical_dropped: u64,
+    historical_rejected: u64,
+    historical_errors: u64,
+    prior_unclosed: u64,
+    closed: AtomicBool,
+    gate: Mutex<()>,
 }
 #[derive(Clone)]
 pub struct Store {
@@ -43,6 +49,8 @@ pub struct Store {
     health: Arc<Health>,
     path: Arc<PathBuf>,
     read_slots: Arc<Semaphore>,
+    shutdown_result: Arc<OnceCell<std::result::Result<(), String>>>,
+    session_id: Arc<String>,
 }
 #[derive(Debug, Clone, Default, Deserialize)]
 #[serde(default, deny_unknown_fields)]
@@ -58,6 +66,46 @@ pub struct Query {
     pub limit: Option<u32>,
     pub offset: Option<u32>,
     pub group_by: Option<String>,
+}
+#[derive(Default)]
+struct CheckedSum;
+impl rusqlite::functions::Aggregate<(Option<i128>, bool), Option<i64>> for CheckedSum {
+    fn init(&self, _: &mut rusqlite::functions::Context<'_>) -> rusqlite::Result<(Option<i128>, bool)> {
+        Ok((None, false))
+    }
+    fn step(&self, ctx: &mut rusqlite::functions::Context<'_>, acc: &mut (Option<i128>, bool)) -> rusqlite::Result<()> {
+        if let Some(value) = ctx.get::<Option<i64>>(0)?
+            && !acc.1
+        {
+            match acc.0.unwrap_or(0).checked_add(i128::from(value)) {
+                Some(sum) => acc.0 = Some(sum),
+                None => acc.1 = true,
+            }
+        }
+        Ok(())
+    }
+    fn finalize(
+        &self,
+        _: &mut rusqlite::functions::Context<'_>,
+        acc: Option<(Option<i128>, bool)>,
+    ) -> rusqlite::Result<Option<i64>> {
+        Ok(acc.and_then(|(value, overflow)| if overflow { None } else { value.and_then(|n| i64::try_from(n).ok()) }))
+    }
+}
+fn register_aggregates(conn: &Connection) -> Result<()> {
+    conn.create_aggregate_function(
+        "usage_sum",
+        1,
+        rusqlite::functions::FunctionFlags::SQLITE_UTF8 | rusqlite::functions::FunctionFlags::SQLITE_DETERMINISTIC,
+        CheckedSum,
+    )?;
+    Ok(())
+}
+const WRITER_SESSIONS_SCHEMA: &str = "CREATE TABLE usage_writer_sessions(id TEXT PRIMARY KEY,started_at_ms INTEGER NOT NULL,ended_at_ms INTEGER,clean INTEGER NOT NULL DEFAULT 0,dropped INTEGER NOT NULL DEFAULT 0,rejected INTEGER NOT NULL DEFAULT 0,writer_errors INTEGER NOT NULL DEFAULT 0,written INTEGER NOT NULL DEFAULT 0,last_commit_at_ms INTEGER NOT NULL DEFAULT 0);";
+static SESSION_SEQUENCE: AtomicU64 = AtomicU64::new(0);
+fn persist_health(conn: &Connection, id: &str, health: &Health) -> Result<()> {
+    conn.execute("UPDATE usage_writer_sessions SET dropped=?2,rejected=?3,writer_errors=?4,written=?5,last_commit_at_ms=?6 WHERE id=?1",params![id,health.dropped.load(Ordering::Relaxed),health.rejected.load(Ordering::Relaxed),health.errors.load(Ordering::Relaxed),health.written.load(Ordering::Relaxed),health.last_commit.load(Ordering::Relaxed)])?;
+    Ok(())
 }
 fn database_failure(error: &anyhow::Error) -> bool {
     error
@@ -120,38 +168,66 @@ impl Store {
             bail!("usage requires a persistent database path");
         }
         let mut conn = Connection::open(path).context("open usage database")?;
+        register_aggregates(&conn)?;
         conn.busy_timeout(std::time::Duration::from_secs(5))?;
         migrate(&mut conn)?;
         conn.execute_batch("PRAGMA journal_mode=WAL; PRAGMA synchronous=FULL; PRAGMA foreign_keys=ON;")?;
         conn.execute("INSERT INTO usage_meta(key,value) VALUES('catalogue',?1) ON CONFLICT(key) DO UPDATE SET value=excluded.value",[serde_json::to_string(&catalogue)?])?;
         conn.execute("INSERT INTO usage_meta(key,value) VALUES('retention_days',?1) ON CONFLICT(key) DO UPDATE SET value=excluded.value",[retention_days.to_string()])?;
-        let cutoff = Utc::now().timestamp_millis() - i64::from(retention_days) * 86_400_000;
+        let cutoff = (Utc::now().timestamp_millis() - i64::from(retention_days) * 86_400_000).max(0);
         purge_conn(&mut conn, cutoff)?;
         let (tx, mut rx) = mpsc::channel(queue_capacity);
-        let health = Arc::new(Health::default());
+        let (historical_dropped,historical_rejected,historical_errors,prior_unclosed):(u64,u64,u64,u64)=conn.query_row("SELECT COALESCE(SUM(dropped),0),COALESCE(SUM(rejected),0),COALESCE(SUM(writer_errors),0),COALESCE(SUM(clean=0),0) FROM usage_writer_sessions",[],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?)))?;
+        let session_id = hex::encode(Sha256::digest(
+            format!(
+                "{}:{}:{}",
+                Utc::now().timestamp_nanos_opt().unwrap_or_default(),
+                std::process::id(),
+                SESSION_SEQUENCE.fetch_add(1, Ordering::Relaxed)
+            )
+            .as_bytes(),
+        ));
+        conn.execute(
+            "INSERT INTO usage_writer_sessions(id,started_at_ms) VALUES(?1,?2)",
+            params![session_id, Utc::now().timestamp_millis()],
+        )?;
+        let health = Arc::new(Health {
+            historical_dropped,
+            historical_rejected,
+            historical_errors,
+            prior_unclosed,
+            ..Default::default()
+        });
         let worker_health = health.clone();
         let runtime = tokio::runtime::Builder::new_current_thread()
             .enable_time()
             .build()
             .context("initialize usage worker timer")?;
+        let worker_session = session_id.clone();
         std::thread::Builder::new()
             .name("fusebox-usage-db".into())
             .spawn(move || {
                 let mut last_retention = Utc::now().timestamp_millis();
                 loop {
                     let received = runtime
-                        .block_on(async { tokio::time::timeout(std::time::Duration::from_secs(60), rx.recv()).await });
+                        .block_on(async { tokio::time::timeout(std::time::Duration::from_secs(1), rx.recv()).await });
                     let command = match received {
                         Ok(Some(command)) => Some(command),
-                        Ok(None) => break,
+                        Ok(None) => {
+                            let _ = persist_health(&conn, &worker_session, &worker_health);
+                            break;
+                        }
                         Err(_) => None,
                     };
                     let now = Utc::now().timestamp_millis();
                     if now - last_retention >= 3_600_000 {
-                        if let Err(e) = purge_conn(&mut conn, now - i64::from(retention_days) * 86_400_000) {
+                        if let Err(e) = purge_conn(&mut conn, (now - i64::from(retention_days) * 86_400_000).max(0)) {
                             worker_health.fail(&e);
                         }
                         last_retention = now;
+                    }
+                    if let Err(e) = persist_health(&conn, &worker_session, &worker_health) {
+                        worker_health.fail(&e);
                     }
                     let Some(command) = command else {
                         continue;
@@ -187,6 +263,9 @@ impl Store {
                                     worker_health.fail(&e);
                                 }
                             }
+                            if let Err(e) = persist_health(&conn, &worker_session, &worker_health) {
+                                worker_health.fail(&e);
+                            }
                             if let Some(Command::Call(f)) = pending {
                                 f(&mut conn);
                             }
@@ -195,9 +274,26 @@ impl Store {
                 }
             })
             .context("start usage database worker")?;
-        Ok(Self { tx, health, path: Arc::new(path.to_path_buf()), read_slots: Arc::new(Semaphore::new(4)) })
+        Ok(Self {
+            tx,
+            health,
+            path: Arc::new(path.to_path_buf()),
+            read_slots: Arc::new(Semaphore::new(4)),
+            shutdown_result: Arc::new(OnceCell::new()),
+            session_id: Arc::new(session_id),
+        })
     }
     pub fn enqueue(&self, observation: Observation) -> bool {
+        if self.health.closed.load(Ordering::Acquire) {
+            return false;
+        }
+        let Ok(_guard) = self.health.gate.try_lock() else {
+            self.health.dropped.fetch_add(1, Ordering::Relaxed);
+            return false;
+        };
+        if self.health.closed.load(Ordering::Acquire) {
+            return false;
+        }
         if observation.validate().is_err() {
             self.health.rejected.fetch_add(1, Ordering::Relaxed);
             return false;
@@ -214,6 +310,16 @@ impl Store {
         }
     }
     pub async fn call<F, R>(&self, f: F) -> Result<R>
+    where
+        F: FnOnce(&mut Connection) -> Result<R> + Send + 'static,
+        R: Send + 'static,
+    {
+        if self.health.closed.load(Ordering::Acquire) {
+            bail!("usage writer has shut down");
+        }
+        self.call_internal(f).await
+    }
+    async fn call_internal<F, R>(&self, f: F) -> Result<R>
     where
         F: FnOnce(&mut Connection) -> Result<R> + Send + 'static,
         R: Send + 'static,
@@ -248,6 +354,32 @@ impl Store {
             .map_err(|_| anyhow!("usage writer stopped"))?;
         rx.await.context("usage writer dropped transaction reply")?
     }
+    /// Close observation ingress, drain prior commands durably, then mark this writer
+    /// clean. Concurrent shutdown callers share the same acknowledged result.
+    pub async fn shutdown(&self) -> Result<()> {
+        let result = self
+            .shutdown_result
+            .get_or_init(|| async {
+                {
+                    let _gate = self.health.gate.lock().unwrap();
+                    self.health.closed.store(true, Ordering::Release);
+                }
+                let id = self.session_id.clone();
+                let health = self.health.clone();
+                self.call_internal(move |conn| {
+                    persist_health(conn, &id, &health)?;
+                    conn.execute(
+                        "UPDATE usage_writer_sessions SET clean=1,ended_at_ms=?2 WHERE id=?1",
+                        params![id.as_str(), Utc::now().timestamp_millis()],
+                    )?;
+                    Ok(())
+                })
+                .await
+                .map_err(|e| e.to_string())
+            })
+            .await;
+        result.clone().map_err(|e| anyhow!(e))
+    }
     pub async fn flush(&self) -> Result<()> {
         self.call(|conn| {
             conn.execute_batch("PRAGMA wal_checkpoint(PASSIVE)")?;
@@ -261,7 +393,7 @@ impl Store {
     }
     pub fn health(&self) -> Value {
         let error = self.health.error.lock().unwrap().clone();
-        json!({"state":if self.tx.is_closed(){"stopped"}else if error.is_some() || self.health.dropped.load(Ordering::Relaxed)>0{"degraded"}else{"healthy"},"message":error,"queue_depth":self.tx.max_capacity()-self.tx.capacity(),"queue_capacity":self.tx.max_capacity(),"dropped":self.health.dropped.load(Ordering::Relaxed),"rejected":self.health.rejected.load(Ordering::Relaxed),"accepted":self.health.accepted.load(Ordering::Relaxed),"written":self.health.written.load(Ordering::Relaxed),"writer_errors":self.health.errors.load(Ordering::Relaxed),"last_commit_at_ms":self.health.last_commit.load(Ordering::Relaxed),"durability":"enqueued observations become durable at committed transaction; queued plus current batch are crash-loss bound"})
+        json!({"state":if self.tx.is_closed() || self.health.closed.load(Ordering::Acquire){"stopped"}else if error.is_some() || self.health.dropped.load(Ordering::Relaxed)>0 || self.health.rejected.load(Ordering::Relaxed)>0 || self.health.historical_dropped>0 || self.health.historical_rejected>0 || self.health.historical_errors>0 || self.health.prior_unclosed>0{"degraded"}else{"healthy"},"message":error,"session_id":self.session_id.as_str(),"historical_gap":{"dropped":self.health.historical_dropped,"rejected":self.health.historical_rejected,"writer_errors":self.health.historical_errors},"prior_unclosed_sessions":self.health.prior_unclosed,"recovery_warning":if self.health.prior_unclosed>0{Some("Previous unclosed writer sessions may represent concurrent writers or an unclean shutdown; queued observations may be missing.")}else{None},"counter_scope":"dropped/rejected/writer_errors describe this writer; historical_gap describes earlier sessions; counters persist best effort between commands and on a one-second idle timer; busy transactions or disk failure can delay persistence", "queue_depth":self.tx.max_capacity()-self.tx.capacity(),"queue_capacity":self.tx.max_capacity(),"dropped":self.health.dropped.load(Ordering::Relaxed),"rejected":self.health.rejected.load(Ordering::Relaxed),"accepted":self.health.accepted.load(Ordering::Relaxed),"written":self.health.written.load(Ordering::Relaxed),"writer_errors":self.health.errors.load(Ordering::Relaxed),"last_commit_at_ms":self.health.last_commit.load(Ordering::Relaxed),"durability":"enqueued observations become durable at committed transaction; queued plus current batch are crash-loss bound"})
     }
     async fn read<F, R>(&self, f: F) -> Result<R>
     where
@@ -280,6 +412,7 @@ impl Store {
                     path.as_path(),
                     rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
                 )?;
+                register_aggregates(&conn)?;
                 conn.busy_timeout(std::time::Duration::from_secs(5))?;
                 conn.execute_batch("PRAGMA query_only=ON; BEGIN;")?;
                 f(&mut conn)
@@ -310,10 +443,20 @@ fn migrate(conn: &mut Connection) -> Result<()> {
     if application_id != 0 && application_id != APPLICATION_ID {
         bail!("database belongs to another application");
     }
+    if version > 0 && application_id != APPLICATION_ID {
+        bail!("versioned usage database has an invalid application identity");
+    }
     if version > VERSION {
         bail!("usage database schema {version} is newer than supported {VERSION}");
     }
     if version == VERSION {
+        return Ok(());
+    }
+    if version == 1 {
+        let tx = conn.transaction()?;
+        tx.execute_batch(WRITER_SESSIONS_SCHEMA)?;
+        tx.pragma_update(None, "user_version", VERSION)?;
+        tx.commit()?;
         return Ok(());
     }
     if version != 0 {
@@ -354,6 +497,8 @@ fn migrate(conn: &mut Connection) -> Result<()> {
     CREATE INDEX usage_source_entries_event_time ON usage_source_entries(event_at_ms);
     CREATE INDEX usage_source_entries_filters ON usage_source_entries(provider,model,account_id,client_id,event_at_ms);
     PRAGMA user_version=1; PRAGMA application_id=1179996997;"))?;
+    tx.execute_batch(WRITER_SESSIONS_SCHEMA)?;
+    tx.pragma_update(None, "user_version", VERSION)?;
     tx.commit()?;
     Ok(())
 }
@@ -412,7 +557,7 @@ pub fn insert_batch(conn: &mut Connection, observations: &[Observation]) -> Resu
         } else {
             2
         };
-        let changed=tx.prepare_cached("INSERT OR IGNORE INTO usage_observations(source,origin_id,source_event_id,fingerprint,canonical_key,association_key,trust_rank,event_at_ms,ingested_at_ms,provider,model,account_id,client_id,logical_request_id,attempt_id,response_id,completeness,known_fields,input,cache_read,cache_write,write_5m,write_1h,output,reasoning,cost_nanos,pricing_basis,catalogue_version,snapshot_json,payload) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19,?20,?21,?22,?23,?24,?25,?26,?27,?28,?29,?30)")?.execute(params![o.source,o.origin_id,o.source_event_id,fingerprint,canonical_key(o),association_key(o),rank,o.event_at_ms,Utc::now().timestamp_millis(),o.provider,o.actual_model.as_ref().or(o.requested_model.as_ref()),o.account_id,o.client_id,o.logical_request_id,o.attempt_id,o.response_id,o.completeness,known as i64,tokens.input,tokens.cache_read,tokens.cache_write,tokens.write_5m,tokens.write_1h,tokens.output,tokens.reasoning,snapshot.cost_nanos,snapshot.basis,snapshot.catalogue_version,serde_json::to_string(&snapshot)?,serde_json::to_string(o)?])?;
+        let changed=tx.prepare_cached("INSERT OR IGNORE INTO usage_observations(source,origin_id,source_event_id,fingerprint,canonical_key,association_key,trust_rank,event_at_ms,ingested_at_ms,provider,model,account_id,client_id,logical_request_id,attempt_id,response_id,completeness,known_fields,input,cache_read,cache_write,write_5m,write_1h,output,reasoning,cost_nanos,pricing_basis,catalogue_version,snapshot_json,payload) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19,?20,?21,?22,?23,?24,?25,?26,?27,?28,?29,?30)")?.execute(params![o.source,o.origin_id,o.source_event_id,fingerprint,canonical_key(o),association_key(o),rank,o.event_at_ms,Utc::now().timestamp_millis(),o.provider,o.actual_model.as_ref(),o.account_id,o.client_id,o.logical_request_id,o.attempt_id,o.response_id,o.completeness,known as i64,tokens.input,tokens.cache_read,tokens.cache_write,tokens.write_5m,tokens.write_1h,tokens.output,tokens.reasoning,snapshot.cost_nanos,snapshot.basis,snapshot.catalogue_version,serde_json::to_string(&snapshot)?,serde_json::to_string(o)?])?;
         if changed > 0 {
             changed_groups.insert((canonical_key(o), o.source.clone()));
             inserted += 1;
@@ -566,7 +711,7 @@ fn filter(q: &Query, r: &Range, alias: &str) -> (String, Vec<SqlValue>) {
     }
     (sql, values)
 }
-const AGG: &str = "COUNT(*),COUNT(DISTINCT logical_request_id),COUNT(DISTINCT COALESCE(attempt_id,source||':'||source_event_id)),SUM(cost_nanos),SUM(cost_nanos IS NULL),SUM(completeness='partial'),SUM(completeness='missing'),SUM(input),SUM(cache_read),SUM(cache_write),SUM(write_5m),SUM(write_1h),SUM(output),SUM(reasoning),SUM(input IS NULL),SUM(cache_read IS NULL),SUM(cache_write IS NULL),SUM(output IS NULL),SUM(reasoning IS NULL),SUM(pricing_partial=1),SUM(logical_request_id IS NULL)";
+const AGG: &str = "COUNT(*),COUNT(DISTINCT logical_request_id),COUNT(DISTINCT COALESCE(attempt_id,source||':'||source_event_id)),usage_sum(cost_nanos),SUM(cost_nanos IS NULL),SUM(completeness='partial'),SUM(completeness='missing'),usage_sum(input),usage_sum(cache_read),usage_sum(cache_write),usage_sum(write_5m),usage_sum(write_1h),usage_sum(output),usage_sum(reasoning),SUM(input IS NULL),SUM(cache_read IS NULL),SUM(cache_write IS NULL),SUM(output IS NULL),SUM(reasoning IS NULL),SUM(pricing_partial=1),SUM(logical_request_id IS NULL),COUNT(cost_nanos),COUNT(input),COUNT(cache_read),COUNT(cache_write),COUNT(write_5m),COUNT(write_1h),COUNT(output),COUNT(reasoning)";
 fn aggregate(conn: &Connection, table: &str, where_sql: &str, values: &[SqlValue]) -> Result<Value> {
     Ok(conn.query_row(
         &format!("SELECT {AGG} FROM {table} o INDEXED BY {table}_event_time WHERE {where_sql}"),
@@ -576,7 +721,7 @@ fn aggregate(conn: &Connection, table: &str, where_sql: &str, values: &[SqlValue
 }
 fn aggregate_row(row: &rusqlite::Row<'_>, offset: usize) -> rusqlite::Result<Value> {
     let mut nums = Vec::new();
-    for i in 0..21 {
+    for i in 0..29 {
         nums.push(row.get::<_, Option<i64>>(i + offset)?);
     }
     let mut tokens = serde_json::Map::new();
@@ -585,8 +730,27 @@ fn aggregate_row(row: &rusqlite::Row<'_>, offset: usize) -> rusqlite::Result<Val
     {
         tokens.insert((*name).into(), json!(nums[7 + i]));
     }
+    let mut overflow_fields = Vec::new();
+    for (i, (name, sum_index)) in [
+        ("estimated_cost_nanos", 3),
+        ("input", 7),
+        ("cache_read", 8),
+        ("cache_write", 9),
+        ("write_5m", 10),
+        ("write_1h", 11),
+        ("output", 12),
+        ("reasoning", 13),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        if nums[21 + i].unwrap_or(0) > 0 && nums[sum_index].is_none() {
+            overflow_fields.push(name);
+        }
+    }
+    let known_cost = if overflow_fields.contains(&"estimated_cost_nanos") { None } else { Some(nums[3].unwrap_or(0)) };
     Ok(
-        json!({"observations":nums[0].unwrap_or(0),"logical_requests":nums[1].unwrap_or(0),"attempts":nums[2].unwrap_or(0),"estimated_cost_nanos":nums[3],"known_cost_nanos":nums[3].unwrap_or(0),"unpriced":nums[4].unwrap_or(0),"partial":nums[5].unwrap_or(0),"missing_usage":nums[6].unwrap_or(0),"tokens":tokens,"pricing_partial":nums[19].unwrap_or(0),"logical_requests_unknown":nums[20].unwrap_or(0),"missing_token_counts":{"input":nums[14].unwrap_or(0),"cache_read":nums[15].unwrap_or(0),"cache_write":nums[16].unwrap_or(0),"output":nums[17].unwrap_or(0),"reasoning":nums[18].unwrap_or(0)}}),
+        json!({"observations":nums[0].unwrap_or(0),"logical_requests":nums[1].unwrap_or(0),"attempts":nums[2].unwrap_or(0),"estimated_cost_nanos":nums[3],"known_cost_nanos":known_cost,"aggregation_overflow":!overflow_fields.is_empty(),"aggregation_overflow_fields":overflow_fields,"unpriced":nums[4].unwrap_or(0),"partial":nums[5].unwrap_or(0),"missing_usage":nums[6].unwrap_or(0),"tokens":tokens,"pricing_partial":nums[19].unwrap_or(0),"logical_requests_unknown":nums[20].unwrap_or(0),"missing_token_counts":{"input":nums[14].unwrap_or(0),"cache_read":nums[15].unwrap_or(0),"cache_write":nums[16].unwrap_or(0),"output":nums[17].unwrap_or(0),"reasoning":nums[18].unwrap_or(0)}}),
     )
 }
 fn local_date_expression(r: &Range) -> Result<String> {
@@ -625,10 +789,28 @@ fn local_date_expression(r: &Range) -> Result<String> {
     Ok(format!("strftime('%Y-%m-%d',o.event_at_ms/1000+({offset_sql}),'unixepoch')"))
 }
 
+// Request lifecycle identities belong to the raw proxy journal. Canonical charge
+// selection may merge an idempotent provider replay without merging client requests.
+const REQUEST_COUNTS: &str = "COUNT(DISTINCT NULLIF(logical_request_id,'')),COUNT(DISTINCT NULLIF(attempt_id,'')),COUNT(DISTINCT CASE WHEN logical_request_id IS NULL OR logical_request_id='' THEN json_array(origin_id,source_event_id) END),COUNT(DISTINCT CASE WHEN attempt_id IS NULL OR attempt_id='' THEN json_array(origin_id,source_event_id) END)";
+fn request_counts_row(row: &rusqlite::Row<'_>, offset: usize) -> rusqlite::Result<Value> {
+    Ok(
+        json!({"logical_requests":row.get::<_,i64>(offset)?,"attempts":row.get::<_,i64>(offset+1)?,"logical_requests_unknown":row.get::<_,i64>(offset+2)?,"attempts_unknown":row.get::<_,i64>(offset+3)?}),
+    )
+}
+fn raw_proxy_counts(conn: &Connection, where_sql: &str, values: &[SqlValue]) -> Result<Value> {
+    Ok(conn.query_row(&format!("SELECT {REQUEST_COUNTS} FROM usage_observations o INDEXED BY usage_event_time WHERE {where_sql} AND o.source='proxy'"),rusqlite::params_from_iter(values),|row|request_counts_row(row,0))?)
+}
+fn apply_request_counts(value: &mut Value, counts: &Value) {
+    for key in ["logical_requests", "attempts", "logical_requests_unknown", "attempts_unknown"] {
+        value[key] = counts[key].clone();
+    }
+}
 fn summary(conn: &mut Connection, q: &Query) -> Result<Value> {
     let r = range(q)?;
     let (where_sql, values) = filter(q, &r, "o");
     let mut proxy = aggregate(conn, "usage_entries", &format!("{where_sql} AND o.source='proxy'"), &values)?;
+    let request_counts = raw_proxy_counts(conn, &where_sql, &values)?;
+    apply_request_counts(&mut proxy, &request_counts);
     let conflicts:i64=conn.query_row(&format!("SELECT COUNT(*) FROM usage_entries o INDEXED BY usage_entries_event_time WHERE {where_sql} AND o.source='proxy' AND EXISTS(SELECT 1 FROM usage_observations x WHERE x.association_key=o.association_key AND ((x.model IS NOT NULL AND o.model IS NOT NULL AND x.model<>o.model) OR (x.account_id IS NOT NULL AND o.account_id IS NOT NULL AND x.account_id<>o.account_id) OR (x.input IS NOT NULL AND o.input IS NOT NULL AND x.input<>o.input) OR (x.cache_read IS NOT NULL AND o.cache_read IS NOT NULL AND x.cache_read<>o.cache_read) OR (x.cache_write IS NOT NULL AND o.cache_write IS NOT NULL AND x.cache_write<>o.cache_write) OR (x.output IS NOT NULL AND o.output IS NOT NULL AND x.output<>o.output)))"),rusqlite::params_from_iter(&values),|row|row.get(0))?;
     proxy["conflicts"] = json!(conflicts);
     let mut sources = Vec::new();
@@ -645,6 +827,9 @@ fn summary(conn: &mut Connection, q: &Query) -> Result<Value> {
             |row| row.get(0),
         )?;
         let source_conflicts:i64=conn.query_row(&format!("SELECT COUNT(*) FROM usage_source_entries o INDEXED BY usage_source_entries_event_time WHERE {where_sql} AND o.source=? AND EXISTS(SELECT 1 FROM usage_observations x INDEXED BY usage_association WHERE x.association_key=o.association_key AND x.source=o.source AND ((x.model IS NOT NULL AND o.model IS NOT NULL AND x.model<>o.model) OR (x.account_id IS NOT NULL AND o.account_id IS NOT NULL AND x.account_id<>o.account_id) OR (x.input IS NOT NULL AND o.input IS NOT NULL AND x.input<>o.input) OR (x.cache_read IS NOT NULL AND o.cache_read IS NOT NULL AND x.cache_read<>o.cache_read) OR (x.cache_write IS NOT NULL AND o.cache_write IS NOT NULL AND x.cache_write<>o.cache_write) OR (x.output IS NOT NULL AND o.output IS NOT NULL AND x.output<>o.output)))"),rusqlite::params_from_iter(&source_values),|row|row.get(0))?;
+        if source == "proxy" {
+            apply_request_counts(&mut totals, &request_counts);
+        }
         totals["conflicts"] = json!(source_conflicts);
         totals["source"] = json!(source);
         totals["source_record_count"] = json!(records);
@@ -665,6 +850,38 @@ fn summary(conn: &mut Connection, q: &Query) -> Result<Value> {
     for row in rows {
         trend.push(row?);
     }
+    let mut proxy_days = std::collections::BTreeMap::new();
+    {
+        let mut statement=conn.prepare(&format!("SELECT {date_expression},{REQUEST_COUNTS} FROM usage_observations o INDEXED BY usage_event_time WHERE {where_sql} AND o.source='proxy' GROUP BY 1 ORDER BY 1 LIMIT 3660"))?;
+        let rows = statement.query_map(rusqlite::params_from_iter(&values), |row| {
+            Ok((row.get::<_, String>(0)?, request_counts_row(row, 1)?))
+        })?;
+        for row in rows {
+            let (date, counts) = row?;
+            proxy_days.insert(date, counts);
+        }
+    }
+    for day in &mut trend {
+        if day["source"] == "proxy"
+            && let Some(counts) = proxy_days.get(day["date"].as_str().unwrap_or(""))
+        {
+            apply_request_counts(day, counts);
+        }
+    }
+    // A replay can fall on a later local day than its selected charge. Preserve the
+    // lifecycle-only day even when canonical accounting has no entry for that day.
+    for (date, counts) in proxy_days {
+        if !trend.iter().any(|day| day["source"] == "proxy" && day["date"] == date) {
+            let mut empty = aggregate(conn, "usage_source_entries", "0", &[])?;
+            empty["date"] = json!(date);
+            empty["source"] = json!("proxy");
+            apply_request_counts(&mut empty, &counts);
+            trend.push(empty);
+        }
+    }
+    trend.sort_by(|a, b| {
+        a["date"].as_str().cmp(&b["date"].as_str()).then(a["source"].as_str().cmp(&b["source"].as_str()))
+    });
     let mut breakdowns = serde_json::Map::new();
     for (name, column) in
         [("provider", "provider"), ("model", "model"), ("account", "account_id"), ("client", "client_id")]
@@ -679,6 +896,22 @@ fn summary(conn: &mut Connection, q: &Query) -> Result<Value> {
         let mut out = Vec::new();
         for row in rows {
             out.push(row?);
+        }
+        let mut raw_statement=conn.prepare(&format!("SELECT o.{column},{REQUEST_COUNTS} FROM usage_observations o INDEXED BY usage_event_time WHERE {where_sql} AND o.source='proxy' GROUP BY 1 ORDER BY COUNT(*) DESC,1 LIMIT 500"))?;
+        let rows = raw_statement.query_map(rusqlite::params_from_iter(&values), |row| {
+            Ok((row.get::<_, Option<String>>(0)?, request_counts_row(row, 1)?))
+        })?;
+        for row in rows {
+            let (id, counts) = row?;
+            if let Some(group) = out.iter_mut().find(|v| v["source"] == "proxy" && v["id"] == json!(id)) {
+                apply_request_counts(group, &counts);
+            } else {
+                let mut group = aggregate(conn, "usage_source_entries", "0", &[])?;
+                group["id"] = json!(id);
+                group["source"] = json!("proxy");
+                apply_request_counts(&mut group, &counts);
+                out.push(group);
+            }
         }
         breakdowns.insert(name.into(), json!(out));
     }

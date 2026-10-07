@@ -126,6 +126,7 @@ async fn bounds_and_dst() {
     o.tokens.output = Some(1);
     assert!(!store.enqueue(o));
     assert_eq!(store.health()["rejected"], 1);
+    assert_eq!(store.health()["state"], "degraded");
     assert!(store.query(Query { timezone: Some("Nope".into()), ..Default::default() }).await.is_err());
     let q = Query {
         start: Some("2026-03-29".into()),
@@ -157,7 +158,7 @@ async fn disk_failure_visible_and_migration_fail_closed() {
         .unwrap();
     assert!(store.enqueue(event("proxy", "lost")));
     assert!(store.flush().await.is_err());
-    assert_eq!(store.health()["writer_errors"], 1);
+    assert!(store.health()["writer_errors"].as_u64().unwrap() >= 1);
     assert_eq!(store.health()["dropped"], 1);
     let p = path("version");
     let c = Connection::open(&p).unwrap();
@@ -229,7 +230,7 @@ fn overflow_missing_unsupported_regions_tools_and_catalogue_validation() {
     a.inference_geo = Some("unknown".into());
     assert_eq!(c.price(&a).basis, "unsupported_inference_region");
     a.inference_geo = None;
-    a.service_tier = Some("priority".into());
+    a.service_tier = Some("unverified-contract-tier".into());
     assert_eq!(c.price(&a).basis, "unsupported_service_tier");
     a.service_tier = None;
     a.numeric_metadata.insert("image_tokens".into(), 1);
@@ -273,7 +274,6 @@ async fn ingestion_metadata_only_and_price_snapshot_immutable() {
     assert!(serde_json::from_value::<Observation>(invalid).is_err());
 }
 #[tokio::test]
-#[ignore = "synthetic performance measurement, run explicitly"]
 async fn generated_history_measurement() {
     let p = path("performance");
     let store = Store::open(&p, 1024, 90, None).unwrap();
@@ -412,4 +412,146 @@ async fn distinct_known_accounts_never_collapse_shared_response_claim() {
     let value = store.query(all()).await.unwrap();
     assert_eq!(value["proxy"]["observations"], 2);
     assert_eq!(value["proxy"]["conflicts"], 2);
+}
+#[tokio::test]
+async fn logical_requests_and_attempts_are_independent_of_replayed_charges() {
+    let store = Store::open(&path("lifecycle"), 8, 90, None).unwrap();
+    let mut a = event("proxy", "first-client");
+    a.response_id = Some("idempotent-response".into());
+    a.account_id = Some("same-account".into());
+    a.logical_request_id = Some("logical-one".into());
+    a.attempt_id = Some("attempt-one".into());
+    let mut b = a.clone();
+    b.source_event_id = "second-client".into();
+    b.logical_request_id = Some("logical-two".into());
+    b.attempt_id = Some("attempt-two".into());
+    store.call(move |c| insert_batch(c, &[a, b])).await.unwrap();
+    let value = store.query(all()).await.unwrap();
+    assert_eq!(value["proxy"]["observations"], 1);
+    assert_eq!(value["proxy"]["tokens"]["input"], 1000);
+    assert_eq!(value["proxy"]["logical_requests"], 2);
+    assert_eq!(value["proxy"]["attempts"], 2);
+    assert_eq!(value["sources"][0]["logical_requests"], 2);
+    assert_eq!(value["trend"][0]["logical_requests"], 2);
+    assert_eq!(value["trend"][0]["attempts"], 2);
+    let mut a = event("proxy", "retry-one");
+    a.response_id = Some("retry-response-one".into());
+    a.logical_request_id = Some("logical-retry".into());
+    a.attempt_id = Some("retry-attempt-one".into());
+    let mut b = a.clone();
+    b.source_event_id = "retry-two".into();
+    b.response_id = Some("retry-response-two".into());
+    b.attempt_id = Some("retry-attempt-two".into());
+    store.call(move |c| insert_batch(c, &[a, b])).await.unwrap();
+    let value = store.query(all()).await.unwrap();
+    assert_eq!(value["proxy"]["observations"], 3);
+    assert_eq!(value["proxy"]["logical_requests"], 3);
+    assert_eq!(value["proxy"]["attempts"], 4);
+    assert_eq!(value["proxy"]["tokens"]["input"], 3000);
+}
+#[tokio::test]
+async fn replay_lifecycle_counts_respect_raw_date_and_client_filters() {
+    let store = Store::open(&path("lifecycle-range"), 8, 90, None).unwrap();
+    let mut a = event("proxy", "first-day");
+    a.response_id = Some("shared-response".into());
+    a.account_id = Some("same-account".into());
+    a.logical_request_id = Some("one".into());
+    a.attempt_id = Some("one".into());
+    a.client_id = Some("client-one".into());
+    a.event_at_ms = boundary("2026-10-05T10:00:00Z", chrono_tz::UTC).unwrap();
+    let mut b = a.clone();
+    b.source_event_id = "second-day".into();
+    b.logical_request_id = Some("two".into());
+    b.attempt_id = Some("two".into());
+    b.client_id = Some("client-two".into());
+    b.event_at_ms = boundary("2026-10-06T10:00:00Z", chrono_tz::UTC).unwrap();
+    store.call(move |c| insert_batch(c, &[a, b])).await.unwrap();
+    let value = store.query(all()).await.unwrap();
+    assert_eq!(value["trend"].as_array().unwrap().len(), 2);
+    for day in value["trend"].as_array().unwrap() {
+        assert_eq!(day["logical_requests"], 1);
+        assert_eq!(day["attempts"], 1);
+    }
+    let value = store.query(Query { client: Some("client-two".into()), ..all() }).await.unwrap();
+    assert_eq!(value["proxy"]["logical_requests"], 1);
+    assert_eq!(value["proxy"]["attempts"], 1);
+    let mut unknown = event("proxy", "unknown");
+    unknown.logical_request_id = None;
+    unknown.attempt_id = None;
+    store.call(move |c| insert_batch(c, &[unknown.clone(), unknown])).await.unwrap();
+    let value = store.query(all()).await.unwrap();
+    assert_eq!(value["proxy"]["logical_requests_unknown"], 1);
+    assert_eq!(value["proxy"]["attempts_unknown"], 1);
+    assert_eq!(value["proxy"]["attempts"], 2);
+}
+#[tokio::test]
+async fn durable_gaps_and_unclean_or_concurrent_sessions_survive_restart() {
+    let p = path("durable-gaps");
+    let store = Store::open(&p, 1, 90, None).unwrap();
+    let (started_tx, started_rx) = oneshot::channel();
+    let (release_tx, release_rx) = std::sync::mpsc::channel();
+    let blocker = store.clone();
+    let task = tokio::spawn(async move {
+        blocker
+            .call(move |_| {
+                started_tx.send(()).unwrap();
+                release_rx.recv().unwrap();
+                Ok(())
+            })
+            .await
+            .unwrap();
+    });
+    started_rx.await.unwrap();
+    assert!(store.enqueue(event("proxy", "accepted")));
+    assert!(!store.enqueue(event("proxy", "dropped")));
+    release_tx.send(()).unwrap();
+    task.await.unwrap();
+    store.flush().await.unwrap();
+    let concurrent = Store::open_existing(&p, 8).unwrap();
+    assert_eq!(concurrent.health()["historical_gap"]["dropped"], 1);
+    assert!(concurrent.health()["recovery_warning"].as_str().unwrap().contains("concurrent"));
+    concurrent.shutdown().await.unwrap();
+    store.shutdown().await.unwrap();
+    assert!(!store.enqueue(event("proxy", "after-shutdown")));
+    store.shutdown().await.unwrap();
+    let reopened = Store::open_existing(&p, 8).unwrap();
+    assert_eq!(reopened.health()["historical_gap"]["dropped"], 1);
+    assert!(reopened.health()["recovery_warning"].is_null());
+    assert_eq!(reopened.health()["state"], "degraded");
+    reopened.shutdown().await.unwrap();
+    let clean = path("clean-shutdown");
+    let store = Store::open(&clean, 8, 90, None).unwrap();
+    assert!(store.enqueue(event("proxy", "a")));
+    store.shutdown().await.unwrap();
+    let reopened = Store::open_existing(&clean, 8).unwrap();
+    assert!(reopened.health()["recovery_warning"].is_null());
+    assert_eq!(reopened.health()["state"], "healthy");
+    reopened.shutdown().await.unwrap();
+}
+#[tokio::test]
+async fn large_exact_integer_cost_overflow_returns_explicit_null() {
+    let store = Store::open(&path("aggregate-overflow"), 8, 90, None).unwrap();
+    let records = (0..200)
+        .map(|i| {
+            let mut o = event("codex", &i.to_string());
+            o.actual_model = Some("gpt-6-astra".into());
+            o.tokens.input = Some(0);
+            o.tokens.cache_read = Some(0);
+            o.tokens.output = Some(1_000_000_000_000);
+            o.tokens.reasoning = Some(0);
+            o
+        })
+        .collect::<Vec<_>>();
+    store.call(move |c| insert_batch(c, &records)).await.unwrap();
+    let value = store.query(all()).await.unwrap();
+    let source = &value["sources"][2];
+    assert_eq!(source["observations"], 200);
+    assert_eq!(source["unpriced"], 0);
+    assert_eq!(source["aggregation_overflow"], true);
+    assert!(source["estimated_cost_nanos"].is_null());
+    assert!(source["known_cost_nanos"].is_null());
+    assert_eq!(source["tokens"]["output"], 200_000_000_000_000_u64);
+    assert_eq!(store.details(all()).await.unwrap()["total"], 200);
+    assert_eq!(store.health()["writer_errors"], 0);
+    store.shutdown().await.unwrap();
 }
