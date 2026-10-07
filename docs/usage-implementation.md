@@ -1,64 +1,79 @@
-# Usage & Costs implementation record
+# Usage and Costs implementation record
 
-Baseline: `4a81fe3` (user's prior work committed on main). Feature: `feature/usage-costs`.
-Local implementation only; synthetic histories/mock upstreams; no existing service restarts.
+Baseline: `4a81fe3` preserved the prior uncommitted work on local `main`, as requested. Implementation is on local `feature/usage-costs`; no push, merge, deployment, or existing service restart was performed. This record tracks implementation and verification separately; the root agent owns final acceptance results.
 
-## Acceptance checklist
+## Implementation checklist
 
-- [x] Inspect product/design, auth, CLI, request lifecycle, storage, dashboard and tests.
-- [x] Discover runtime: Codex CLI 0.160.1; native collaboration.spawn_agent supports explicit model/effort.
-- [x] Define source observation/token contracts and ownership before concurrent implementation.
-- [ ] Persistent SQLite storage/migrations, deterministic reconciliation, bounded writer and health.
-- [ ] Versioned local pricing, explicit unknowns and source-separated estimates.
-- [ ] Proxy HTTP/stream/WS/retry/compaction integration and named authenticated clients.
-- [ ] Opt-in Claude Code/Codex imports, checkpoints/idempotency and sanitized fixtures.
-- [ ] Standalone collector enrollment, durable outbox, authenticated bounded ingestion and status.
-- [ ] Management APIs, server aggregates, timezone ranges, exports, retention.
-- [ ] Embedded Usage page with imports/collectors, quota separation and privacy states.
-- [ ] Independent review, regression fixes, backend/browser/process acceptance and performance evidence.
-- [ ] Format, clippy, tests, release build, documentation and local commits.
+- [x] Map request, streaming, WebSocket, media, auth, persistence, dashboard, CLI and config paths.
+- [x] Define a strict metadata-only observation contract and source/token provenance.
+- [x] Add versioned SQLite storage, migrations, deterministic reconciliation, pricing snapshots, bounded writes, health counters, retention and query/export APIs.
+- [x] Capture proxy HTTP/stream/WebSocket/retry/media usage and add named inference client attribution.
+- [x] Add explicitly enabled Claude Code and Codex imports with parser checkpoints and idempotent ingestion.
+- [x] Add standalone collectors with one-time enrollment credentials, durable local outbox and authenticated bounded ingestion.
+- [x] Add management APIs and the embedded Usage view while keeping provider subscription quota reporting separate.
+- [x] Document configuration, source coverage, pricing limits, imports, collectors, privacy, retention, backup and recovery.
+- [x] Final independent review, regression fixes, full checks and performance acceptance report.
 
-## Orchestration evidence
+Final executed evidence is recorded in [usage-verification.md](usage-verification.md), with measured release results in [usage-benchmark-results.json](usage-benchmark-results.json).
 
-Root runtime: GPT-6 Astra / ultra (runtime supplied). Local user config selects gpt-6.1-sol / max with cliproxyapi provider; no custom agents/profiles were found in inspected config. This is not evidence of worker effective model selection. Available native overrides: gpt-6.1-sol, gpt-6-astra, gpt-6-sol, gpt-6-luna, gpt-5.6-sol; effort values from tool schema. Workers never recursively delegate. Maximum three workers. Each implementation worktree starts at the agreed contract commit; root alone integrates. Requested settings recorded below; effective settings unverified unless runtime reports them.
+## Orchestration record
+
+Runtime discovery: installed Codex CLI `0.160.1`; native `collaboration.spawn_agent` exposes supported model and effort overrides. Root runtime is GPT-6 Astra / ultra. Inspected local configuration selected `gpt-6.1-sol` / max through `cliproxyapi`, with no custom agent profiles found; configuration was unchanged. Available overrides included GPT-6.1 Sol, GPT-6 Astra, GPT-6 Sol, GPT-6 Luna, and GPT-5.6 Sol. Implementation workers used separate worktrees rooted at the shared contract baseline; root alone cherry-picked and integrated changes. Later bounded fixes used explicit file ownership. At most three workers ran concurrently, with no recursive delegation.
+
+Worker effective models and effort are not exposed authoritatively in this session. Requested settings are recorded where known; every effective value remains **unverified**.
 
 | Worker | Assignment | Requested model / effort | Effective |
 |---|---|---|---|
-| map | Read-only repository map | gpt-6-luna / high | unverified |
-| formats_research | Official formats/pricing research | gpt-6.1-sol / high | unverified |
+| map | Repository mapping and usage documentation | gpt-6-luna / high | unverified |
+| formats_research | Official format/pricing research, importers and collectors | gpt-6.1-sol / high | unverified |
+| store | SQLite, reconciliation, pricing, persistence regressions | gpt-6.1-sol / high | unverified |
+| dashboard | Embedded dashboard and JavaScript tests | gpt-6.1-sol / high | unverified |
+| review | Independent accounting/security/failure review | gpt-6-astra / xhigh | unverified |
 
-## Baseline coverage matrix
+The baseline coverage was 203 Rust tests and 2 JavaScript checks. This is baseline coverage information, not a report that the feature branch's final checks passed.
 
-| Path | Current observer | Analytics integration |
+## Integration map
+
+| Path | Implementation | Coverage notes |
 |---|---|---|
-| Translated HTTP, SSE, legacy completions, Gemini | proxy::Tracker; formats -> IR | Native metadata before flattening; bounded final observation per attempt |
-| Pass-through JSON/SSE | proxy::execute_inner, passthrough_stream, collect_passthrough | Observe without payload changes |
-| Retries/failover/auth refresh | Tracker::attempt, execute_inner loop | Close previous attempt; logical request once; failed usage retained |
-| WS native | ws::native_turn, Tracker | One request per turn, response identities, cancel/terminal handling |
-| WS HTTP fallback | proxy::execute | Same logical-request contract |
-| Compaction/images/video create | media::with_accounts | Capture reported JSON usage; unsupported pricing explicit |
-| Video status polling | media::video_status | No generation inference; document observation gap |
-| count_tokens/model listing | local metadata endpoints | No billed generation; excluded from token accounting |
-| Devin protobuf | translated IR | Reported flattened fields; richer metadata unavailable explicit |
+| Translated HTTP, SSE, legacy completions, Gemini | `proxy::Tracker`; format parsers and renderers use the IR | Metadata captured before client-format rendering where possible. |
+| Pass-through JSON/SSE | `proxy::execute_inner`, `passthrough_stream`, `collect_passthrough` | Provider output is observed without changing pass-through payloads. |
+| Retries, failover, refresh | `Tracker::attempt`, `proxy::execute_inner` | Attempts remain distinct; source-reported failure usage is retained. |
+| Responses WebSocket | `ws::native_turn` and shared `Tracker`; fallback enters `proxy::execute` | One observation per turn, including terminal usage and cancellation state. |
+| Compaction and image/video creation | `media::with_accounts` | Captured when upstream returns usage. Video status polls do not imply generation use. |
+| Token count and model listing | Local metadata endpoints | Excluded from generation accounting. |
+| Devin | Translated IR usage where reported | Its current protobuf path does not expose richer usage/tier metadata. |
+| Native imports | `usage::imports` | Claude Code `message.usage`; Codex durable response records and supported legacy cumulative snapshots. |
+| Standalone collector | `usage::collector` | Metadata-only outbox; server replaces untrusted collector attribution and request claims. |
 
-Live ring is 300 records and is not historical storage. IR Usage currently uses noncached input, separate read/write, output, reasoning; fields are u64 defaulting to zero and TTL detail is lost. Analytics uses independent optional fields.
+Final root integration: `6c060b1`.
 
-## Shared contract v1
+The existing request ring remains an in-memory, 300-row live view. The persistent usage database is the historical source. Provider allowance/quota remains in the existing account and quota state.
 
-`src/usage/types.rs` owns strict allowlisted Observation and Tokens. UTC event and ingestion milliseconds; bounded integers. Tokens input = ordinary non-cache input; cache_read/cache_write are disjoint input categories; write_5m/write_1h are subsets of cache_write; output includes reasoning; reasoning is subset and never added to output. Missing is None. Cache write TTL unknown stays unknown. Numeric metadata is an enumerated typed map, never arbitrary JSON. Unknown account/model/tier remains unknown. No transcript, project metadata or credential data.
+## Data and version contracts
 
-Observation retains source (`proxy`, `claude_code`, `codex`), stable source_event_id, origin identity (local or server-bound collector), parser version, provider (`anthropic`, `openai`, otherwise provider name), actual/requested models, optional account/auth, request/response/session identities only if evidenced, attempt/logical ids and completion state. Provider request ID and response/message ID are distinct namespaces. Imported auth/account must not be inferred from current sign-ins. Server stamps ingestion and collector identity, strips untrusted proxy attribution, rejects claimed proxy source.
+`src/usage/types.rs` defines the strict, allowlisted observation. Observation envelope `schema_version` is 1. Collector wire `Batch.version` is also 1. The SQLite database's `user_version` is 2: opening version 1 transactionally adds writer-session health accounting; a newer or foreign application database is rejected. These versions describe different layers.
 
-SQLite observations retain provenance separately from derived accounting entries. Idempotency key = source + origin + source_event_id. Copied native histories reconcile using native stable source event identity across origins. Reliable provider response/message IDs can associate proxy/history; no token/time matching. Proxy evidence wins over local import, which wins over collector, with deterministic tie-breaks. Imported-only source totals remain separate and explicitly possibly overlapping; the default defensible reconciled total contains proxy entries and their matching history evidence only, never a guessed cross-source grand total. Conflicts stay visible. Collector claims cannot override trusted proxy counts/accounts/models.
+Tokens use disjoint uncached input, cache read, cache write, and output categories. Cache-write TTL values are subsets of cache write; reasoning is a subset of output. Missing is `null`, not zero. Observations retain source, origin, parser version, provider/model, event/ingest time, optional evidenced identities, completion, and allowlisted numeric metadata. Prompt/completion bodies, tools, transcripts, credentials, and arbitrary provider JSON are not persisted.
 
-Pricing stored alongside derived entries at ingestion with catalogue version/basis; nanos of USD (i64, checked arithmetic) avoids per-event cents rounding. Unknown pricing is NULL, not zero. Historical events outside documented effective periods explicitly unpriced/current-rate-equivalent only if labelled. Never combine quota percentages/credits with API estimates.
+Idempotency uses source + origin + source event identity. Reliable provider response IDs can associate proxy and imported evidence; token/time similarity is never enough. Reconciliation selects trusted evidence deterministically, with proxy before local import before collector, and surfaces conflicts. Imported-only source totals remain separate and possibly overlapping. The reconciled total is based on proxy evidence and matching records; the UI does not make a guessed cross-source grand total.
 
-SQLite uses WAL/FULL sync, versioned migrations, transactions and indexes. Bounded writer channel on a dedicated blocking worker; proxy enqueue never waits for disk, failed enqueue increments visible gaps. Enqueued events are not durable until commit; crash-loss bound = queued + current batch. Imports/collector ingestion await durable transaction ack, idempotent retry; checkpoint moves atomically with records. DB failure leaves proxy available with degraded analytics. Queries via spawn_blocking, bounded pagination/aggregation. Purge watermark blocks automatic resurrection; explicit reimport can deliberately reset it.
+## Pricing provenance
 
-API prefix /api/usage under existing management auth. Collector-only /api/usage-ingest separately authenticated. Query range start/end RFC3339 or local dates + IANA timezone, filter provider/model/account/client/source; server groups local calendar dates. Source totals, reconciled proxy totals, unpriced/missing/partial/conflicts/possible overlap explicit. Detail/export pagination bounded. CSV escapes formulas. Collector enrollment returns credential once; hash only server-side; fixed prefix excluded from inference/management even when defaults allow anonymous loopback. Non-loopback collector destinations require HTTPS, default verified certs, redirects disabled. Batch version=1, at most 200 observations/512 KiB.
+Catalogue `2026-10-07.2` records USD rates in integer nanodollars per token. Its list-price source URLs and model rows are in `src/usage/rates.json`; schema, matching and tier logic are in `src/usage/pricing.rs`. Undocumented effective dates are null and therefore apply only from `verified_at`, displayed as current-rate equivalents. No old event is repriced using a later rate. Unknown rates remain null. A local override is USD-only and its content digest is incorporated into the catalogue version stored with price snapshots.
 
-Configuration additive `usage` section: enabled default true for service, database optional (config-adjacent usage.sqlite3), retention_days=90, queue_capacity=1024. Local imports disabled by default; roots explicitly enabled via management/CLI and persisted in usage database. Collector mode initializes its own state dir/outbox and runs without App/provider pool. Client attribution additive `named-clients` list {id,label,key}; old api-keys unchanged; stable key scope is a fingerprint, not physical machine proof.
+The bundled tier multipliers are explicit and limited: OpenAI GPT-6 and GPT-5.6 rows support Batch/Flex at 1/2, Fast/Priority at 2/1, and GPT-6 Astra Ultrafast at 6/1. The listed Anthropic rows support Batch at 1/2; Fast at 2/1 is limited to Opus 5.5, Opus 5, and Opus 4.8. Unsupported model/tier combinations are unpriced. The 272,000 input threshold is present only for listed OpenAI models with threshold rate fields. Pricing is an API estimate, never a provider invoice or subscription-plan charge.
 
-## Baseline checks
+## Storage, health, retention and imports
 
-Default cargo test could not start: system Rust 1.85 < manifest/dependency 1.88. Use `rustup run 1.96.1 cargo ...` explicitly, no global toolchain changes. Full baseline rerun pending.
+SQLite uses WAL, `synchronous=FULL`, transactions, foreign keys, application identity, and transactional migrations. A dedicated writer batches up to 200 observations and uses a bounded nonblocking ingress queue. Enqueue acceptance is not durable acknowledgment. If the queue is full or capture ingress cannot acquire its gate, the observation is dropped; invalid records are rejected; a failed insertion batch contributes drops and writer errors. The crash-loss bound is queued observations plus the current uncommitted batch.
+
+Health separates counters for the current writer from `historical_gap` counters recovered from earlier writer sessions. Counter persistence is best-effort between commands and on the idle timer, so a busy transaction or disk failure can delay or prevent updates. An unclosed prior session is a recovery warning because it can indicate forced shutdown or a concurrent process. Do not treat a healthy proxy response as proof of complete analytics when health is degraded.
+
+Normal shutdown stops the native import poller, closes usage ingress, drains queued writer commands, then persists and marks the writer session clean after acknowledgment. Shutdown errors are logged. A crash/forced kill may leave an unclosed session and lose queued/uncommitted observations. The test-only flush barrier reports prior writer errors rather than clearing gaps; production commands use acknowledged shutdown.
+
+Retention purges at database open and about hourly during the writer loop using the configured retention horizon. A manual purge advances a watermark that blocks automatic resurrection. Explicit `usage backfill` clears enabled roots' checkpoints and temporarily allows their imported records past that watermark; the watermark is restored, and age-based retention still applies at a later purge. The server scans enabled roots about every 30 seconds; CLI scans and backfills wait for transaction acknowledgment. Imported records and source checkpoints commit atomically. Collector outbox records and checkpoints also commit atomically, and the server acknowledges only after durable ingestion.
+
+## Baseline and final verification
+
+Baseline coverage: 203 Rust tests and 2 JavaScript checks. Final feature checks: 272 Rust tests, 14 JavaScript tests, 6 real-browser acceptance groups and 9 isolated process checks passed. Formatting, clippy with denied warnings, syntax checks and release build passed. The 100k-record test ran without ignoring tests. See the verification report for methodology and limitations. Existing services were not restarted; only isolated synthetic test processes were rebuilt/restarted.

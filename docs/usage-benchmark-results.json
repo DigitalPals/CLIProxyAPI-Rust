@@ -1,0 +1,63 @@
+{
+  "environment": {
+    "system": "Linux-6.12.107+deb13-amd64-x86_64-with-glibc2.41",
+    "cpu_count": 64,
+    "binary": "/home/john/Code/Fusebox/target/release/fusebox"
+  },
+  "records": 10000,
+  "fixture_bytes": 4157780,
+  "http_requests_per_sample": 200,
+  "http_samples": {
+    "analytics_off": {
+      "mean_ms_each_sample": [
+        0.8495873451465741,
+        0.825065080425702,
+        0.828940145438537
+      ],
+      "median_ms": 0.828940145438537
+    },
+    "analytics_on": {
+      "mean_ms_each_sample": [
+        0.8497753750998527,
+        0.7768954150378704,
+        0.8378590346546844
+      ],
+      "median_ms": 0.8378590346546844
+    }
+  },
+  "import": {
+    "seconds": 0.9951500220922753,
+    "scan_calls": 5,
+    "observations": 10000
+  },
+  "summary_query": {
+    "samples": 10,
+    "median_ms": 107.41232399595901,
+    "max_ms": 108.28440997283906
+  },
+  "health": {
+    "state": "healthy",
+    "message": null,
+    "session_id": "1bf2326354d4e71a3941efab855b70e34b0063ae66e838f8399203b5491a9dc8",
+    "historical_gap": {
+      "dropped": 0,
+      "rejected": 0,
+      "writer_errors": 0
+    },
+    "prior_unclosed_sessions": 0,
+    "recovery_warning": null,
+    "counter_scope": "dropped/rejected/writer_errors describe this writer; historical_gap describes earlier sessions; counters persist best effort between commands and on a one-second idle timer; busy transactions or disk failure can delay persistence",
+    "queue_depth": 0,
+    "queue_capacity": 1024,
+    "dropped": 0,
+    "rejected": 0,
+    "accepted": 620,
+    "written": 620,
+    "writer_errors": 0,
+    "last_commit_at_ms": 1791352951211,
+    "durability": "enqueued observations become durable at committed transaction; queued plus current batch are crash-loss bound"
+  },
+  "sqlite_bytes": 36249600,
+  "observed_proxy_difference_ms": 0.008918889216147363,
+  "methodology": "Sequential local HTTP through loopback synthetic provider; 20 warmup requests then 3 samples per mode; local OS/process noise included. Import repeated bounded scans including API query overhead. No external model calls."
+}

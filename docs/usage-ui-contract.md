@@ -14,8 +14,7 @@ Start is inclusive local midnight; end is exclusive local midnight. Today, 7 day
 and 30 days include today. The custom UI accepts an inclusive “Through” date
 and advances it by a calendar day, without adding a fixed 24-hour duration.
 Optional `provider`, `model` (actual model), `account`, `client`, `source`
-filters use stable server values. The `client` facet includes collectors if
-collector-origin filtering is supported. Every read/action is authenticated.
+filters use stable server values. The `client` facet includes named client IDs and server-bound `collector:<id>` origins. Every read/action is authenticated.
 
 ## GET /api/usage/summary
 
@@ -74,7 +73,7 @@ The server must use stable ordering and apply filters identically to summary.
 }
 ```
 
-Optional labels may be null. `origin_id` is `local` or a collector UUID; a
+Optional labels may be null. `origin_id` is `local` or `collector:<server-id>`; a
 collector label takes precedence for presentation. `completeness` is
 `complete`, `partial` or `missing`; completion `state` remains independently
 visible. Input is non-cache input; cache reads and writes are separate. Write
@@ -136,3 +135,5 @@ may still render alongside that error. Management 401/403 returns the existing
 lock view. Initial loading, empty histories, no matching records and missing
 source status are explicit. Reads refresh once a minute while Usage is visible;
 manual refresh and preset date ranges recalculate calendar boundaries.
+
+Source summaries include `source_record_count` (raw observations/revisions) and `observations` (globally selected accounting entries). Collector-filtered raw copies may have their accounting evidence selected under another origin. `coverage_basis` explains this distinction. Breakdowns contain server aggregates for provider/model/account/client, capped at 500 groups per dimension. Collector status adds the strict per-source `progress` reports documented in [usage-imports-collectors.md](usage-imports-collectors.md).
