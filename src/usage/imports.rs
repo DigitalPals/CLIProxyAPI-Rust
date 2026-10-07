@@ -235,11 +235,19 @@ struct NativeTokens {
     read: u64,
     write: u64,
     output: u64,
-    reasoning: u64,
+    #[serde(default)]
+    reasoning: Option<u64>,
 }
 impl NativeTokens {
     fn key(&self) -> String {
-        format!("{}:{}:{}:{}:{}", self.input, self.read, self.write, self.output, self.reasoning)
+        format!(
+            "{}:{}:{}:{}:{}",
+            self.input,
+            self.read,
+            self.write,
+            self.output,
+            self.reasoning.map(|v| v.to_string()).unwrap_or_else(|| "?".into())
+        )
     }
     fn diff(&self, previous: &Self) -> Option<Self> {
         Some(Self {
@@ -247,7 +255,10 @@ impl NativeTokens {
             read: self.read.checked_sub(previous.read)?,
             write: self.write.checked_sub(previous.write)?,
             output: self.output.checked_sub(previous.output)?,
-            reasoning: self.reasoning.checked_sub(previous.reasoning)?,
+            reasoning: match (self.reasoning, previous.reasoning) {
+                (Some(current), Some(previous)) => Some(current.checked_sub(previous)?),
+                _ => None,
+            },
         })
     }
     fn tokens(&self) -> Option<Tokens> {
@@ -256,7 +267,7 @@ impl NativeTokens {
             cache_read: Some(self.read),
             cache_write: Some(self.write),
             output: Some(self.output),
-            reasoning: Some(self.reasoning),
+            reasoning: self.reasoning,
             ..Tokens::default()
         })
     }
@@ -328,9 +339,9 @@ fn native(v: &Value) -> Option<NativeTokens> {
     Some(NativeTokens {
         input: number(v.get("input_tokens"))?,
         read: number(v.get("cached_input_tokens"))?,
-        write: number(v.get("cache_write_input_tokens")).unwrap_or(0),
+        write: if v.get("cache_write_input_tokens").is_none() { 0 } else { number(v.get("cache_write_input_tokens"))? },
         output: number(v.get("output_tokens"))?,
-        reasoning: number(v.get("reasoning_output_tokens")).unwrap_or(0),
+        reasoning: number(v.get("reasoning_output_tokens")),
     })
 }
 fn validated_native(v: &Value) -> Result<NativeTokens> {
@@ -518,7 +529,10 @@ fn parse_record_inner(source: &str, v: &Value, context: &mut Context) -> Result<
             o.completeness = "partial".into();
             // Validate timestamps and cumulative subsets before recording a reset.
             o.validate().map_err(|_| anyhow!("invalid usage metadata"))?;
-            let previous = context.cumulative.replace(total.clone()).unwrap_or_default();
+            let previous = context
+                .cumulative
+                .replace(total.clone())
+                .unwrap_or_else(|| NativeTokens { reasoning: Some(0), ..NativeTokens::default() });
             if total == previous {
                 return Ok(None);
             }

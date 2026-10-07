@@ -143,6 +143,54 @@ fn malformed_legacy_does_not_advance_baseline_or_mark_reset() {
 }
 
 #[test]
+fn legacy_reasoning_is_unknown_when_current_or_baseline_is_missing() {
+    for explicit_null in [false, true] {
+        let mut state = Context::default();
+        parse_record("codex", &meta("openai"), &mut state).unwrap();
+        let mut row = legacy();
+        if explicit_null {
+            row["payload"]["info"]["total_token_usage"]["reasoning_output_tokens"] = Value::Null;
+        } else {
+            row["payload"]["info"]["total_token_usage"].as_object_mut().unwrap().remove("reasoning_output_tokens");
+        }
+        assert_eq!(parse_record("codex", &row, &mut state).unwrap().unwrap().tokens.reasoning, None);
+        state = serde_json::from_value(serde_json::to_value(&state).unwrap()).unwrap();
+        for (scale, expected) in [(2, None), (3, Some(80)), (4, None)] {
+            row["payload"]["info"]["total_token_usage"] = json!({
+                "input_tokens":1000*scale,"cached_input_tokens":600*scale,
+                "cache_write_input_tokens":100*scale,"output_tokens":200*scale,
+                "reasoning_output_tokens":80*scale
+            });
+            if scale == 4 {
+                row["payload"]["info"]["total_token_usage"].as_object_mut().unwrap().remove("reasoning_output_tokens");
+            }
+            let observed = parse_record("codex", &row, &mut state).unwrap().unwrap();
+            assert_eq!(observed.tokens.reasoning, expected);
+            assert_eq!(observed.tokens.output, Some(200));
+        }
+    }
+}
+
+#[test]
+fn legacy_cache_write_null_is_rejected_but_absence_defaults_zero() {
+    let mut state = Context::default();
+    parse_record("codex", &meta("openai"), &mut state).unwrap();
+    let mut row = legacy();
+    row["payload"]["info"]["total_token_usage"]["cache_write_input_tokens"] = Value::Null;
+    let before = serde_json::to_value(&state).unwrap();
+    assert!(parse_record("codex", &row, &mut state).is_err());
+    assert_eq!(serde_json::to_value(&state).unwrap(), before);
+    row["payload"]["info"]["total_token_usage"].as_object_mut().unwrap().remove("cache_write_input_tokens");
+    let observed = parse_record("codex", &row, &mut state).unwrap().unwrap();
+    assert_eq!(observed.tokens.cache_write, Some(0));
+    assert_eq!(observed.tokens.input, Some(400));
+    let before = serde_json::to_value(&state).unwrap();
+    row["payload"]["info"]["total_token_usage"]["cache_write_input_tokens"] = Value::Null;
+    assert!(parse_record("codex", &row, &mut state).is_err());
+    assert_eq!(serde_json::to_value(&state).unwrap(), before);
+}
+
+#[test]
 fn counter_reset_disables_ambiguous_legacy_across_restart() {
     let mut state = Context::default();
     parse_record("codex", &meta("openai"), &mut state).unwrap();
