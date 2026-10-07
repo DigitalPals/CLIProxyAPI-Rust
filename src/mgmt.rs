@@ -454,6 +454,8 @@ async fn account_activity(State(app): State<Arc<App>>, Path(id): Path<String>) -
         model: String,
         requests: u64,
         cache_tokens: u64,
+        usage_missing: u64,
+        usage_partial: u64,
     }
     let mut seen: std::collections::HashMap<String, Seen> = Default::default();
     for log in app.stats.recent.lock().iter().filter(|l| l.account_id == id) {
@@ -465,6 +467,8 @@ async fn account_activity(State(app): State<Arc<App>>, Path(id): Path<String>) -
         s.model.clone_from(&log.model);
         s.requests += 1;
         s.cache_tokens += log.cache_tokens;
+        s.usage_missing += u64::from(log.usage_completeness == "missing");
+        s.usage_partial += u64::from(log.usage_completeness == "partial");
     }
     let sessions: Vec<Value> = app
         .sessions
@@ -482,6 +486,8 @@ async fn account_activity(State(app): State<Arc<App>>, Path(id): Path<String>) -
                 "model": Some(s.model).filter(|m| !m.is_empty()),
                 "requests": s.requests,
                 "cache_tokens": s.cache_tokens,
+                "usage_missing": s.usage_missing,
+                "usage_partial": s.usage_partial,
             })
         })
         .collect();
@@ -914,6 +920,39 @@ async fn live(State(app): State<Arc<App>>, ws: WebSocketUpgrade) -> Response {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn pinned_session_activity_preserves_missing_and_partial_usage() {
+        let cfg = Config {
+            auth_dir: "/nonexistent".into(),
+            codex_api_key: vec![crate::config::KeyEntry { api_key: "mock-only".into(), ..Default::default() }],
+            ..Default::default()
+        };
+        let mut app = App::new(cfg.clone(), "/nonexistent/config.yaml".into());
+        Arc::get_mut(&mut app).unwrap().sessions = Arc::new(crate::affinity::Sessions::memory());
+        let model = "gpt-6.1-sol";
+        let mut account_id = String::new();
+        for (session, cached) in [("mixed", 0), ("mixed", 40), ("missing", 0)] {
+            let (account, _) = app.sessions.pick(&app.pool, &cfg, model, Some(session), &[], None).unwrap();
+            account_id.clone_from(&account.id);
+            let mut tracker = crate::proxy::Tracker::new(&app, crate::ir::Format::Responses, true, "http", model);
+            tracker.session(Some(session), Some("thread-id"), &cfg);
+            tracker.attempt(&account);
+            tracker.finish(499, &crate::ir::Usage { cache_read: cached, ..Default::default() }, None);
+        }
+        let response = account_activity(State(app), Path(account_id)).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), 1024 * 1024).await.unwrap();
+        let payload: Value = serde_json::from_slice(&body).unwrap();
+        let sessions = payload["sessions"].as_array().unwrap();
+        assert_eq!(sessions.len(), 2);
+        let mixed = sessions.iter().find(|s| s["session"] == "mixed").unwrap();
+        assert_eq!((mixed["requests"].as_u64(), mixed["cache_tokens"].as_u64()), (Some(2), Some(40)));
+        assert_eq!((mixed["usage_missing"].as_u64(), mixed["usage_partial"].as_u64()), (Some(1), Some(1)));
+        let missing = sessions.iter().find(|s| s["session"] == "missing").unwrap();
+        assert_eq!((missing["requests"].as_u64(), missing["cache_tokens"].as_u64()), (Some(1), Some(0)));
+        assert_eq!((missing["usage_missing"].as_u64(), missing["usage_partial"].as_u64()), (Some(1), Some(0)));
+    }
 
     #[tokio::test]
     async fn key_edits_fall_back_to_a_rewrite_when_formatting_cannot_be_kept() {

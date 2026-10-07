@@ -19,7 +19,7 @@ function dashboard() {
   return {
     S,
     record(minute, input = 100) {
-      context.onRequest({ id: S.requests.length, ts: new Date(minute * 60000).toISOString(), status: 200, input_tokens: input, output_tokens: 2, cache_tokens: 3 });
+      context.onRequest({ id: S.requests.length, ts: new Date(minute * 60000).toISOString(), status: 200, usage_completeness: 'complete', input_tokens: input, output_tokens: 2, cache_tokens: 3 });
     },
   };
 }

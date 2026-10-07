@@ -87,6 +87,8 @@ async fn cancelled(app: &App, input: u64, cache: u64) {
         loop {
             if let Some(log) = app.stats.recent.lock().front().cloned() {
                 assert_eq!(log.status, 499);
+                assert!(matches!(log.failure_kind, Some("downstream_disconnect" | "downstream_read_error")));
+                assert_eq!(log.usage_completeness, if input > 0 { "partial" } else { "missing" });
                 assert_eq!((log.input_tokens, log.cache_tokens), (input, cache));
                 assert_eq!(app.stats.active.load(Ordering::Relaxed), 0);
                 assert_eq!(app.pool.all()[0].state.lock().active_requests.load(Ordering::Relaxed), 0);
@@ -218,7 +220,68 @@ async fn downstream_write_deadline_releases_a_blocked_sink() {
     let mut sender =
         tokio_tungstenite::WebSocketStream::from_raw_socket(socket, tungstenite::protocol::Role::Client, None).await;
     let started = tokio::time::Instant::now();
-    assert!(client_write(sender.send(tungstenite::Message::Text("blocked response".into()))).await.is_err());
+    let downstream = crate::diagnostics::Downstream::default();
+    assert!(
+        crate::diagnostics::downstream_scope(
+            downstream.clone(),
+            client_write(sender.send(tungstenite::Message::Text("blocked response".into())))
+        )
+        .await
+        .is_err()
+    );
+    assert_eq!(downstream.kind(), "downstream_write_timeout");
     assert!(started.elapsed() >= CLIENT_WRITE_TIMEOUT);
     assert!(started.elapsed() < CLIENT_WRITE_TIMEOUT + Duration::from_secs(2));
+}
+
+#[tokio::test]
+async fn downstream_socket_error_is_distinct_from_write_timeout() {
+    let downstream = crate::diagnostics::Downstream::default();
+    assert!(
+        crate::diagnostics::downstream_scope(
+            downstream.clone(),
+            client_write(async { Err::<(), _>("private socket error") })
+        )
+        .await
+        .is_err()
+    );
+    assert_eq!(downstream.kind(), "downstream_write_error");
+}
+
+#[tokio::test]
+async fn native_completion_reports_full_usage_without_durable_analytics() {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let base = format!("http://{}", listener.local_addr().unwrap());
+    let task = tokio::spawn(async move {
+        let (socket, _) = listener.accept().await.unwrap();
+        let mut socket = tokio_tungstenite::accept_async(socket).await.unwrap();
+        socket.next().await.unwrap().unwrap();
+        socket.send(tungstenite::Message::Text(json!({
+            "type":"response.completed", "response":{"id":"native-complete","status":"completed","output":[],
+                "usage":{"input_tokens":12,"output_tokens":2,"input_tokens_details":{"cached_tokens":4,"cache_creation_tokens":0}}}
+        }).to_string().into())).await.unwrap();
+        while socket.next().await.is_some() {}
+    });
+    let _upstream = Server { url: base.clone(), task };
+    let app = app(&base, true);
+    assert!(app.usage.is_none());
+    let proxy = serve(crate::server::router(app.clone())).await;
+    let mut socket = client(&proxy).await;
+    create(&mut socket, true, "first").await;
+    until_event(&mut socket, "response.completed").await;
+    tokio::time::timeout(Duration::from_secs(2), async {
+        loop {
+            if let Some(log) = app.stats.recent.lock().front().cloned() {
+                assert_eq!(log.status, 200);
+                assert_eq!(log.transport, "ws");
+                assert_eq!(log.usage_completeness, "complete");
+                assert_eq!(log.failure_kind, None);
+                assert_eq!((log.input_tokens, log.output_tokens, log.cache_tokens), (8, 2, 4));
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
 }

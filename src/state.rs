@@ -249,6 +249,9 @@ pub struct RequestLog {
     pub input_tokens: u64,
     pub output_tokens: u64,
     pub cache_tokens: u64,
+    /// Whether provider usage is final, an observed lower bound, or absent.
+    pub usage_completeness: &'static str,
+    pub failure_kind: Option<&'static str>,
     pub stream: bool,
     pub transport: &'static str,
     pub attempts: u32,
@@ -260,6 +263,9 @@ pub struct Totals {
     pub requests: u64,
     pub ok: u64,
     pub failed: u64,
+    pub cancelled: u64,
+    pub usage_missing: u64,
+    pub usage_partial: u64,
     pub input_tokens: u64,
     pub output_tokens: u64,
     pub cache_tokens: u64,
@@ -270,6 +276,9 @@ pub struct Bucket {
     pub minute: i64,
     pub requests: u64,
     pub failed: u64,
+    pub cancelled: u64,
+    pub usage_missing: u64,
+    pub usage_partial: u64,
     pub tokens: u64,
     pub input_tokens: u64,
     pub output_tokens: u64,
@@ -279,9 +288,13 @@ pub struct Bucket {
 impl Bucket {
     fn add(&mut self, log: &RequestLog) {
         self.requests += 1;
-        if log.status >= 400 {
+        if log.status == 499 {
+            self.cancelled += 1;
+        } else if log.status >= 400 {
             self.failed += 1;
         }
+        self.usage_missing += u64::from(log.usage_completeness == "missing");
+        self.usage_partial += u64::from(log.usage_completeness == "partial");
         self.tokens += log.input_tokens + log.output_tokens + log.cache_tokens;
         self.input_tokens += log.input_tokens;
         self.output_tokens += log.output_tokens;
@@ -336,15 +349,18 @@ impl Stats {
     }
 
     pub fn record(&self, log: &RequestLog) {
-        let ok = log.status < 400;
         {
             let mut t = self.totals.lock();
             t.requests += 1;
-            if ok {
+            if log.status == 499 {
+                t.cancelled += 1
+            } else if log.status < 400 {
                 t.ok += 1
             } else {
                 t.failed += 1
             }
+            t.usage_missing += u64::from(log.usage_completeness == "missing");
+            t.usage_partial += u64::from(log.usage_completeness == "partial");
             t.input_tokens += log.input_tokens;
             t.output_tokens += log.output_tokens;
             t.cache_tokens += log.cache_tokens;
@@ -404,6 +420,8 @@ mod tests {
             input_tokens: tokens,
             output_tokens: 2,
             cache_tokens: 3,
+            usage_completeness: "complete",
+            failure_kind: None,
             stream: true,
             transport: "http",
             attempts: 1,
@@ -441,5 +459,43 @@ mod tests {
         assert_eq!(series.iter().map(|b| b.input_tokens).sum::<u64>(), 600);
         assert_eq!(stats.account_series("account").iter().map(|b| b.requests).sum::<u64>(), 60);
         assert_eq!(stats.totals.lock().input_tokens, 1600);
+    }
+
+    #[test]
+    fn cancellations_and_usage_coverage_are_independent_of_failures() {
+        let now = Utc::now().timestamp() / 60;
+        let stats = Stats::default();
+        let mut account = crate::accounts::Counters::default();
+        // Missing usage is unknown even on a successful request; a reported zero
+        // is complete and must not become unknown just because the client left.
+        for (status, completeness, input, output, cache) in [
+            (200, "complete", 100, 20, 30),
+            (200, "missing", 0, 0, 0),
+            (499, "missing", 0, 0, 0),
+            (499, "partial", 10, 2, 3),
+            (499, "complete", 0, 0, 0),
+            (502, "missing", 0, 0, 0),
+            (502, "partial", 5, 1, 2),
+        ] {
+            let mut request = log(now, input);
+            request.status = status;
+            request.usage_completeness = completeness;
+            request.output_tokens = output;
+            request.cache_tokens = cache;
+            stats.record(&request);
+            account.record(&request);
+        }
+        let totals = stats.totals.lock();
+        assert_eq!((totals.requests, totals.ok, totals.failed, totals.cancelled), (7, 2, 2, 3));
+        assert_eq!((totals.usage_missing, totals.usage_partial), (3, 2));
+        assert_eq!((totals.input_tokens, totals.output_tokens, totals.cache_tokens), (115, 23, 35));
+        assert_eq!((account.requests, account.failures, account.cancelled), (7, 2, 3));
+        assert_eq!((account.usage_missing, account.usage_partial), (3, 2));
+        assert_eq!((account.input_tokens, account.output_tokens, account.cache_tokens), (115, 23, 35));
+        for series in [stats.series(), stats.account_series("account")] {
+            let bucket = series.iter().find(|b| b.minute == now).unwrap();
+            assert_eq!((bucket.requests, bucket.failed, bucket.cancelled), (7, 2, 3));
+            assert_eq!((bucket.usage_missing, bucket.usage_partial, bucket.tokens), (3, 2, 173));
+        }
     }
 }

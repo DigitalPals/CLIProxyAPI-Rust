@@ -64,12 +64,12 @@ fn recorded(app: &App, status: u16, input: u64, output: u64, cache: u64) -> Requ
     assert_eq!(app.stats.active.load(Ordering::Relaxed), 0);
     let totals = app.stats.totals.lock();
     assert_eq!(totals.requests, 1);
-    assert_eq!(totals.failed, u64::from(status >= 400));
+    assert_eq!(totals.failed, u64::from(status >= 400 && status != 499));
     assert_eq!((totals.input_tokens, totals.output_tokens, totals.cache_tokens), (input, output, cache));
     let account = app.pool.all()[0].clone();
     let state = account.state.lock();
     assert_eq!(state.counters.requests, 1);
-    assert_eq!(state.counters.failures, u64::from(status >= 400));
+    assert_eq!(state.counters.failures, u64::from(status >= 400 && status != 499));
     assert_eq!(
         (state.counters.input_tokens, state.counters.output_tokens, state.counters.cache_tokens),
         (input, output, cache)

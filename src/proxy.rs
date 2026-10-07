@@ -20,6 +20,9 @@ use crate::upstream::{self, Target};
 pub type FrameStream = Pin<Box<dyn Stream<Item = Frame> + Send>>;
 
 #[cfg(test)]
+#[path = "diagnostic_tests.rs"]
+mod diagnostic_tests;
+#[cfg(test)]
 #[path = "stream_accounting_tests.rs"]
 mod stream_accounting_tests;
 
@@ -59,6 +62,8 @@ pub struct Tracker {
     load: Option<crate::accounts::RequestLoad>,
     done: bool,
     analytics: Option<crate::usage::capture::RequestUsage>,
+    downstream: crate::diagnostics::Downstream,
+    logical_final: bool,
 }
 
 impl Tracker {
@@ -66,7 +71,9 @@ impl Tracker {
         app.stats.active.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         Self {
             app: app.clone(),
-            analytics: app.usage.clone().map(|store| crate::usage::capture::RequestUsage::new(store, model)),
+            analytics: Some(crate::usage::capture::RequestUsage::new(app.usage.clone(), model)),
+            downstream: crate::diagnostics::Downstream::current(),
+            logical_final: true,
             started: Instant::now(),
             acct: None,
             stream_usage: Usage::default(),
@@ -99,6 +106,8 @@ impl Tracker {
                 transport,
                 attempts: 0,
                 error: None,
+                usage_completeness: "missing",
+                failure_kind: None,
             },
         }
     }
@@ -177,6 +186,11 @@ impl Tracker {
             c.wire(value);
         }
     }
+    pub(crate) fn diagnostic_failure(&self, failure: crate::diagnostics::Failure) {
+        if let Some(c) = self.usage_tap() {
+            c.failure(failure);
+        }
+    }
     fn observe_usage_text(&self, text: &str) {
         if let Some(c) = self.usage_tap() {
             c.text(text);
@@ -187,7 +201,7 @@ impl Tracker {
     pub fn cancel(&mut self) {
         if !self.done {
             if let Some(a) = &mut self.analytics {
-                a.finish(None, None, false);
+                let _ = a.finish(None, None, false);
             }
             self.done = true;
             self.load = None;
@@ -232,9 +246,7 @@ impl Tracker {
 
     /// A native transport attempt failed before HTTP fallback; the logical request continues.
     pub(crate) fn finish_fallback(&mut self, status: u16, usage: &Usage, error: Option<String>) {
-        if let Some(a) = &mut self.analytics {
-            a.finish(Some(status), Some(usage), false);
-        }
+        self.logical_final = false;
         self.finish(status, usage, error);
     }
 
@@ -243,9 +255,20 @@ impl Tracker {
             return;
         }
         self.done = true;
-        if let Some(a) = &mut self.analytics {
-            a.finish(Some(status), Some(usage), true);
-        }
+        let failure = self.usage_tap().and_then(|c| c.failure_detail());
+        let captured = self.analytics.as_mut().and_then(|a| a.finish(Some(status), Some(usage), self.logical_final));
+        self.log.usage_completeness = match captured.as_ref().map(|o| o.completeness.as_str()) {
+            Some("complete") => "complete",
+            Some("partial") => "partial",
+            _ => "missing",
+        };
+        self.log.failure_kind = if status == 499 {
+            Some(self.downstream.kind())
+        } else if status < 400 {
+            None
+        } else {
+            failure.as_ref().map(|f| f.kind).or_else(|| crate::diagnostics::failure_kind(status, error.as_deref()))
+        };
         self.load = None;
         self.app.stats.active.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
         let (input, output, cache) = crate::state::usage_tokens(usage);
@@ -262,30 +285,12 @@ impl Tracker {
                 mark_quota_exhausted(a, &self.log.model, &reqwest::header::HeaderMap::new(), message);
             }
             let mut st = a.state.lock();
-            st.counters.requests += 1;
-            if status >= 400 {
-                st.counters.failures += 1;
-            }
-            st.counters.input_tokens += input;
-            st.counters.output_tokens += output;
-            st.counters.cache_tokens += cache;
+            st.counters.record(&self.log);
             st.last_used = Some(Utc::now());
         }
         self.app.stats.record(&self.log);
         self.app.broadcast("request", &self.log);
-        tracing::info!(
-            target: "fusebox::request",
-            request_id = self.log.id,
-            session = self.log.session_id.as_deref().unwrap_or("none"),
-            session_source = self.log.session_source.unwrap_or("none"),
-            routing_strategy = ?self.log.routing_strategy,
-            routing_reason = self.log.routing_reason.unwrap_or("unassigned"),
-            routing_warning = self.log.routing_warning.unwrap_or("none"),
-            cached_tokens = cache,
-            "{} {} → {} [{}] {} {}ms in={} out={}",
-            self.log.client, self.log.model, self.log.provider, self.log.account, status,
-            self.log.latency_ms, input, output
-        );
+        crate::diagnostics::record(&self.log, captured.as_ref(), failure.as_ref());
     }
 }
 
@@ -720,7 +725,13 @@ async fn execute_inner(app: Arc<App>, call: Call) -> Reply {
         let (acct, upstream_model) = (selected.account, selected.model);
 
         if let Err(e) = crate::oauth::ensure_ready(&app, &acct).await {
-            tracing::warn!(account = %acct.label, "refresh failed: {e:#}");
+            let failure = crate::diagnostics::Failure {
+                kind: "credential_refresh",
+                causes: crate::diagnostics::cause_chain(e.as_ref()),
+            };
+            tracker.diagnostic_failure(failure.clone());
+            tracing::warn!(request_id = tracker.log.id, account = ?crate::diagnostics::fingerprint(Some(&acct.id)),
+                failure_kind = failure.kind, error_causes = ?failure.causes, "credential refresh failed");
             acct.cool(None, Utc::now() + Duration::minutes(5), &format!("token refresh failed: {e}"));
             tried.push(acct.id.clone());
             last_error = Some((401, formats::error_body(call.format, 401, &format!("token refresh failed: {e}"))));
@@ -844,7 +855,10 @@ async fn execute_inner(app: Arc<App>, call: Call) -> Reply {
             Ok(r) => r,
             Err(e) => {
                 let msg = format!("upstream connection failed: {e}");
-                tracing::warn!(account = %acct.label, "{msg}");
+                let failure = crate::diagnostics::Failure::http("upstream_connect", &e);
+                tracker.diagnostic_failure(failure.clone());
+                tracing::warn!(request_id = tracker.log.id, account = ?crate::diagnostics::fingerprint(Some(&acct.id)),
+                    failure_kind = failure.kind, error_causes = ?failure.causes, "upstream connection failed");
                 acct.state.lock().last_error = Some(msg.clone());
                 // A dropped connection is usually a blip on the provider's side: one more try.
                 let n = soft_tries.entry(acct.id.clone()).or_default();
@@ -868,10 +882,17 @@ async fn execute_inner(app: Arc<App>, call: Call) -> Reply {
         crate::quota::observe(&acct, resp.headers(), quota_epoch);
         if !resp.status().is_success() {
             let headers = resp.headers().clone();
-            let text = resp.text().await.unwrap_or_default();
+            let text = match resp.text().await {
+                Ok(text) => text,
+                Err(error) => {
+                    tracker.diagnostic_failure(crate::diagnostics::Failure::http("upstream_body_read", &error));
+                    String::new()
+                }
+            };
             tracker.observe_usage_text(&text);
             let msg = error_message(&text);
-            tracing::warn!(account = %acct.label, status, "upstream error: {msg}");
+            tracing::warn!(request_id = tracker.log.id, account = ?crate::diagnostics::fingerprint(Some(&acct.id)),
+                status, failure_kind = crate::diagnostics::failure_kind(status, Some(&msg)), "upstream rejected request");
             let client_body = if passthrough {
                 serde_json::from_str(&text).unwrap_or_else(|_| formats::error_body(call.format, status, &msg))
             } else {
@@ -889,7 +910,8 @@ async fn execute_inner(app: Arc<App>, call: Call) -> Reply {
                 if *n < 2 {
                     *n += 1;
                     let wait = delay.max(std::time::Duration::from_secs(if *n == 1 { 1 } else { 3 }));
-                    tracing::info!(account = %acct.label, status, "upstream busy, retrying in {}s", wait.as_secs());
+                    tracing::info!(request_id = tracker.log.id, account = ?crate::diagnostics::fingerprint(Some(&acct.id)),
+                        status, retry_delay_seconds = wait.as_secs(), "upstream busy; retrying");
                     tokio::time::sleep(wait).await;
                     retry_same = Some(acct.id.clone());
                     last_error = Some((status, client_body));
@@ -958,6 +980,7 @@ async fn execute_inner(app: Arc<App>, call: Call) -> Reply {
             let text = match resp.text().await {
                 Ok(text) => text,
                 Err(e) => {
+                    tracker.diagnostic_failure(crate::diagnostics::Failure::http("upstream_body_read", &e));
                     let message = format!("upstream response read failed: {e}");
                     tracker.finish(502, &Usage::default(), Some(message.clone()));
                     return error_reply(call.format, 502, &message);
@@ -1098,6 +1121,7 @@ fn event_stream(
             let text = match resp.text().await {
                 Ok(text) => text,
                 Err(e) => {
+                    if let Some(c) = &usage_tap { c.failure(crate::diagnostics::Failure::http("upstream_body_read", &e)); }
                     yield Event::Error { status: 502, message: format!("upstream response read failed: {e}") };
                     return;
                 }
@@ -1141,6 +1165,7 @@ fn event_stream(
                 }
                 Some(Err(e)) => {
                     if finished { return; }
+                    if let Some(c) = &usage_tap { c.failure(crate::diagnostics::Failure::http("upstream_body_read", &e)); }
                     out.push(Event::Error { status: 502, message: format!("upstream stream error: {e}") });
                     for ev in out.drain(..) { yield rename(ev); }
                     return;
@@ -1220,6 +1245,7 @@ fn passthrough_stream(resp: reqwest::Response, native: Format, mut tracker: Trac
             let (batch, end) = match body.next().await {
                 Some(Ok(chunk)) => (dec.push(&chunk), false),
                 Some(Err(e)) => {
+                    if !tracker.stream_finished { tracker.diagnostic_failure(crate::diagnostics::Failure::http("upstream_body_read", &e)); }
                     transport_error = Some(format!("upstream stream error: {e}"));
                     (dec.finish(), true)
                 }
@@ -1299,6 +1325,7 @@ async fn collect_passthrough(mut body: ByteStream, native: Format, mut tracker: 
             Ok(c) => dec.push(&c).into_iter().for_each(|s| handle(s, &mut agg, &mut final_obj)),
             Err(e) => {
                 if agg.finish.is_none() {
+                    tracker.diagnostic_failure(crate::diagnostics::Failure::http("upstream_body_read", &e));
                     agg.error = Some((502, format!("upstream stream error: {e}")));
                 }
                 break;

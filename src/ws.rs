@@ -39,20 +39,34 @@ struct UpstreamFailure {
     operation: &'static str,
     status: u16,
     message: String,
+    diagnostic: crate::diagnostics::Failure,
 }
 
 impl UpstreamFailure {
     fn timeout(operation: &'static str) -> Self {
-        Self { operation, status: 504, message: format!("codex websocket {operation} timed out") }
+        Self {
+            operation,
+            status: 504,
+            message: format!("codex websocket {operation} timed out"),
+            diagnostic: crate::diagnostics::Failure { kind: "upstream_timeout", causes: vec!["timeout"] },
+        }
     }
 
     fn socket(operation: &'static str, error: &tungstenite::Error) -> Self {
-        Self { operation, status: 502, message: format!("codex websocket {operation} failed: {}", socket_error(error)) }
+        Self {
+            operation,
+            status: 502,
+            message: format!("codex websocket {operation} failed: {}", socket_error(error)),
+            diagnostic: crate::diagnostics::Failure {
+                kind: "upstream_websocket",
+                causes: crate::diagnostics::cause_chain(error),
+            },
+        }
     }
 
     fn log(&self, connection_id: &str, phase: &'static str) {
-        tracing::warn!(connection_id, phase, operation = self.operation, status = self.status, error = %self.message,
-            "codex upstream websocket failure");
+        tracing::warn!(connection_id, phase, operation = self.operation, status = self.status,
+            failure_kind = self.diagnostic.kind, error_causes = ?self.diagnostic.causes, "codex upstream websocket failure");
     }
 }
 
@@ -220,7 +234,17 @@ async fn send(tx: &mut ClientTx, text: String) -> Result<(), ClientGone> {
 }
 
 async fn client_write<E>(write: impl Future<Output = Result<(), E>>) -> Result<(), ClientGone> {
-    tokio::time::timeout(CLIENT_WRITE_TIMEOUT, write).await.map_err(|_| ClientGone)?.map_err(|_| ClientGone)
+    match tokio::time::timeout(CLIENT_WRITE_TIMEOUT, write).await {
+        Ok(Ok(())) => Ok(()),
+        Ok(Err(_)) => {
+            crate::diagnostics::Downstream::current().set("downstream_write_error");
+            Err(ClientGone)
+        }
+        Err(_) => {
+            crate::diagnostics::Downstream::current().set("downstream_write_timeout");
+            Err(ClientGone)
+        }
+    }
 }
 
 fn message_bytes(message: &Message) -> usize {
@@ -300,23 +324,32 @@ pub async fn handle(app: Arc<App>, headers: HeaderMap, socket: WebSocket) {
         }
         // Continue reading the client during setup, upload, generation and writes.
         // Dropping this future cancels the HTTP body or native socket immediately.
-        let running = async {
+        let downstream = crate::diagnostics::Downstream::default();
+        let running = crate::diagnostics::downstream_scope(downstream.clone(), async {
             drain_idle_upstream(&mut sess).await;
             turn(&app, &headers, &mut sess, body, &mut tx).await
-        };
+        });
         tokio::pin!(running);
         loop {
             tokio::select! {
                 message = rx.next() => match message {
                     Some(Ok(message @ (Message::Text(_) | Message::Binary(_)))) => {
                         if pending.len() >= MAX_PENDING_TURNS || message_bytes(&message) > MAX_PENDING_BYTES - pending_bytes {
+                            downstream.set("downstream_queue_limit");
                             tracing::warn!("websocket pending turn limit exceeded; closing connection");
                             break 'connection;
                         }
                         pending_bytes += message_bytes(&message);
                         pending.push_back(message);
                     }
-                    Some(Ok(Message::Close(_))) | Some(Err(_)) | None => break 'connection,
+                    Some(Err(_)) => {
+                        downstream.set("downstream_read_error");
+                        break 'connection;
+                    }
+                    Some(Ok(Message::Close(_))) | None => {
+                        downstream.set("downstream_disconnect");
+                        break 'connection;
+                    }
                     Some(Ok(_)) => {}
                 },
                 result = &mut running => {
@@ -450,10 +483,10 @@ enum Native {
     Fallback,
 }
 
-async fn connect(acct: &Arc<Account>, client_headers: &HeaderMap) -> Result<Upstream, String> {
+async fn connect(acct: &Arc<Account>, client_headers: &HeaderMap) -> Result<Upstream, UpstreamFailure> {
     let (url, headers) = crate::upstream::codex_ws_url(acct, client_headers);
-    let mut req =
-        tungstenite::client::IntoClientRequest::into_client_request(url.as_str()).map_err(|e| socket_error(&e))?;
+    let mut req = tungstenite::client::IntoClientRequest::into_client_request(url.as_str())
+        .map_err(|e| UpstreamFailure::socket("handshake", &e))?;
     for (k, v) in headers {
         if let (Ok(name), Ok(val)) =
             (tungstenite::http::HeaderName::from_bytes(k.as_bytes()), tungstenite::http::HeaderValue::from_str(&v))
@@ -463,8 +496,8 @@ async fn connect(acct: &Arc<Account>, client_headers: &HeaderMap) -> Result<Upst
     }
     let (ws, _) = tokio::time::timeout(Duration::from_secs(20), tokio_tungstenite::connect_async(req))
         .await
-        .map_err(|_| "websocket handshake timed out".to_string())?
-        .map_err(|e| socket_error(&e))?;
+        .map_err(|_| UpstreamFailure::timeout("handshake"))?
+        .map_err(|e| UpstreamFailure::socket("handshake", &e))?;
     Ok(ws)
 }
 
@@ -528,8 +561,7 @@ async fn native_turn(
                 sess.upstream = Some((acct, ws));
             }
             Err(e) => {
-                tracing::warn!(connection_id = sess.connection_id, phase = "handshake", account = %acct.label,
-                    error = %e, "codex websocket unavailable, using HTTP");
+                e.log(&sess.connection_id, "handshake_fallback");
                 return Native::Fallback;
             }
         }
@@ -566,8 +598,8 @@ async fn native_turn(
     if let Err(failure) =
         upstream_write_within(deadline, "send", up.send(tungstenite::Message::Text(payload.into()))).await
     {
-        tracing::warn!(connection_id = sess.connection_id, phase = "turn", account = %acct.label,
-            error = %failure.message, "codex websocket send failed, using HTTP");
+        failure.log(&sess.connection_id, "send_fallback");
+        tracker.diagnostic_failure(failure.diagnostic.clone());
         // A send only fails or times out with part of the message still unwritten, and the
         // socket is dropped here, so upstream never received the request: HTTP runs it once.
         sess.discard_upstream();
@@ -597,6 +629,7 @@ async fn native_turn(
                 if let Err(failure) = upstream_write("flush", up.flush()).await {
                     failure.log(&sess.connection_id, "turn_close");
                 }
+                tracker.diagnostic_failure(crate::diagnostics::Failure::classified("upstream_websocket_closed"));
                 error = Some((502, "codex websocket closed".into()));
                 break;
             }
@@ -606,12 +639,14 @@ async fn native_turn(
                     phase = "turn",
                     "codex upstream websocket ended during turn"
                 );
+                tracker.diagnostic_failure(crate::diagnostics::Failure::classified("upstream_websocket_closed"));
                 error = Some((502, "codex websocket closed".into()));
                 break;
             }
             Ok(Some(Ok(tungstenite::Message::Ping(_)))) => {
                 if let Err(failure) = upstream_write("flush", up.flush()).await {
                     failure.log(&sess.connection_id, "turn");
+                    tracker.diagnostic_failure(failure.diagnostic.clone());
                     error = Some((failure.status, failure.message));
                     break;
                 }
@@ -621,12 +656,14 @@ async fn native_turn(
             Ok(Some(Err(e))) => {
                 let failure = UpstreamFailure::socket("read", &e);
                 failure.log(&sess.connection_id, "turn");
+                tracker.diagnostic_failure(failure.diagnostic.clone());
                 error = Some((failure.status, failure.message));
                 break;
             }
             Err(_) => {
                 let failure = UpstreamFailure::timeout("read");
                 failure.log(&sess.connection_id, "turn");
+                tracker.diagnostic_failure(failure.diagnostic.clone());
                 error = Some((failure.status, failure.message));
                 break;
             }

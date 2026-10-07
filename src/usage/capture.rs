@@ -10,11 +10,24 @@ use std::sync::Arc;
 
 pub const REQUEST_HEADER: &str = "x-fusebox-usage-request";
 pub const CLIENT_HEADER: &str = "x-fusebox-usage-client";
+struct Captured {
+    observation: Observation,
+    failure: Option<crate::diagnostics::Failure>,
+}
 #[derive(Clone)]
-pub struct Capture(Arc<Mutex<Observation>>);
+pub struct Capture(Arc<Mutex<Captured>>);
 impl Capture {
+    pub fn failure(&self, failure: crate::diagnostics::Failure) {
+        self.0.lock().failure = Some(failure);
+    }
+    pub fn failure_detail(&self) -> Option<crate::diagnostics::Failure> {
+        self.0.lock().failure.clone()
+    }
+    pub fn snapshot(&self, status: Option<u16>, fallback: Option<&Usage>, logical_final: bool) -> Observation {
+        finalized(self.0.lock().observation.clone(), status, fallback, logical_final)
+    }
     pub fn wire(&self, value: &Value) {
-        observe(&mut self.0.lock(), value);
+        observe(&mut self.0.lock().observation, value);
     }
     pub fn text(&self, text: &str) {
         if let Ok(v) = serde_json::from_str(text) {
@@ -22,7 +35,8 @@ impl Capture {
         }
     }
     pub fn headers(&self, headers: &axum::http::HeaderMap, status: u16) {
-        let mut o = self.0.lock();
+        let mut captured = self.0.lock();
+        let o = &mut captured.observation;
         o.status = Some(status);
         for key in ["request-id", "x-request-id"] {
             if let Some(v) = headers.get(key).and_then(|v| v.to_str().ok()).and_then(safe) {
@@ -32,12 +46,12 @@ impl Capture {
         }
     }
     pub fn model(&self, model: &str) {
-        self.0.lock().actual_model = safe(model);
+        self.0.lock().observation.actual_model = safe(model);
     }
 }
 
 pub struct RequestUsage {
-    store: Store,
+    store: Option<Store>,
     logical_id: String,
     requested_model: Option<String>,
     client: Option<String>,
@@ -45,7 +59,7 @@ pub struct RequestUsage {
     current: Option<Capture>,
 }
 impl RequestUsage {
-    pub fn new(store: Store, model: &str) -> Self {
+    pub fn new(store: Option<Store>, model: &str) -> Self {
         Self {
             store,
             logical_id: uuid::Uuid::new_v4().to_string(),
@@ -65,7 +79,7 @@ impl RequestUsage {
         self.session = id.and_then(safe);
     }
     pub fn attempt(&mut self, acct: &Account) {
-        self.finish(None, None, false);
+        let _ = self.finish(None, None, false);
         let id = uuid::Uuid::new_v4().to_string();
         let provider = match acct.provider {
             crate::accounts::Provider::Claude => "anthropic",
@@ -81,38 +95,48 @@ impl RequestUsage {
         o.session_id = self.session.clone();
         o.account_id = Some(acct.id.clone());
         o.auth_type = Some(if acct.is_oauth() { "subscription" } else { "api_key" }.into());
-        self.current = Some(Capture(Arc::new(Mutex::new(o))));
+        self.current = Some(Capture(Arc::new(Mutex::new(Captured { observation: o, failure: None }))));
     }
     pub fn tap(&self) -> Option<Capture> {
         self.current.clone()
     }
-    pub fn finish(&mut self, status: Option<u16>, fallback: Option<&Usage>, logical_final: bool) {
-        let Some(c) = self.current.take() else {
-            return;
-        };
-        let mut o = c.0.lock().clone();
-        if let Some(s) = status {
-            o.status = Some(s);
+    pub fn finish(
+        &mut self,
+        status: Option<u16>,
+        fallback: Option<&Usage>,
+        logical_final: bool,
+    ) -> Option<Observation> {
+        let c = self.current.take()?;
+        let o = c.snapshot(status, fallback, logical_final);
+        if let Some(store) = &self.store {
+            store.enqueue(o.clone());
         }
-        if logical_final {
-            o.logical_success = Some(status.is_some_and(|s| s < 400));
-        }
-        // IR fallback cannot prove absent fields zero; native tap is preferred.
-        if o.completeness == "missing"
-            && let Some(u) = fallback.filter(|u| u.input > 0 || u.output > 0 || u.cache_read > 0 || u.cache_write > 0)
-        {
-            o.tokens.input = (u.input > 0).then_some(u.input);
-            o.tokens.output = (u.output > 0).then_some(u.output);
-            o.tokens.cache_read = (u.cache_read > 0).then_some(u.cache_read);
-            o.tokens.cache_write = (u.cache_write > 0).then_some(u.cache_write);
-            o.tokens.reasoning = (u.reasoning > 0).then_some(u.reasoning);
-            o.completeness = "partial".into();
-        }
-        if o.status.is_none_or(|s| s >= 400) && o.completeness == "complete" {
-            o.completeness = "partial".into();
-        }
-        self.store.enqueue(o);
+        Some(o)
     }
+}
+
+fn finalized(mut o: Observation, status: Option<u16>, fallback: Option<&Usage>, logical_final: bool) -> Observation {
+    if let Some(s) = status {
+        o.status = Some(s);
+    }
+    if logical_final {
+        o.logical_success = Some(status.is_some_and(|s| s < 400));
+    }
+    // IR fallback cannot prove absent fields zero; native tap is preferred.
+    if o.completeness == "missing"
+        && let Some(u) = fallback.filter(|u| u.input > 0 || u.output > 0 || u.cache_read > 0 || u.cache_write > 0)
+    {
+        o.tokens.input = (u.input > 0).then_some(u.input);
+        o.tokens.output = (u.output > 0).then_some(u.output);
+        o.tokens.cache_read = (u.cache_read > 0).then_some(u.cache_read);
+        o.tokens.cache_write = (u.cache_write > 0).then_some(u.cache_write);
+        o.tokens.reasoning = (u.reasoning > 0).then_some(u.reasoning);
+        o.completeness = "partial".into();
+    }
+    if o.status.is_none_or(|s| s >= 400) && o.completeness == "complete" {
+        o.completeness = "partial".into();
+    }
+    o
 }
 fn safe(s: &str) -> Option<String> {
     (!s.is_empty() && super::types::valid_label(s).is_ok()).then(|| s.to_string())
@@ -312,9 +336,27 @@ pub fn observe(o: &mut Observation, v: &Value) {
         o.tokens.write_1h = None;
         invalid = true;
     }
-    o.completeness =
-        if !invalid && o.tokens.total().is_some() && o.tokens.validate().is_ok() { "complete" } else { "partial" }
-            .into();
+    o.completeness = if !invalid && o.tokens.total().is_some() && o.tokens.validate().is_ok() {
+        "complete"
+    } else if invalid
+        || !o.numeric_metadata.is_empty()
+        || [
+            o.tokens.input,
+            o.tokens.output,
+            o.tokens.cache_read,
+            o.tokens.cache_write,
+            o.tokens.reasoning,
+            o.tokens.write_5m,
+            o.tokens.write_1h,
+        ]
+        .iter()
+        .any(Option::is_some)
+    {
+        "partial"
+    } else {
+        "missing"
+    }
+    .into();
 }
 
 #[cfg(test)]

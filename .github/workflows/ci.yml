@@ -37,3 +37,10 @@ jobs:
       - name: Dashboard regression tests
         if: matrix.os == 'ubuntu-latest'
         run: node --test tests/*.test.cjs
+      - uses: actions/setup-python@v5
+        if: matrix.os == 'ubuntu-latest'
+        with:
+          python-version: '3.12'
+      - name: Operational and benchmark regression tests
+        if: matrix.os == 'ubuntu-latest'
+        run: python3 -m unittest discover -s tests -p 'test_*.py'

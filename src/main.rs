@@ -7,6 +7,7 @@ mod config;
 mod config_editor;
 mod device;
 mod devin;
+mod diagnostics;
 mod formats;
 mod ir;
 mod media;
@@ -100,7 +101,13 @@ async fn main() -> Result<()> {
     let cfg = Config::load(&path)?;
     let filter = std::env::var("RUST_LOG")
         .unwrap_or_else(|_| if cfg.debug { "fusebox=debug".into() } else { "fusebox=info".into() });
-    tracing_subscriber::fmt().with_env_filter(filter).with_target(false).compact().init();
+    use std::io::IsTerminal;
+    tracing_subscriber::fmt()
+        .with_env_filter(filter)
+        .with_target(false)
+        .with_ansi(std::io::stdout().is_terminal())
+        .compact()
+        .init();
     if cfg.legacy_auth_dir {
         tracing::info!(
             "using sign-ins from {} because {} doesn't exist; set auth-dir in config.yaml to choose",

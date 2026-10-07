@@ -75,6 +75,38 @@ async fn rollback_journal_symlink_is_rejected_before_database_open() {
     assert!(local_store(state.clone()).await.is_err());
     assert!(!state.join("outbox.sqlite3").exists());
     assert_eq!(fs::read(&outside).unwrap(), b"untouched synthetic marker");
+    fs::remove_file(&outside).unwrap();
+    assert!(local_store(state.clone()).await.is_err(), "dangling sidecar links must also be rejected");
+    assert!(!state.join("outbox.sqlite3").exists());
+}
+#[tokio::test]
+#[cfg(unix)]
+async fn rollback_journal_permissions_survive_commit_unlink() {
+    use std::os::unix::fs::PermissionsExt;
+    let dir = TestDir::new();
+    let store = local_store(dir.0.clone()).await.unwrap();
+    let journal = dir.0.join("outbox.sqlite3-journal");
+    store
+        .call(move |conn| {
+            conn.execute_batch("CREATE TABLE journal_permission_fixture(value INTEGER)")?;
+            let tx = conn.transaction()?;
+            tx.execute("INSERT INTO journal_permission_fixture VALUES(1)", [])?;
+            let file = outbox_sidecar(&journal)?.expect("active DELETE transaction has a rollback journal");
+            // Newly created journals inherit the protected database permissions.
+            assert_eq!(file.metadata()?.permissions().mode() & 0o777, 0o600);
+            tx.commit()?;
+            assert!(!journal.exists());
+            // This is the exact lifecycle that made path-based chmod fail with
+            // ENOENT. The checked descriptor can still be protected after unlink.
+            file.set_permissions(fs::Permissions::from_mode(0o600))?;
+            assert!(outbox_sidecar(&journal)?.is_none());
+            let rows: u64 = conn.query_row("SELECT COUNT(*) FROM journal_permission_fixture", [], |r| r.get(0))?;
+            assert_eq!(rows, 1);
+            Ok(())
+        })
+        .await
+        .unwrap();
+    store.shutdown().await.unwrap();
 }
 #[tokio::test]
 async fn server_binds_identity_strips_claims_and_rotates() {

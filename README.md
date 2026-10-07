@@ -247,6 +247,8 @@ Choose **Used** or **Remaining** beside the quota meters (or press <kbd>U</kbd>)
 
 The Usage page records proxy-reported tokens and can import metadata from opted-in Claude Code and Codex histories, including from a standalone collector on another machine. Source totals stay separate when histories may overlap. USD figures are local API list-price estimates; subscription quota meters remain separate and are never presented as API bills. See [Usage and costs](docs/usage-costs.md) for configuration, source coverage, privacy, import and collector setup, reconciliation limits, and SQLite backup and recovery.
 
+Retiring an older Redis-based usage collector requires a compatible replacement and a database backup; see [production log follow-up](docs/production-log-followup.md). Fusebox's native usage capture replaces that ingestion path.
+
 ## Configuration
 
 `config.yaml` reloads automatically when it changes, and the dashboard edits the same file.
@@ -324,6 +326,8 @@ Token-count responses include `x-fusebox-token-count-estimated: false` when Clau
 
 An upstream stream that ends before its completion event returns an error, retaining any usage received. Closing a client WebSocket cancels its active turn; a client that stops reading is disconnected after a bounded write wait. Session assignments are saved by a background writer, with new assignments persisted before the provider request starts.
 
+The dashboard separates cancelled requests from failures. Missing usage appears as unknown, and partial usage is a lower bound. Request logs retain safe failure categories, transport, timing, attempts and usage completeness without recording upstream error bodies. To measure whether smaller contexts help your workload, use the opt-in [context comparison benchmark](docs/context-efficiency.md); Fusebox does not silently rewrite prompts.
+
 ### Running it on a server
 
 Set `host: "0.0.0.0"`, an `api-keys` entry for your clients, and a `management-key` for the dashboard. In Docker the dashboard also needs a `management-key`, because browser requests reach the container from outside `localhost`. Then keep it running, for example with systemd:
@@ -337,6 +341,7 @@ After=network-online.target
 [Service]
 ExecStart=/usr/local/bin/fusebox --config /etc/fusebox/config.yaml
 Restart=always
+TimeoutStopSec=90s
 
 [Install]
 WantedBy=multi-user.target
@@ -396,7 +401,7 @@ Plugins are Go shared libraries loaded into CLIProxyAPI's process, and the Redis
 
 **Claude sign-in fails or gets blocked.** Some Anthropic endpoints sit behind bot protection that CLIProxyAPI works around with a browser TLS fingerprint. Fusebox uses standard rustls. If token exchange fails for you, please open an issue with the error from the dashboard.
 
-**Are usage stats saved?** They're kept in memory and reset when Fusebox restarts.
+**Are usage stats saved?** The Usage page uses a durable SQLite database by default. The overview's live counters, minute charts and last 300 request details reset on restart. Missing provider usage remains unknown; see [Usage and costs](docs/usage-costs.md) for coverage, retention and backup details.
 
 **I used this project when it was called CLIProxyAPI-Rust.** Everything keeps working. The old `CLIPROXYAPI_RUST_CONFIG` and `CLIPROXYAPI_RUST_DEFAULT_HOST` variables are still read (the new names are `FUSEBOX_CONFIG` and `FUSEBOX_DEFAULT_HOST`), the `x-cliproxy-*` session headers are still accepted, `~/.cli-proxy-api` is still found, and the dashboard moves its saved preferences over. Rename the binary in your scripts from `cliproxyapi-rust` to `fusebox`, and Codex's `env_key` to `FUSEBOX_KEY` if you like.
 

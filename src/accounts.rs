@@ -294,9 +294,28 @@ pub struct PendingOAuthSave {
 pub struct Counters {
     pub requests: u64,
     pub failures: u64,
+    pub cancelled: u64,
+    pub usage_missing: u64,
+    pub usage_partial: u64,
     pub input_tokens: u64,
     pub output_tokens: u64,
     pub cache_tokens: u64,
+}
+
+impl Counters {
+    pub fn record(&mut self, log: &crate::state::RequestLog) {
+        self.requests += 1;
+        if log.status == 499 {
+            self.cancelled += 1;
+        } else if log.status >= 400 {
+            self.failures += 1;
+        }
+        self.usage_missing += u64::from(log.usage_completeness == "missing");
+        self.usage_partial += u64::from(log.usage_completeness == "partial");
+        self.input_tokens += log.input_tokens;
+        self.output_tokens += log.output_tokens;
+        self.cache_tokens += log.cache_tokens;
+    }
 }
 
 #[derive(Debug, Default)]

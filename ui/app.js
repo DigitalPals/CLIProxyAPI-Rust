@@ -340,23 +340,18 @@ function onRequest(log) {
   }, 1500);
   const o = S.overview;
   if (o) {
-    o.totals.requests += 1;
-    if (log.status < 400) o.totals.ok += 1; else o.totals.failed += 1;
+    addRequestCounters(o.totals, log, true);
     const minute = Math.floor(Date.parse(log.ts) / 60000);
     const cutoff = Math.floor(Date.now() / 60000) - 59;
     o.series = o.series.filter((bucket) => bucket.minute >= cutoff);
     let b = o.series.find((bucket) => bucket.minute === minute);
     if (!b && minute >= cutoff) {
-      o.series.push((b = { minute, requests: 0, failed: 0, tokens: 0, input_tokens: 0, output_tokens: 0, cache_tokens: 0 }));
+      o.series.push((b = { minute, requests: 0, failed: 0, cancelled: 0, usage_missing: 0, usage_partial: 0, tokens: 0, input_tokens: 0, output_tokens: 0, cache_tokens: 0 }));
       o.series.sort((a, b) => a.minute - b.minute);
     }
     if (b) {
-      b.requests += 1;
-      if (log.status >= 400) b.failed += 1;
+      addRequestCounters(b, log);
       b.tokens += log.input_tokens + log.output_tokens + log.cache_tokens;
-      b.input_tokens += log.input_tokens;
-      b.output_tokens += log.output_tokens;
-      b.cache_tokens += log.cache_tokens;
     }
   }
   if (log.account_id && S.activity[log.account_id]) S.activity[log.account_id].at = 0;
@@ -376,6 +371,52 @@ function onRequest(log) {
     patch('models-root', modelsBodyHTML);
   }
   if (S.drawer && S.drawer === log.account_id) { patch('drawer-reqs', drawerRequestsHTML); loadActivity(S.drawer); }
+}
+
+function usageState(r) {
+  if (['complete', 'partial', 'missing'].includes(r.usage_completeness)) return r.usage_completeness;
+  // Older request records do not establish that their observed usage is final.
+  return r.input_tokens || r.output_tokens || r.cache_tokens ? 'partial' : 'missing';
+}
+
+function addRequestCounters(c, log, withOk = false) {
+  c.requests = (c.requests || 0) + 1;
+  const outcome = log.status === 499 ? 'cancelled' : log.status >= 400 ? 'failed' : withOk ? 'ok' : null;
+  if (outcome) c[outcome] = (c[outcome] || 0) + 1;
+  const completeness = usageState(log);
+  if (completeness !== 'complete') {
+    const field = `usage_${completeness}`;
+    c[field] = (c[field] || 0) + 1;
+  }
+  for (const field of ['input_tokens', 'output_tokens', 'cache_tokens']) c[field] = (c[field] || 0) + (log[field] || 0);
+}
+
+function usageCoverageText(c) {
+  return [c.usage_missing ? `${fmt(c.usage_missing)} missing` : '', c.usage_partial ? `${fmt(c.usage_partial)} partial` : ''].filter(Boolean).join(' · ');
+}
+
+function aggregateTokenText(c, field) {
+  const value = c[field] || 0;
+  if (!c.usage_missing && !c.usage_partial) return fmt(value);
+  return value ? `≥${fmt(value)}` : 'Unknown';
+}
+
+function aggregateTokensHTML(c, field) {
+  const coverage = usageCoverageText(c);
+  const title = coverage ? `Observed tokens only; request usage: ${coverage}. Total consumption is unknown.` : 'Reported provider tokens';
+  return `<span title="${esc(title)}">${aggregateTokenText(c, field)}</span>`;
+}
+
+function seriesCounters(series) {
+  return series.reduce((sum, b) => {
+    for (const field of ['requests', 'failed', 'cancelled', 'usage_missing', 'usage_partial', 'input_tokens', 'output_tokens', 'cache_tokens']) sum[field] = (sum[field] || 0) + (b[field] || 0);
+    return sum;
+  }, {});
+}
+
+function usageStats(c) {
+  return [['usage_missing', 'Usage missing'], ['usage_partial', 'Usage partial']]
+    .filter(([field]) => c[field]).map(([field, label]) => [fmt(c[field]), label]);
 }
 
 // ---------------------------------------------------------------- render
@@ -738,18 +779,20 @@ function overviewHTML() {
 
 function figuresHTML() {
   const o = S.overview;
-  const sum = (k) => o.series.reduce((n, b) => n + (b[k] || 0), 0);
-  const req = sum('requests');
-  const failed = sum('failed');
-  const ok = req - failed;
-  const rate = req ? `${((ok / req) * 100).toFixed(ok === req ? 0 : 1)}%` : '—';
+  const c = seriesCounters(o.series);
+  const req = c.requests || 0;
+  const completed = req - (c.cancelled || 0);
+  const ok = completed - (c.failed || 0);
+  const rate = completed ? `${((ok / completed) * 100).toFixed(ok === completed ? 0 : 1)}%` : '—';
   const items = [
     ['Requests', fmt(req)],
-    ['Success', rate],
-    ['Tokens in', fmt(sum('input_tokens'))],
-    ['Tokens out', fmt(sum('output_tokens'))],
-    ['Cached', fmt(sum('cache_tokens'))],
+    ['Success', `<span title="Successful requests divided by non-cancelled requests">${rate}</span>`],
+    ['Cancelled', fmt(c.cancelled || 0)],
+    ['Tokens in', aggregateTokensHTML(c, 'input_tokens')],
+    ['Tokens out', aggregateTokensHTML(c, 'output_tokens')],
+    ['Cached', aggregateTokensHTML(c, 'cache_tokens')],
     ['In flight', fmt(o.active)],
+    ...usageStats(c).map(([v, k]) => [k, v]),
   ];
   return items.map(([k, v]) => `<div><dt>${k}</dt><dd>${v}</dd></div>`).join('');
 }
@@ -759,7 +802,8 @@ function barsHTML(series = S.overview.series) {
   const now = Math.floor(Date.now() / 60000);
   const total = series.reduce((a, b) => a + b.requests, 0);
   const bars = series.map((b) => {
-    const label = `${new Date(b.minute * 60000).toLocaleTimeString('en-GB', { hour: '2-digit', minute: '2-digit' })} · ${plural(b.requests, 'request')}${b.failed ? `, ${b.failed} failed` : ''} · ${fmt(b.tokens)} tokens`;
+    const coverage = usageCoverageText(b);
+    const label = `${new Date(b.minute * 60000).toLocaleTimeString('en-GB', { hour: '2-digit', minute: '2-digit' })} · ${plural(b.requests, 'request')}${b.failed ? `, ${b.failed} failed` : ''}${b.cancelled ? `, ${b.cancelled} cancelled` : ''} · ${aggregateTokenText(b, 'tokens')} tokens${coverage ? ` · usage: ${coverage}` : ''}`;
     const cls = [b.minute === now ? 'now' : '', b.failed ? 'fail' : '', b.requests ? '' : 'zero'].filter(Boolean).join(' ');
     return `<i${cls ? ` class="${cls}"` : ''} style="height:${b.requests ? Math.max(3, (b.requests / max) * 100) : 0}%" title="${esc(label)}"></i>`;
   });
@@ -983,7 +1027,7 @@ function whySentence(r) {
   }[r.routing_reason] || (r.account ? `It went to ${pick}.` : 'No account could take this request.');
   const tries = r.attempts > 1 ? ` It took ${COUNT[r.attempts] || r.attempts} tries.` : '';
   let end = '';
-  if (r.status === 499) end = ' The client closed the connection before it finished.';
+  if (r.status === 499) end = ` ${cancellationText(r)}`;
   else if (isErr(r)) end = r.attempts > 1 ? ' It still failed upstream.' : ' The request failed upstream; nothing was retried.';
   return base + tries + end;
 }
@@ -1018,11 +1062,28 @@ function acctCellHTML(r, button = true) {
 }
 
 const statusCls = (r) => (isErr(r) ? 'code-err' : r.status === 499 ? 'code-closed' : 'code-ok');
-const statusCell = (r) => `<span class="mono ${statusCls(r)}">${r.status || '—'}</span>`;
+const statusCell = (r) => `<span class="mono ${statusCls(r)}"${r.status === 499 ? ` title="${esc(cancellationText(r))}"` : ''}>${r.status || '—'}</span>`;
+
+function cancellationText(r) {
+  return {
+    downstream_disconnect: 'Connection closed before completion.',
+    downstream_write_timeout: 'Timed out sending the response to the client.',
+    downstream_write_error: 'Connection error while sending the response to the client.',
+    downstream_read_error: 'Connection error while reading from the client.',
+    downstream_queue_limit: 'Connection ended because the pending request limit was reached.',
+  }[r.failure_kind] || 'Connection ended before completion.';
+}
 
 function tokensText(r, field) {
-  if (r.status === 499 && !r.input_tokens && !r.output_tokens && !r.cache_tokens) return '<span class="dim" title="No token usage was reported before this request closed.">—</span>';
-  return `<span title="${Number(r[field] || 0).toLocaleString('en-US')} tokens">${fmt(r[field])}</span>`;
+  const completeness = usageState(r);
+  if (completeness === 'missing') return '<span class="dim" title="No provider token usage was reported; consumption is unknown.">Unknown</span>';
+  const partial = completeness === 'partial';
+  return `<span title="${Number(r[field] || 0).toLocaleString('en-US')} reported tokens${partial ? '; partial usage, total consumption is unknown' : ''}">${partial ? '≥' : ''}${fmt(r[field] || 0)}</span>`;
+}
+
+function requestTokensHTML(r) {
+  if (usageState(r) === 'missing') return '<span class="dim">Unknown · provider usage not reported</span>';
+  return `${tokensText(r, 'input_tokens')} in · ${tokensText(r, 'output_tokens')} out · ${tokensText(r, 'cache_tokens')} cached${usageState(r) === 'partial' ? ' · partial usage' : ''}`;
 }
 
 function recentRowHTML(r) {
@@ -1131,7 +1192,7 @@ function drawerSinceHTML() {
   if (!a) return '';
   const c = a.counters;
   const sessions = S.activity[a.id] ? fmt(S.activity[a.id].sessions.length) : '—';
-  return [[fmt(c.requests), 'Requests'], [fmt(c.failures), 'Failed'], [sessions, 'Sessions'], [fmt(c.input_tokens), 'Tokens in'], [fmt(c.output_tokens), 'Tokens out'], [fmt(c.cache_tokens), 'Cached']]
+  return [[fmt(c.requests), 'Requests'], [fmt(c.failures), 'Failed'], [fmt(c.cancelled || 0), 'Cancelled'], [sessions, 'Sessions'], [aggregateTokensHTML(c, 'input_tokens'), 'Tokens in'], [aggregateTokensHTML(c, 'output_tokens'), 'Tokens out'], [aggregateTokensHTML(c, 'cache_tokens'), 'Cached'], ...usageStats(c)]
     .map(([v, k]) => `<div><b>${v}</b><span>${k}</span></div>`).join('');
 }
 
@@ -1370,7 +1431,7 @@ function accountListHTML() {
       return `<div class="item click${a.disabled ? ' off' : ''}" data-open="${esc(a.id)}" style="${a.disabled ? 'opacity:.55' : ''}">
         <div class="item-top">${acctLogo(a, 18)}<div class="cell2"><button class="name-btn" type="button" data-act="open-acc" data-id="${esc(a.id)}">${esc(acctLabel(a))}</button><span>${esc(provName(a))} · ${esc(authName(a))}</span></div>${statusHTML(a, 7)}</div>
         ${metered(a) ? `<div class="indent">${miniMetersHTML(a)}</div>` : ''}
-        <div class="metaline indent">${st.cls === 'cooling' ? `<span>${esc(modelScope(st.model))}</span>` : ''}${bankedLineHTML(a)}<span>${fmt(a.counters.requests)} req · ${liveAgo(a.last_used)}</span>${fails ? `<span class="err">${fmt(fails)} failed</span>` : ''}</div>
+        <div class="metaline indent">${st.cls === 'cooling' ? `<span>${esc(modelScope(st.model))}</span>` : ''}${bankedLineHTML(a)}<span>${fmt(a.counters.requests)} req · ${liveAgo(a.last_used)}</span>${fails ? `<span class="err">${fmt(fails)} failed</span>` : ''}${a.counters.cancelled ? `<span>${fmt(a.counters.cancelled)} cancelled</span>` : ''}${usageCoverageText(a.counters) ? `<span>Usage: ${usageCoverageText(a.counters)}</span>` : ''}</div>
         ${a.last_error && !a.disabled ? `<span class="errline indent">${esc(hideEmails(a.last_error))}</span>` : ''}
       </div>`;
     }).join('');
@@ -1384,7 +1445,7 @@ function accountListHTML() {
         <div class="who">${acctLogo(a)}<div class="cell2"><button class="name-btn" type="button" data-act="open-acc" data-id="${esc(a.id)}">${esc(acctLabel(a))}</button><span class="sub">${esc(acctSub(a))}</span></div></div>
         ${metered(a) ? metersHTML(a) : '<span class="no-limits">No usage limits</span>'}
         <div class="c-status">${statusHTML(a)}${statusExtrasHTML(a)}</div>
-        <div class="c-traffic"><span>${fmt(c.requests)} <span class="dim">requests</span></span><span class="subs-line">${fmt(c.input_tokens)} in · ${fmt(c.output_tokens)} out${c.failures ? ` · <span class="err">${fmt(c.failures)} failed</span>` : ''}</span></div>
+        <div class="c-traffic"><span>${fmt(c.requests)} <span class="dim">requests</span></span><span class="subs-line">${aggregateTokensHTML(c, 'input_tokens')} in · ${aggregateTokensHTML(c, 'output_tokens')} out${c.failures ? ` · <span class="err">${fmt(c.failures)} failed</span>` : ''}${c.cancelled ? ` · ${fmt(c.cancelled)} cancelled` : ''}</span>${usageCoverageText(c) ? `<span class="subs-line">Usage: ${usageCoverageText(c)}</span>` : ''}</div>
         <span class="c-last fg2" style="text-align:left">${liveAgo(a.last_used)}</span>
         ${breakerHTML(a)}
       </div>
@@ -1469,11 +1530,12 @@ function detLoadHTML() {
   if (!a) return '';
   const act = S.activity[a.id];
   const series = act?.series || Array.from({ length: 60 }, (_, i) => ({ minute: Math.floor(Date.now() / 60000) - 59 + i, requests: 0, failed: 0, tokens: 0 }));
-  const sum = (k) => series.reduce((n, b) => n + (b[k] || 0), 0);
-  const v = (k) => (act ? fmt(sum(k)) : '—');
-  const stats = [[v('requests'), 'Requests'], [v('failed'), 'Failed']];
+  const c = seriesCounters(series);
+  const v = (k) => (act ? fmt(c[k] || 0) : '—');
+  const tokens = (k) => act ? aggregateTokensHTML(c, k) : '—';
+  const stats = [[v('requests'), 'Requests'], [v('failed'), 'Failed'], [v('cancelled'), 'Cancelled']];
   if (mob()) stats.push([act ? fmt(act.sessions.length) : '—', 'Sessions']);
-  stats.push([v('input_tokens'), 'Tokens in'], [v('output_tokens'), 'Tokens out'], [v('cache_tokens'), 'Cached']);
+  stats.push([tokens('input_tokens'), 'Tokens in'], [tokens('output_tokens'), 'Tokens out'], [tokens('cache_tokens'), 'Cached'], ...usageStats(c));
   return `<div class="load-head"><span class="label">Load · last 60 min</span><dl class="stats">${stats.map(([n, k]) => `<div><dt>${k}</dt><dd>${n}</dd></div>`).join('')}</dl></div>
     <div class="bars h72">${barsHTML(series)}</div><div class="axis" aria-hidden="true"><span>60 min ago</span><span>now</span></div>`;
 }
@@ -1533,7 +1595,8 @@ function detSessionsHTML() {
     const fp = s.session ? `<button class="sess-btn" type="button" data-act="filter-session" data-id="${esc(s.session)}" title="Show this session’s requests">${esc(s.session.slice(0, 8))}</button>` : '<span class="dim mono">unknown</span>';
     const client = s.client_app || (s.client ? `${CLIENT[s.client] || s.client} client` : '');
     const since = s.since ? `since ${hm(s.since)}` : `seen ${ago(s.last_seen)}`;
-    const meta = s.requests ? `<span class="mono">${esc(s.model || '')}</span><span>· ${plural(s.requests, 'req', 'req')} · ${fmt(s.cache_tokens)} cached</span>` : '<span>No requests in the last 300</span>';
+    const coverage = usageCoverageText(s);
+    const meta = s.requests ? `<span class="mono">${esc(s.model || '')}</span><span>· ${plural(s.requests, 'recent req', 'recent req')} · ${aggregateTokensHTML(s, 'cache_tokens')} cached${coverage ? ` · usage: ${coverage}` : ''}</span>` : '<span>No requests in the last 300</span>';
     return `<div class="sess"><div class="sess-top">${fp}<span class="fg2">${esc(client)}</span>${s.active ? '<span class="dot s6 ok" title="A request is in flight"></span>' : ''}<span class="grow"></span><span class="dim" style="font-size:12px">${since}</span></div><div class="sess-meta">${meta}</div></div>`;
   }).join('');
 }
@@ -1852,7 +1915,7 @@ function visibleRequests() {
     && (!S.reqSess || r.session_id === S.reqSess)
     && textMatches(r));
 }
-const CHIPS = { all: () => true, errors: isErr, rerouted: isRerouted };
+const CHIPS = { all: () => true, errors: isErr, cancelled: (r) => r.status === 499, rerouted: isRerouted };
 const shownRequests = () => visibleRequests().filter(CHIPS[S.reqChip] || CHIPS.all);
 
 function pauseHTML() {
@@ -1862,7 +1925,7 @@ function pauseHTML() {
 
 function reqToolsHTML() {
   const base = visibleRequests();
-  const chips = [['all', 'All'], ['errors', 'Errors'], ['rerouted', 'Rerouted']].map(([id, label]) => `<button class="chip" type="button" data-act="req-chip" data-id="${id}" aria-pressed="${S.reqChip === id}">${label} <span class="n">${base.filter(CHIPS[id]).length}</span></button>`).join('');
+  const chips = [['all', 'All'], ['errors', 'Errors'], ['cancelled', 'Cancelled'], ['rerouted', 'Rerouted']].map(([id, label]) => `<button class="chip" type="button" data-act="req-chip" data-id="${id}" aria-pressed="${S.reqChip === id}">${label} <span class="n">${base.filter(CHIPS[id]).length}</span></button>`).join('');
   const acct = S.reqAcc && accountById(S.reqAcc);
   const pills = [];
   if (S.reqAcc) pills.push(['acc', 'Account', acct ? acctLabel(acct) : S.reqAcc.slice(0, 12)]);
@@ -1898,8 +1961,8 @@ function reqListHTML() {
 const isFresh = (r) => (S.fresh.get(r.id) || 0) > Date.now();
 
 function errLineText(r) {
+  if (r.status === 499) return cancellationText(r);
   if (!r.error) return '';
-  if (r.status === 499) return 'Client closed the connection.';
   return r.status >= 400 ? String(hideEmails(r.error)) : '';
 }
 
@@ -1921,7 +1984,7 @@ function reqItemHTML(r) {
         <div><span>Endpoint</span><span class="mono">${esc(endpoint)}</span></div>
         <div><span>Session</span><span class="mono" title="${esc(r.session_id || '')}">${esc(r.session_id ? r.session_id.slice(0, 8) : 'none')}</span></div>
         <div class="why-ft"><span>Latency</span><span class="mono">${ms(r.ttft_ms)} to first token</span></div>
-        <div class="why-tok"><span>Tokens</span><span class="mono">${fmt(r.input_tokens)} in · ${fmt(r.output_tokens)} out · ${fmt(r.cache_tokens)} cached</span></div>
+        <div class="why-tok"><span>Tokens</span><span class="mono">${requestTokensHTML(r)}</span></div>
       </div>
       <div class="why-text"><span class="label">Why this account</span><p>${esc(whySentence(r))}</p></div>
       <div class="why-acts">${accountOf(r) ? `<button class="btn sm" type="button" data-act="open-acc" data-id="${esc(accountOf(r).id)}">Open account</button>` : ''}${r.session_id ? `<button class="btn sm" type="button" data-act="filter-session" data-id="${esc(r.session_id)}">Only this session</button>` : ''}</div>
@@ -1942,7 +2005,7 @@ function reqMobileHTML(r) {
     <span class="l3">${esc(reqAcctName(r))}${r.routing_reason ? ` · ${noteHTML(r)}` : ''}${r.session_id ? ` · <span class="mono">${esc(r.session_id.slice(0, 8))}</span>` : ''}</span>
     ${err ? `<span class="errline${r.status === 499 ? ' dim' : ''}" style="font-size:11.5px${r.status === 499 ? ';color:var(--fg-3)' : ''}">${esc(err)}</span>` : ''}
     ${open ? `<div class="m-why"><p>${esc(whySentence(r))}</p><span class="meta" style="font-size:12px">${esc(client)} · <span class="mono">${esc(endpoint)}</span></span>
-      <span class="meta" style="font-size:12px">First token ${ms(r.ttft_ms)} · ${fmt(r.input_tokens)} in · ${fmt(r.output_tokens)} out · ${fmt(r.cache_tokens)} cached</span>
+      <span class="meta" style="font-size:12px">First token ${ms(r.ttft_ms)} · ${requestTokensHTML(r)}</span>
       <div class="acts">${acct ? `<button class="btn" type="button" data-act="open-acc" data-id="${esc(acct.id)}">Open account</button>` : ''}${r.session_id ? `<button class="btn" type="button" data-act="filter-session" data-id="${esc(r.session_id)}">Session ${esc(r.session_id.slice(0, 8))}</button>` : ''}</div></div>` : ''}
   </div>`;
 }

@@ -458,6 +458,22 @@ fn local_state(directory: &Path) -> Result<LocalState> {
     validate_destination(&state.destination)?;
     Ok(state)
 }
+fn outbox_sidecar(path: &Path) -> Result<Option<fs::File>> {
+    // DELETE-mode journals may disappear on commit, including while the previous
+    // writer finishes shutting down. Inspect the link itself (even if dangling).
+    match fs::symlink_metadata(path) {
+        Ok(metadata) if metadata.file_type().is_symlink() => bail!("symlink outbox sidecar unsupported"),
+        Ok(metadata) if !metadata.is_file() => bail!("invalid outbox sidecar"),
+        Ok(_) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error.into()),
+    }
+    match fs::File::open(path) {
+        Ok(file) => Ok(Some(file)),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(error.into()),
+    }
+}
 async fn local_store(directory: PathBuf) -> Result<Store> {
     let store = tokio::task::spawn_blocking(move || -> Result<Store> {
         secure_dir(&directory)?;
@@ -467,8 +483,15 @@ async fn local_store(directory: PathBuf) -> Result<Store> {
         }
         for suffix in ["-wal", "-shm", "-journal"] {
             let sidecar = directory.join(format!("outbox.sqlite3{suffix}"));
-            if sidecar.exists() && fs::symlink_metadata(sidecar)?.file_type().is_symlink() {
-                bail!("symlink outbox sidecar unsupported")
+            if let Some(file) = outbox_sidecar(&sidecar)? {
+                #[cfg(unix)]
+                {
+                    use std::os::unix::fs::PermissionsExt;
+                    // A descriptor remains valid if SQLite unlinks the sidecar.
+                    file.set_permissions(fs::Permissions::from_mode(0o600))?;
+                }
+                #[cfg(not(unix))]
+                drop(file);
             }
         }
         #[cfg(unix)]
@@ -479,18 +502,10 @@ async fn local_store(directory: PathBuf) -> Result<Store> {
             }
             fs::set_permissions(&database, fs::Permissions::from_mode(0o600))?;
         }
-        let store = Store::open_collector(&database, MAX_LOCAL_DATABASE_BYTES)?;
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            for suffix in ["", "-wal", "-shm", "-journal"] {
-                let file = directory.join(format!("outbox.sqlite3{suffix}"));
-                if file.exists() {
-                    fs::set_permissions(file, fs::Permissions::from_mode(0o600))?;
-                }
-            }
-        }
-        Ok(store)
+        // SQLite inherits the database's 0600 mode for newly created sidecars.
+        // Do not sweep paths after starting its worker: a commit can unlink a
+        // rollback journal between an existence check and chmod.
+        Store::open_collector(&database, MAX_LOCAL_DATABASE_BYTES)
     })
     .await??;
     imports::init(&store).await?;
