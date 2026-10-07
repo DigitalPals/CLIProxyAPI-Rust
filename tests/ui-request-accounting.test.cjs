@@ -8,7 +8,7 @@ const source = fs.readFileSync(path.join(__dirname, '../ui/app.js'), 'utf8');
 const section = (start, end) => source.slice(source.indexOf(start), source.indexOf(end));
 const code = [
   section('function onRequest(log) {', '// ---------------------------------------------------------------- render'),
-  section('function figuresHTML() {', 'function ovFaultsHTML() {'),
+  section('function figuresHTML() {', 'const ROUTING_TEXT = {'),
   section('const statusCls =', 'function recentRowHTML(r) {'),
   section('function drawerSinceHTML() {', 'function drawerRequestsHTML() {'),
   section('function detLoadHTML() {', 'function detRequestsHTML() {'),

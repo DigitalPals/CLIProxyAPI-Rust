@@ -151,7 +151,7 @@ Mode: Operate. Familiar controls, dense tables, tabular numbers, keyboard shortc
 Self-hosted from `ui/fonts/` (latin subset, SIL OFL 1.1), served at `/ui/fonts/*` with no external requests.
 
 - IBM Plex Sans for everything people read: 14px/1.45 body, 13px rows and buttons, 12–12.5px metadata, 20px/500 figures.
-- IBM Plex Sans Condensed, uppercase and tracked, for labels: 22px page titles (Accounts, Requests, Models, Config), 13px section titles (Subscriptions, Other circuits, Latest requests), 11px panel labels (Main line, Load · last 60 min, Tripped & faults) and table headers, 10.5px meter labels (5H, WK), `NEEDS RESTART` and `NEXT`. Labels are written in sentence case in the markup and set in capitals by CSS.
+- IBM Plex Sans Condensed, uppercase and tracked, for labels: 22px page titles (Accounts, Requests, Models, Config), 13px section titles (Subscriptions, Other circuits, Latest requests), 11px panel labels (Main line, Load · last 60 min) and table headers, 10.5px meter labels (5H, WK), `NEEDS RESTART` and `NEXT`. Labels are written in sentence case in the markup and set in capitals by CSS.
 - DM Mono for data: the endpoint, keys, model ids, times, status codes, session ids, file paths, YAML and keyboard hints.
 - `font-variant-numeric: tabular-nums` everywhere.
 
@@ -159,7 +159,7 @@ Self-hosted from `ui/fonts/` (latin subset, SIL OFL 1.1), served at `/ui/fonts/*
 
 Fluid and full width (no max-width container). Desktop: a 56px header with the wordmark (the mark below 900px), five tabs (Overview, Accounts, Requests, Models, Config), the search button (⌘K), the faults button, the privacy toggle and Live / Reconnecting. Phones (below 760px): a 52px header (the wordmark on Overview, otherwise the mark and the page title) and a 64px bottom tab bar with an amber 16×2px indicator.
 
-Overview, top to bottom: the main line (endpoint, key, model count and "Set up a client", open until the first request), then Load · last 60 min beside Tripped & faults, Subscriptions, Other circuits, Latest requests. On phones the order is main line, faults, subscriptions, load, other circuits, latest requests.
+Overview, top to bottom: the main line (endpoint, key, model count and "Set up a client", open until the first request), then Load · last 60 min across the full width, Subscriptions, Other circuits, Latest requests. Tripped accounts are listed by the faults button in the top bar, not on the page. On phones the order is main line, subscriptions, load, other circuits, latest requests, and the faults button sits in the header on every page.
 
 Column tiers: Requests adds First token at 1100px and In / Out / Cached at 1360px; Accounts adds Traffic at 1100px and # / Last used at 1380px; Overview's subscriptions add # and Requests at 1180px and latest requests add First token at 1240px; Models shows route order beside the ids from 1180px; Config's section nav becomes chips below 980px.
 

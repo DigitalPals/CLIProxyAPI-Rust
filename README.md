@@ -20,7 +20,7 @@ Point Claude Code, Codex, your editor or any SDK at one URL and stop caring whic
 
 <br>
 
-<img src="assets/screenshots/overview.png" alt="Fusebox dashboard: the main line, an hour of load, tripped accounts, and every subscription's 5-hour and weekly limits side by side" width="100%">
+<img src="assets/screenshots/overview.png" alt="Fusebox dashboard: the main line, an hour of load, and every subscription's 5-hour and weekly limits side by side" width="100%">
 
 <br>
 

@@ -360,7 +360,6 @@ function onRequest(log) {
     patch('figures', figuresHTML);
     patch('bars', barsHTML);
     patch('recent', recentHTML);
-    patch('ov-faults', ovFaultsHTML);
   } else if (S.route === 'requests') {
     if (S.paused) patch('req-pause', pauseHTML);
     else insertRequest(log);
@@ -445,7 +444,6 @@ function refreshViews() {
   if (S.locked || !S.overview) return;
   if (S.route === 'overview') {
     patch('ov-main', mainlineHTML);
-    patch('ov-faults', ovFaultsHTML);
     patch('ov-subs', ovSubsHTML);
     patch('ov-other', ovOtherHTML);
     patch('recent', recentHTML);
@@ -510,7 +508,7 @@ function renderChrome() {
   if (S.route === 'overview' || S.locked) lead = `${WORDMARK}<span class="dot s6 ${S.live === 'offline' ? 'err' : 'ok'}" data-live-dot aria-hidden="true"></span>`;
   else if (S.route === 'accounts' && S.sub) lead = `<button class="back" type="button" data-act="to-list">${ICON.back}Accounts</button>`;
   else lead = `${MARK}<span class="title">${TITLES[S.route]}</span>`;
-  $('#mbar').innerHTML = `${lead}${S.route !== 'overview' ? down : ''}<span class="grow"></span>${ready && S.route !== 'overview' ? '<span class="faults-slot" data-faults-slot></span>' : ''}${ready ? searchBtn : ''}${privacyBtn}`;
+  $('#mbar').innerHTML = `${lead}${S.route !== 'overview' ? down : ''}<span class="grow"></span>${ready ? '<span class="faults-slot" data-faults-slot></span>' : ''}${ready ? searchBtn : ''}${privacyBtn}`;
   $('.bar .search').hidden = !ready;
   renderPrivacy();
   renderLive();
@@ -738,15 +736,6 @@ function alertsList() {
   return out.sort((x, y) => (x.lvl === y.lvl ? 0 : x.lvl === 'err' ? -1 : 1));
 }
 
-function alertHTML(al, i) {
-  const a = accountById(al.id);
-  if (!a) return '';
-  return `<div class="alert"${mob() ? ` data-open="${esc(a.id)}"` : ''}><span class="dot ${al.lvl}"></span>
-    <div class="alert-main"><div class="alert-top">${acctLogo(a, 14)}<span class="alert-title">${esc(al.title)}</span>${mob() ? '' : `<span class="alert-who">${esc(acctLabel(a))}</span>`}</div>
-      <div class="alert-detail">${esc(al.detail)}</div>${mob() ? `<span class="alert-who">${esc(acctLabel(a))}</span>` : ''}</div>
-    <button class="btn sm" type="button" data-act="alert" data-id="${i}">${esc(al.act)}</button></div>`;
-}
-
 function runAlert(i) {
   const al = alertsList()[Number(i)];
   if (!al) return;
@@ -764,17 +753,15 @@ function overviewHTML() {
       <div class="load-head"><h2 class="label" id="load-title">Load · last 60 min</h2><dl class="stats" id="figures">${figuresHTML()}</dl></div>
       <div class="bars" id="bars">${barsHTML()}</div>
       <div class="axis" aria-hidden="true"><span>60 min ago</span><span>now</span></div></section>`;
-  const faults = `<section class="card faults-card" id="ov-faults" aria-label="Tripped and faults">${ovFaultsHTML()}</section>`;
   const subs = `<section class="sec" id="ov-subs" aria-label="Subscriptions">${ovSubsHTML()}</section>`;
   const other = `<section class="sec" id="ov-other" aria-label="Other circuits">${ovOtherHTML()}</section>`;
   const latest = `<section class="sec" aria-labelledby="latest-title"><div class="sec-head"><h2 class="h-sec" id="latest-title">Latest requests</h2><span class="grow"></span><a class="link" href="#/requests">All requests →</a></div>
       <div id="recent">${recentHTML()}</div></section>`;
   if (mob()) {
     const loadSec = `<section class="sec" aria-labelledby="load-title-m"><h2 class="h-sec" id="load-title-m">Load · last 60 min</h2>${load.replace(' aria-labelledby="load-title"', '').replace('<h2 class="label" id="load-title">Load · last 60 min</h2>', '')}</section>`;
-    const faultSec = `<section class="sec"><div class="sec-head"><h2 class="h-sec">Tripped &amp; faults</h2><span class="kbd" style="border:0;padding:0;font-size:12px" id="ov-fault-count">${alertsList().length}</span></div>${faults}</section>`;
-    return main + faultSec + subs + loadSec + other + latest;
+    return main + subs + loadSec + other + latest;
   }
-  return `${main}<div class="ov-row">${load}${faults}</div>${subs}${other}${latest}`;
+  return `${main}${load}${subs}${other}${latest}`;
 }
 
 function figuresHTML() {
@@ -808,20 +795,6 @@ function barsHTML(series = S.overview.series) {
     return `<i${cls ? ` class="${cls}"` : ''} style="height:${b.requests ? Math.max(3, (b.requests / max) * 100) : 0}%" title="${esc(label)}"></i>`;
   });
   return `<span class="sr-only">${plural(total, 'request')} in the last hour</span>${bars.join('')}`;
-}
-
-function ovFaultsHTML() {
-  const list = alertsList();
-  const count = $('#ov-fault-count');
-  if (count) count.textContent = list.length;
-  if (mob()) {
-    return list.length ? list.map(alertHTML).join('') : '<p class="empty-line">Nothing tripped. Every account is in rotation.</p>';
-  }
-  const more = list.length - 2;
-  const head = `<div class="head"><h2 class="label">Tripped &amp; faults</h2>${more > 0
-    ? `<button class="more-btn" type="button" data-act="faults"><span>+${more} more</span><span class="mono dim">·</span><span>View all ${list.length}</span></button>`
-    : `<span class="mono dim" style="font-size:12px">${list.length}</span>`}</div>`;
-  return head + (list.length ? list.slice(0, 2).map(alertHTML).join('') : '<p class="empty-line" style="border-top:1px solid var(--line)">Nothing tripped. Every account is in rotation.</p>');
 }
 
 const ROUTING_TEXT = {
@@ -2419,7 +2392,7 @@ document.addEventListener('click', (e) => {
     case 'close-palette': return closePalette();
     case 'faults': return toggleFaults(el);
     case 'close-faults': return closeFaults();
-    case 'alert': case 'alert-open': return runAlert(id);
+    case 'alert-open': return runAlert(id);
     case 'open-acc': return openAccount(id);
     case 'close-drawer': return closeDrawer();
     case 'to-list': location.hash = '#/accounts'; return;
