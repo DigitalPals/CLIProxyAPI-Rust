@@ -38,7 +38,16 @@ fn headers(token: &str) -> HeaderMap {
     h
 }
 fn batch(o: Vec<Observation>) -> Bytes {
-    Bytes::from(serde_json::to_vec(&Batch { version: 1, observations: o, pending: 1, superseded: Vec::new() }).unwrap())
+    Bytes::from(
+        serde_json::to_vec(&Batch {
+            version: 1,
+            observations: o,
+            pending: 1,
+            superseded: Vec::new(),
+            progress: Vec::new(),
+        })
+        .unwrap(),
+    )
 }
 async fn body(response: Response) -> Value {
     serde_json::from_slice(&axum::body::to_bytes(response.into_body(), MAX_BODY).await.unwrap()).unwrap()
@@ -184,6 +193,11 @@ async fn two_collectors_durable_offline_restart_and_replay() {
     assert_eq!(local_status(&reopened, &states[0]).await.unwrap()["collector"]["outbox"]["pending"], 0);
     let collectors = status(&server_store).await.unwrap();
     assert_eq!(collectors["collectors"].as_array().unwrap().len(), 2);
+    for collector in collectors["collectors"].as_array().unwrap() {
+        let progress = collector["progress"].as_array().unwrap();
+        assert_eq!(progress.len(), 2);
+        assert!(progress.iter().all(|p| p["state"] == "unknown" && p["last_scan_at_ms"].is_null()));
+    }
     assert!(collectors["collectors"].as_array().unwrap().iter().all(|c| c["last_sync_at_ms"].is_number()));
     handle.abort();
 }
@@ -275,6 +289,7 @@ async fn collector_supersession_cannot_suppress_another_identity() {
         observations: vec![],
         pending: 1,
         superseded: vec![CounterSupersession { source_event_id: id.clone() }],
+        progress: Vec::new(),
     };
     assert_eq!(
         ingest(&store, headers(b["credential"].as_str().unwrap()), Bytes::from(serde_json::to_vec(&claim).unwrap()))
@@ -346,6 +361,140 @@ async fn standalone_commands_close_writer_even_when_offline() {
         assert_eq!(reopened.health()["prior_unclosed_sessions"], 0);
         reopened.shutdown().await.unwrap();
     }
+}
+
+fn progress() -> Value {
+    json!({"source":"codex","state":"ready","imported":7,"duplicate":2,"skipped":3,"unsupported":4,"failed":1,"last_scan_at_ms":chrono::Utc::now().timestamp_millis()})
+}
+
+#[test]
+fn progress_aggregation_is_allowlisted_and_never_invents_scan_evidence() {
+    let now = chrono::Utc::now().timestamp_millis();
+    let mut status = json!({"imports":[{"source":"codex","root":"PRIVATE-ROOT-PROJECT-MARKER","enabled":true,"last_error":null,"last_scan_at_ms":null,"imported":5,"duplicate":1,"skipped":2,"unsupported":3,"failed":0}],"candidates":[{"root":"PRIVATE-HOME-MARKER"}]});
+    let report = source_progress(&status).unwrap();
+    assert_eq!(report[0].state, ProgressState::Unknown);
+    assert_eq!(report[1].state, ProgressState::Unknown);
+    status["imports"][0]["last_scan_at_ms"] = json!(now);
+    assert_eq!(source_progress(&status).unwrap()[0].state, ProgressState::Ready);
+    status["imports"].as_array_mut().unwrap().push(json!({"source":"codex","root":"PRIVATE-SECOND-ROOT","enabled":false,"last_error":null,"last_scan_at_ms":now,"imported":7,"duplicate":2,"skipped":3,"unsupported":4,"failed":1}));
+    let report = source_progress(&status).unwrap();
+    assert_eq!(report[0].imported, 12);
+    assert_eq!(report[0].duplicate, 3);
+    let wire = serde_json::to_string(&Batch {
+        version: 1,
+        observations: vec![],
+        pending: 0,
+        superseded: vec![],
+        progress: report,
+    })
+    .unwrap();
+    assert!(!wire.contains("PRIVATE"));
+    assert!(!wire.contains("root"));
+    assert!(!wire.contains("total"));
+    status["imports"][0]["last_error"] = json!("scan unavailable");
+    assert_eq!(source_progress(&status).unwrap()[0].state, ProgressState::Attention);
+    status["imports"][0]["enabled"] = json!(false);
+    assert_eq!(source_progress(&status).unwrap()[0].state, ProgressState::Disabled);
+    let legacy: Batch = serde_json::from_value(json!({"version":1,"observations":[]})).unwrap();
+    assert!(legacy.progress.is_empty());
+}
+
+#[tokio::test]
+async fn progress_bounds_privacy_and_atomic_roundtrip() {
+    let dir = TestDir::new();
+    let store = dir.store();
+    let enrolled = enroll(&store, "progress-test".into()).await.unwrap();
+    let token = enrolled["credential"].as_str().unwrap();
+    let mut good = json!({"version":1,"observations":[],"progress":[progress()]});
+    assert_eq!(
+        ingest(&store, headers(token), Bytes::from(serde_json::to_vec(&good).unwrap())).await.status(),
+        StatusCode::OK
+    );
+    let saved = status(&store).await.unwrap()["collectors"][0]["progress"].clone();
+    assert_eq!(saved, good["progress"]);
+    for (field, value) in [
+        ("source", json!("proxy")),
+        ("state", json!("complete")),
+        ("imported", json!(MAX_PROGRESS_COUNT + 1)),
+        ("duplicate", json!(-1)),
+        ("last_scan_at_ms", json!(0)),
+        ("last_scan_at_ms", json!(chrono::Utc::now().timestamp_millis() + 172_800_000)),
+        ("last_scan_at_ms", Value::Null),
+        ("root", json!("PRIVATE-ROOT-MARKER")),
+    ] {
+        let mut invalid = good.clone();
+        invalid["progress"][0][field] = value;
+        assert_eq!(
+            ingest(&store, headers(token), Bytes::from(serde_json::to_vec(&invalid).unwrap())).await.status(),
+            StatusCode::BAD_REQUEST
+        );
+    }
+    for reports in [json!([progress(), progress()]), json!([progress(), progress(), progress()])] {
+        let mut invalid = good.clone();
+        invalid["progress"] = reports;
+        assert_eq!(
+            ingest(&store, headers(token), Bytes::from(serde_json::to_vec(&invalid).unwrap())).await.status(),
+            StatusCode::BAD_REQUEST
+        );
+    }
+    assert_eq!(status(&store).await.unwrap()["collectors"][0]["progress"], saved);
+    store.call(|c|{c.execute_batch("CREATE TRIGGER fail_progress BEFORE UPDATE ON usage_collector_progress BEGIN SELECT RAISE(FAIL,'test failure'); END;")?;Ok(())}).await.unwrap();
+    good["observations"] = serde_json::to_value(vec![observation("progress-atomic")]).unwrap();
+    good["progress"][0]["imported"] = json!(8);
+    assert_eq!(
+        ingest(&store, headers(token), Bytes::from(serde_json::to_vec(&good).unwrap())).await.status(),
+        StatusCode::SERVICE_UNAVAILABLE
+    );
+    assert_eq!(status(&store).await.unwrap()["collectors"][0]["progress"], saved);
+    let count = store
+        .call(|c| Ok(c.query_row("SELECT COUNT(*) FROM usage_entries", [], |r| r.get::<_, u64>(0))?))
+        .await
+        .unwrap();
+    assert_eq!(count, 0);
+}
+
+#[tokio::test]
+async fn local_database_limit_and_delete_journal_preserve_pending_on_full() {
+    let dir = TestDir::new();
+    let store = local_store(dir.0.clone()).await.unwrap();
+    let pending = serde_json::to_string(&observation("preserved-at-full")).unwrap();
+    let expected = pending.clone();
+    store
+        .call(move |c| {
+            let mode: String = c.query_row("PRAGMA journal_mode", [], |r| r.get(0))?;
+            let durability: u64 = c.query_row("PRAGMA synchronous", [], |r| r.get(0))?;
+            let size: u64 = c.query_row("PRAGMA page_size", [], |r| r.get(0))?;
+            let pages: u64 = c.query_row("PRAGMA max_page_count", [], |r| r.get(0))?;
+            assert_eq!(mode, "delete");
+            assert_eq!(durability, 2);
+            assert!(size * pages <= MAX_LOCAL_DATABASE_BYTES);
+            c.execute(
+                "INSERT INTO usage_collector_outbox(event_key,payload,created_at_ms) VALUES('preserved',?1,0)",
+                [pending],
+            )?;
+            c.execute_batch("CREATE TABLE synthetic_capacity_padding(payload BLOB);")?;
+            let error = c
+                .execute("INSERT INTO synthetic_capacity_padding VALUES(zeroblob(?1))", [MAX_LOCAL_DATABASE_BYTES])
+                .unwrap_err();
+            assert!(matches!(error,rusqlite::Error::SqliteFailure(e,_) if e.code==rusqlite::ErrorCode::DiskFull));
+            Ok(())
+        })
+        .await
+        .unwrap();
+    store.shutdown().await.unwrap();
+    assert!(fs::metadata(dir.0.join("outbox.sqlite3")).unwrap().len() <= MAX_LOCAL_DATABASE_BYTES);
+    assert!(!dir.0.join("outbox.sqlite3-wal").exists());
+    let reopened = local_store(dir.0.clone()).await.unwrap();
+    let saved = reopened
+        .call(|c| {
+            Ok(c.query_row("SELECT payload FROM usage_collector_outbox WHERE event_key='preserved'", [], |r| {
+                r.get::<_, String>(0)
+            })?)
+        })
+        .await
+        .unwrap();
+    assert_eq!(saved, expected);
+    reopened.shutdown().await.unwrap();
 }
 
 #[tokio::test]

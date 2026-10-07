@@ -28,6 +28,9 @@ const MAX_BATCH: usize = 200;
 const MAX_BODY: usize = 512 * 1024;
 const REQUESTS_PER_MINUTE: u64 = 120;
 const CREDENTIAL_PREFIX: &str = "fbxc_";
+const MAX_PROGRESS_COUNT: u64 = 1_000_000_000_000;
+const MAX_LOCAL_DATABASE_BYTES: u64 = 64 * 1024 * 1024;
+const MAX_LOCAL_SQLITE_BYTES: u64 = 130 * 1024 * 1024;
 #[derive(Debug, Subcommand)]
 pub enum CollectorCommand {
     /// Install a server-issued collector credential; stdin is used without --credential-file.
@@ -76,6 +79,94 @@ pub struct Batch {
     pub pending: u64,
     #[serde(default)]
     pub superseded: Vec<CounterSupersession>,
+    #[serde(default)]
+    pub progress: Vec<SourceProgress>,
+}
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ProgressSource {
+    Codex,
+    ClaudeCode,
+}
+impl ProgressSource {
+    fn name(self) -> &'static str {
+        match self {
+            Self::Codex => "codex",
+            Self::ClaudeCode => "claude_code",
+        }
+    }
+}
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ProgressState {
+    Ready,
+    Attention,
+    Disabled,
+    Unknown,
+}
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct SourceProgress {
+    pub source: ProgressSource,
+    pub state: ProgressState,
+    pub imported: u64,
+    pub duplicate: u64,
+    pub skipped: u64,
+    pub unsupported: u64,
+    pub failed: u64,
+    pub last_scan_at_ms: Option<i64>,
+}
+impl SourceProgress {
+    fn valid(&self) -> bool {
+        [self.imported, self.duplicate, self.skipped, self.unsupported, self.failed]
+            .into_iter()
+            .all(|v| v <= MAX_PROGRESS_COUNT)
+            && self
+                .last_scan_at_ms
+                .is_none_or(|at| (1_577_836_800_000..=chrono::Utc::now().timestamp_millis() + 86_400_000).contains(&at))
+            && (self.state != ProgressState::Ready || self.last_scan_at_ms.is_some())
+    }
+}
+fn source_progress(status: &Value) -> Result<Vec<SourceProgress>> {
+    let roots = status["imports"].as_array().ok_or_else(|| anyhow!("import progress unavailable"))?;
+    [ProgressSource::Codex, ProgressSource::ClaudeCode]
+        .into_iter()
+        .map(|source| {
+            let selected: Vec<_> = roots.iter().filter(|root| root["source"].as_str() == Some(source.name())).collect();
+            let enabled: Vec<_> = selected.iter().filter(|root| root["enabled"].as_bool() == Some(true)).collect();
+            let count = |name: &str| -> Result<u64> {
+                selected.iter().try_fold(0_u64, |sum, root| {
+                    sum.checked_add(root[name].as_u64().unwrap_or(0))
+                        .filter(|sum| *sum <= MAX_PROGRESS_COUNT)
+                        .ok_or_else(|| anyhow!("import progress exceeds bounds"))
+                })
+            };
+            let progress = SourceProgress {
+                source,
+                state: if selected.is_empty() {
+                    ProgressState::Unknown
+                } else if enabled.is_empty() {
+                    ProgressState::Disabled
+                } else if enabled.iter().any(|root| root["last_error"].is_string()) {
+                    ProgressState::Attention
+                } else if enabled.iter().any(|root| root["last_scan_at_ms"].as_i64().is_none()) {
+                    ProgressState::Unknown
+                } else {
+                    ProgressState::Ready
+                },
+                imported: count("imported")?,
+                duplicate: count("duplicate")?,
+                skipped: count("skipped")?,
+                unsupported: count("unsupported")?,
+                failed: count("failed")?,
+                last_scan_at_ms: selected.iter().filter_map(|root| root["last_scan_at_ms"].as_i64()).max(),
+            };
+            if !progress.valid() {
+                bail!("invalid import progress")
+            }
+            Ok(progress)
+        })
+        .collect()
 }
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
@@ -102,7 +193,8 @@ fn id_ok(id: &str) -> Result<()> {
     Ok(())
 }
 async fn init(store: &Store) -> Result<()> {
-    store.call(|conn| {conn.execute_batch("CREATE TABLE IF NOT EXISTS usage_collectors(id TEXT PRIMARY KEY,label TEXT NOT NULL,credential_hash TEXT NOT NULL UNIQUE,revoked INTEGER NOT NULL DEFAULT 0,last_contact_at_ms INTEGER,last_sync_at_ms INTEGER,pending INTEGER NOT NULL DEFAULT 0,covered_sources TEXT NOT NULL DEFAULT '[]',time_start_ms INTEGER,time_end_ms INTEGER,rate_minute INTEGER NOT NULL DEFAULT 0,rate_count INTEGER NOT NULL DEFAULT 0);")?;Ok(())}).await
+    store.call(|conn| {conn.execute_batch("CREATE TABLE IF NOT EXISTS usage_collectors(id TEXT PRIMARY KEY,label TEXT NOT NULL,credential_hash TEXT NOT NULL UNIQUE,revoked INTEGER NOT NULL DEFAULT 0,last_contact_at_ms INTEGER,last_sync_at_ms INTEGER,pending INTEGER NOT NULL DEFAULT 0,covered_sources TEXT NOT NULL DEFAULT '[]',time_start_ms INTEGER,time_end_ms INTEGER,rate_minute INTEGER NOT NULL DEFAULT 0,rate_count INTEGER NOT NULL DEFAULT 0);
+    CREATE TABLE IF NOT EXISTS usage_collector_progress(collector_id TEXT NOT NULL,source TEXT NOT NULL,payload TEXT NOT NULL,PRIMARY KEY(collector_id,source));")?;Ok(())}).await
 }
 pub async fn enroll(store: &Store, label: String) -> Result<Value> {
     valid_label(&label).map_err(|_| anyhow!("invalid collector label"))?;
@@ -160,7 +252,13 @@ pub async fn status(store: &Store) -> Result<Value> {
     let collectors=store.call(|conn|{
         let mut stmt=conn.prepare("SELECT id,label,revoked,last_contact_at_ms,last_sync_at_ms,pending,covered_sources,time_start_ms,time_end_ms FROM usage_collectors ORDER BY label,id")?;
         let rows=stmt.query_map([],|r|{let revoked:bool=r.get(2)?;let last:Option<i64>=r.get(3)?;let synced:Option<i64>=r.get(4)?;let now=chrono::Utc::now().timestamp_millis();Ok(json!({"id":r.get::<_,String>(0)?,"label":r.get::<_,String>(1)?,"revoked":revoked,"last_contact_at_ms":last,"last_sync_at_ms":synced,"pending":r.get::<_,u64>(5)?,"state":if revoked{"revoked"}else if last.is_none(){"enrolled"}else if last.is_some_and(|t|now-t>120000){"offline"}else if synced.is_none(){"contacted"}else{"synced"},"covered_sources":serde_json::from_str::<Value>(&r.get::<_,String>(6)?).unwrap_or(json!([])),"time_start_ms":r.get::<_,Option<i64>>(7)?,"time_end_ms":r.get::<_,Option<i64>>(8)?}))})?;
-        Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+        let mut rows=rows.collect::<rusqlite::Result<Vec<_>>>()?;
+        let mut progress=conn.prepare("SELECT payload FROM usage_collector_progress WHERE collector_id=?1 ORDER BY source")?;
+        for collector in &mut rows {
+            let reports=progress.query_map([collector["id"].as_str().unwrap_or("")],|r|r.get::<_,String>(0))?.collect::<rusqlite::Result<Vec<_>>>()?;
+            collector["progress"]=serde_json::to_value(reports.into_iter().map(|v|serde_json::from_str::<SourceProgress>(&v)).collect::<serde_json::Result<Vec<_>>>()?)?;
+        }
+        Ok(rows)
     }).await?;
     Ok(json!({"collectors":collectors}))
 }
@@ -221,6 +319,9 @@ pub async fn ingest(store: &Store, headers: HeaderMap, body: Bytes) -> Response 
         || batch.superseded.len() > MAX_BATCH
         || batch.superseded.iter().any(|s| !valid_supersession(&s.source_event_id))
         || batch.pending > (imports::OUTBOX_LIMIT * 2) as u64
+        || batch.progress.len() > 2
+        || batch.progress.iter().any(|p| !p.valid())
+        || (batch.progress.len() == 2 && batch.progress[0].source == batch.progress[1].source)
     {
         return response(StatusCode::BAD_REQUEST, "unsupported batch or bounds");
     }
@@ -257,6 +358,9 @@ pub async fn ingest(store: &Store, headers: HeaderMap, body: Bytes) -> Response 
         let result=(||->Result<Value>{
             let result=store::insert_batch(conn,&batch.observations)?;
             for superseded in &batch.superseded{store::suppress_origin_event(conn,"codex",&superseded.source_event_id,&format!("collector:{collector_id}"),"superseded native response evidence")?;}
+            for progress in &batch.progress {
+                conn.execute("INSERT INTO usage_collector_progress(collector_id,source,payload) VALUES(?1,?2,?3) ON CONFLICT(collector_id,source) DO UPDATE SET payload=excluded.payload",params![collector_id,progress.source.name(),serde_json::to_string(progress)?])?;
+            }
             let old_sources:String=conn.query_row("SELECT covered_sources FROM usage_collectors WHERE id=?1",[&collector_id],|r|r.get(0))?;
             let mut sources:std::collections::BTreeSet<String>=serde_json::from_str(&old_sources).unwrap_or_default();sources.extend(batch.observations.iter().map(|o|o.source.clone()));
             let start=batch.observations.iter().map(|o|o.event_at_ms).min();let end=batch.observations.iter().map(|o|o.event_at_ms).max();
@@ -389,6 +493,28 @@ async fn local_store(directory: PathBuf) -> Result<Store> {
         Ok(store)
     })
     .await??;
+    let bounded = store
+        .call(|conn| {
+            // This standalone database has one serialized writer and no dashboard
+            // workload. DELETE avoids unbounded WAL growth behind external readers.
+            let mode: String = conn.query_row("PRAGMA journal_mode=DELETE", [], |r| r.get(0))?;
+            if mode != "delete" {
+                bail!("collector journal mode unavailable")
+            }
+            conn.execute_batch("PRAGMA synchronous=FULL")?;
+            let page_size: u64 = conn.query_row("PRAGMA page_size", [], |r| r.get(0))?;
+            conn.pragma_update(None, "max_page_count", MAX_LOCAL_DATABASE_BYTES / page_size)?;
+            let limit: u64 = conn.query_row("PRAGMA max_page_count", [], |r| r.get(0))?;
+            if limit * page_size > MAX_LOCAL_DATABASE_BYTES {
+                bail!("collector database exceeds size limit; pending outbox preserved")
+            }
+            Ok(())
+        })
+        .await;
+    if let Err(error) = bounded {
+        let _ = store.shutdown().await;
+        return Err(error);
+    }
     imports::init(&store).await?;
     store.call(|conn|{conn.execute_batch("CREATE TABLE IF NOT EXISTS usage_collector_outbox(sequence INTEGER PRIMARY KEY AUTOINCREMENT,event_key TEXT NOT NULL UNIQUE,payload TEXT NOT NULL,created_at_ms INTEGER NOT NULL);
     CREATE TABLE IF NOT EXISTS usage_collector_local_meta(key TEXT PRIMARY KEY,value TEXT NOT NULL);
@@ -401,10 +527,15 @@ async fn local_status(store: &Store, state: &LocalState) -> Result<Value> {
         let superseded:u64=conn.query_row("SELECT COUNT(*) FROM usage_collector_supersessions",[],|r|r.get(0))?;
         let mut stmt=conn.prepare("SELECT key,value FROM usage_collector_local_meta WHERE key IN ('last_contact_at_ms','last_sync_at_ms','last_error','server_id')")?;
         let meta=stmt.query_map([],|r|Ok((r.get::<_,String>(0)?,r.get::<_,String>(1)?)))?.collect::<rusqlite::Result<std::collections::BTreeMap<_,_>>>()?;
-        Ok(json!({"pending":pending+superseded,"pending_bytes":bytes+superseded*72,"superseded":superseded,"max_pending":imports::OUTBOX_LIMIT,"max_pending_bytes":imports::OUTBOX_BYTES,"metadata":meta}))
+        let page_size:u64=conn.query_row("PRAGMA page_size",[],|r|r.get(0))?;
+        let pages:u64=conn.query_row("PRAGMA page_count",[],|r|r.get(0))?;
+        let free:u64=conn.query_row("PRAGMA freelist_count",[],|r|r.get(0))?;
+        let max_pages:u64=conn.query_row("PRAGMA max_page_count",[],|r|r.get(0))?;
+        let storage_full=pages>=max_pages && free==0;
+        Ok(json!({"pending":pending+superseded,"pending_bytes":bytes+superseded*72,"superseded":superseded,"max_pending":imports::OUTBOX_LIMIT,"max_pending_bytes":imports::OUTBOX_BYTES,"metadata":meta,"storage":{"journal_mode":"delete","database_bytes":pages*page_size,"free_page_bytes":free*page_size,"database_limit_bytes":MAX_LOCAL_DATABASE_BYTES,"sqlite_files_budget_bytes":MAX_LOCAL_SQLITE_BYTES,"state":if storage_full{"full"}else{"ready"}},"paused":storage_full || pending+superseded>=imports::OUTBOX_LIMIT as u64 || bytes+superseded*72>=imports::OUTBOX_BYTES as u64}))
     }).await?;
     Ok(
-        json!({"collector":{"id":state.id,"destination":state.destination,"state":if queue["metadata"]["last_error"].is_string(){"offline"}else if queue["pending"].as_u64().unwrap_or(0)>0{"pending"}else{"ready"},"outbox":queue},"imports":imports::status(store).await?}),
+        json!({"collector":{"id":state.id,"destination":state.destination,"state":if queue["paused"]==true{"paused"}else if queue["metadata"]["last_error"].is_string(){"offline"}else if queue["pending"].as_u64().unwrap_or(0)>0{"pending"}else{"ready"},"outbox":queue},"imports":imports::status(store).await?}),
     )
 }
 async fn record_failure(store: &Store, code: &str) -> Result<()> {
@@ -419,6 +550,7 @@ async fn synchronize(store: &Store, state: &LocalState) -> Result<Value> {
         .build()?;
     let mut sent = 0_u64;
     for _ in 0..50 {
+        let progress = source_progress(&imports::status(store).await?)?;
         let (records, pending, superseded) = store
             .call(|conn| {
                 let pending: u64 = conn.query_row("SELECT COUNT(*) FROM usage_collector_outbox", [], |r| r.get(0))?;
@@ -446,6 +578,7 @@ async fn synchronize(store: &Store, state: &LocalState) -> Result<Value> {
                 observations: observations.iter().cloned().chain(std::iter::once(o.clone())).collect(),
                 pending,
                 superseded: superseded.clone(),
+                progress: progress.clone(),
             };
             if serde_json::to_vec(&tentative)?.len() > MAX_BODY {
                 break;
@@ -453,7 +586,7 @@ async fn synchronize(store: &Store, state: &LocalState) -> Result<Value> {
             observations.push(o);
             sequences.push((sequence, payload));
         }
-        let batch = Batch { version: 1, observations, pending, superseded: superseded.clone() };
+        let batch = Batch { version: 1, observations, pending, superseded: superseded.clone(), progress };
         let count = batch.observations.len();
         let superseded_count = superseded.len();
         let reply = match client.post(url.clone()).bearer_auth(&state.credential).json(&batch).send().await {
