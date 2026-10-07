@@ -3,6 +3,40 @@ use crate::ir::{Finish, Reasoning, Usage};
 use serde_json::json;
 
 #[test]
+fn cache_writes_and_inclusive_reasoning_survive_full_and_stream_translation() {
+    let expected = Usage { input: 70, cache_read: 20, cache_write: 10, output: 40, reasoning: 30 };
+    let req = Request { include_usage: true, ..Default::default() };
+    for format in [Format::Chat, Format::Responses, Format::Claude] {
+        let mut agg = Aggregate::default();
+        agg.push(&Event::Usage(expected.clone()));
+        agg.push(&Event::Finish(Finish::Stop));
+        let body = render_full(format, &agg, "model", &req);
+        let mut full = Aggregate::default();
+        for event in full_to_events(format, &body) {
+            full.push(&event);
+        }
+        assert_eq!(full.usage, expected, "full {format:?}");
+        let mut renderer = renderer(format, "model", &req);
+        let mut frames = Vec::new();
+        renderer.push(&Event::Usage(expected.clone()), &mut frames);
+        renderer.push(&Event::Finish(Finish::Stop), &mut frames);
+        renderer.finish(&mut frames);
+        let mut parser = parser(format);
+        let mut events = Vec::new();
+        for frame in frames {
+            parser
+                .feed(&SseEvent { event: frame.event.map(|event| event.into_owned()), data: frame.data }, &mut events);
+        }
+        let mut streamed = Aggregate::default();
+        for event in events {
+            streamed.push(&event);
+        }
+        assert_eq!(streamed.usage, expected, "stream {format:?}");
+        assert_eq!(streamed.usage.prompt_total() + streamed.usage.output, 140);
+    }
+}
+
+#[test]
 fn manual_thinking_preserves_caps_and_rejects_impossible_budgets() {
     let model = "claude-sonnet-4-5";
     for cap in [0, 64, 1024, 1025, 1500, 2047, 2048, 4096] {

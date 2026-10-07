@@ -1,0 +1,87 @@
+{
+  "ok": true,
+  "proxy_version": "0.3.2+gui.2849cdfb943e",
+  "helper_version": "0.3.2+keeper.d3141cb807d6",
+  "source_sha256": "d3141cb807d64c99487ad1efe8ad753669ccc9d33cd802b8a4531a3e62254e2a",
+  "helper_sha256": "2096d514c2798523f318eb96385b93d73bfe44e1f4e7f41b1ce81ce0887cccde",
+  "legacy_original_sha256": "513f8c56d320628e4a4403eab517bf7198fc4157bcbccc03350a90d314e51d1c",
+  "legacy_backup": {
+    "sha256": "96c17ea2188bc02ba14563cca25450c382f5273cf2f0240c1eeca45c605db1dc",
+    "bytes": 258502656
+  },
+  "native_backup": {
+    "sha256": "9ff2995d70df10961d2056faa310a181092c2da6ae61f284b4e72d7dc016b90c",
+    "bytes": 21192704
+  },
+  "metadata_sha256": "18aa1a2adb64e51027f2b0c79a2040e4a6209696169d5a9b5f6296f2a0432129",
+  "origin": "keeper:production-20260912-v1.15.4",
+  "source_rows": 192716,
+  "first_event_utc": "2026-09-12T07:36:38.967+00:00",
+  "last_event_utc": "2026-10-02T13:52:16.709+00:00",
+  "preservation": {
+    "usage_observations": {
+      "rows": 2906,
+      "sha256": "1d37176f2101e37f926b79c5eeaf0448f8ca69b426b99470a500b576fd8f85b5"
+    },
+    "priced_snapshots_preserved": 2674
+  },
+  "import": {
+    "counts": {
+      "usage_observations": 192716,
+      "usage_entries": 192716,
+      "usage_source_entries": 192716
+    },
+    "tokens": {
+      "input": 400061338,
+      "cache_read": 36826749846,
+      "cache_write": 639810695,
+      "output": 122884032,
+      "reasoning": 42513381,
+      "total": 37989505911
+    },
+    "priced": 102990,
+    "unpriced": 89726,
+    "estimated_cost_nanos": 14220058197020,
+    "partial_backdated_prices_verified": true,
+    "sqlite_quick_check": "ok"
+  },
+  "pricing_reasons": {
+    "current_rate_equivalent": 102990,
+    "missing_tokens": 173,
+    "unknown_cache_write_ttl": 89536,
+    "unknown_model": 17
+  },
+  "history_api_verified": true,
+  "public_https_health_verified": true,
+  "production_units_unchanged": true,
+  "configuration_and_accounts_unchanged": true,
+  "native_records_after": 2972,
+  "native_health": {
+    "state": "healthy",
+    "written": 209,
+    "dropped": 0,
+    "rejected": 0,
+    "writer_errors": 0,
+    "prior_unclosed_sessions": 0
+  },
+  "rust_tests": 323,
+  "clippy_warnings_denied": true,
+  "replay_trial_duplicates": 192716,
+  "inference_calls": 0,
+  "completed_at_utc": "2026-10-07T10:22:43.123445+00:00",
+  "coverage_gap": "No keeper records after 2026-10-02; native capture begins 2026-10-07",
+  "keeper_source_commit": "f53fec8d3f7c0f189cf046aeae807375fd9b23e4",
+  "development": {
+    "rebuilt": true,
+    "restarted": true,
+    "service": "fusebox-reset-countdown-dev.service",
+    "healthz": "ok"
+  },
+  "verification_retry": {
+    "initial_category": "nonfixed-backend-port",
+    "cause": "Backend-only verification helper used for public HTTPS check",
+    "corrected": true,
+    "read_only_retry": true,
+    "import_repeated": false
+  }
+}

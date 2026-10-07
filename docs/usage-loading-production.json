@@ -1,0 +1,224 @@
+{
+  "verified_at_utc": "2026-10-07T10:59:32.784072+00:00",
+  "deployment": {
+    "backup_sha256": "5e6553d66fb2e9a880f9dde54c42ad43697881513f486e021ad7b60adee576b3",
+    "billing_calls": 0,
+    "database": "/var/lib/cli-proxy-api/usage/usage.sqlite3",
+    "gate_released": true,
+    "outcome": "deployed",
+    "rollback_version": "0.3.2+gui.2849cdfb943e",
+    "transaction": "7d476dcfbcbf4362957690f35c03a427",
+    "version": "0.3.2+gui.31af9badd922"
+  },
+  "source_sha256": "31af9badd92225fddc41befa381bba806380e39913593559e9db6d64e050342d",
+  "binary_sha256": "d3847fd0947e40e5fb4d4fb98d200de783c9c0bfe43cec52636dd0161e959d6b",
+  "assets_sha256": {
+    "/ui/index.html": "c56747b4f42db50f4fe270f659576409516fa4438727ecb28ea50ba09fffc714",
+    "/ui/app.js": "aa33ff811ec6f3bbd27545a61f62c8374036e2dd5252f0046d1211dc8d1a30ad",
+    "/ui/style.css": "3b449937e46066655f375da0a37573daeba48c013b25bfc03316e4aaea1e75eb",
+    "/ui/usage.js": "a8253f2bef774ff2c7fce135988b72d9eacf86d56c899f3aa403d886aa0dc84e",
+    "/ui/config.js": "0b4f67e74bf5878cc599e8e747c896195c86764866f718d4a10b7ae83e0347d8"
+  },
+  "baseline": {
+    "measured_at_utc": "2026-10-07T10:31:17.490777+00:00",
+    "method": "single authenticated HTTPS request per endpoint, independent WAL read, no inference calls",
+    "database_observations": 195825,
+    "summary": [
+      {
+        "range": "today",
+        "ms": 167.9,
+        "observations": 3104
+      },
+      {
+        "range": "7days",
+        "ms": 2104.5,
+        "observations": 27886
+      },
+      {
+        "range": "30days",
+        "ms": 27782.5,
+        "observations": 195820
+      }
+    ],
+    "status_ms": 4.3,
+    "overview_ms": 2.1,
+    "records_7day_ms": 26.2
+  },
+  "production_latency": {
+    "billing_calls": 0,
+    "cache_ttl_seconds": 0,
+    "dashboard": [
+      {
+        "first_ms": 15.8,
+        "max_ms": 15.8,
+        "median_ms": 10.6,
+        "observations": 3356,
+        "range": "today",
+        "samples": 8
+      },
+      {
+        "first_ms": 82.0,
+        "max_ms": 84.6,
+        "median_ms": 75.75,
+        "observations": 28138,
+        "range": "7days",
+        "samples": 8
+      },
+      {
+        "first_ms": 704.2,
+        "max_ms": 704.2,
+        "median_ms": 683.9000000000001,
+        "observations": 196072,
+        "range": "30days",
+        "samples": 8
+      }
+    ],
+    "health": {
+      "accepted": 7,
+      "dropped": 0,
+      "prior_unclosed_sessions": 0,
+      "rejected": 0,
+      "state": "healthy",
+      "writer_errors": 0,
+      "written": 7
+    },
+    "management_auth_verified": true,
+    "public_assets_verified": true,
+    "public_tls_verified": true,
+    "records_page_ms": 19.4,
+    "version": "0.3.2+gui.31af9badd922"
+  },
+  "preservation": {
+    "all_previous_observations_byte_for_byte": true,
+    "application_id": 1179996997,
+    "closed_range_display_fields_exact": true,
+    "health": {
+      "accepted": 5,
+      "dropped": 0,
+      "prior_unclosed_sessions": 0,
+      "rejected": 0,
+      "state": "healthy",
+      "writer_errors": 0,
+      "written": 5
+    },
+    "high_id": 195972,
+    "observation_sha256": "c31977a73c200ae2d98389be1dc61fa2a94c595218657ca85ac8735aa27bf7d1",
+    "observations": 195972,
+    "priced": 105977,
+    "schema_version": 3,
+    "total_observations": 196070
+  },
+  "verification": {
+    "accounts": 5,
+    "analytics_health": "healthy",
+    "billing_calls": 0,
+    "binary_sha256": "d3847fd0947e40e5fb4d4fb98d200de783c9c0bfe43cec52636dd0161e959d6b",
+    "collectors_enrolled": 0,
+    "config_and_routing_verified": true,
+    "configured_imports": 0,
+    "gate_unchanged": true,
+    "ok": true,
+    "sessions": {
+      "current_assignments": 60,
+      "expired_assignments": 0,
+      "preserved_assignments": 60,
+      "snapshot_assignments": 60
+    },
+    "usage_backup_bytes": 1337668480,
+    "usage_backup_sha256": "20f4390d855db13f9d9cedd3ffae4d718059edf3453854ff87a76a7e0bcdfad4",
+    "version": "0.3.2+gui.31af9badd922"
+  },
+  "maintenance": {
+    "active_requests_at_stop": 2,
+    "forced": true,
+    "quiet_samples": 0,
+    "stopped_at_ms": 1791370578374
+  },
+  "production_copy_trial": {
+    "version": "0.3.2+gui.31af9badd922",
+    "production_copy": {
+      "rows": 195586,
+      "sha256": "3906438f40b32f3b710ca0b0e5cdd366b87abddecbb995c227a7b095aee82403"
+    },
+    "ranges": [
+      {
+        "range": "today",
+        "full_summary_ms": 152.6,
+        "dashboard_first_ms": 13.8,
+        "dashboard_median_ms": 9.8,
+        "dashboard_max_ms": 10.5,
+        "observations": 2870,
+        "shared_fields_exact": true
+      },
+      {
+        "range": "7days",
+        "full_summary_ms": 1808.6,
+        "dashboard_first_ms": 71.2,
+        "dashboard_median_ms": 72.5,
+        "dashboard_max_ms": 108.9,
+        "observations": 27652,
+        "shared_fields_exact": true
+      },
+      {
+        "range": "30days",
+        "full_summary_ms": 25381.1,
+        "dashboard_first_ms": 708.4,
+        "dashboard_median_ms": 678.6,
+        "dashboard_max_ms": 701.1,
+        "observations": 195586,
+        "shared_fields_exact": true
+      }
+    ],
+    "filtered_equivalence": true,
+    "empty_range_equivalence": true,
+    "both_chart_stacks_equivalent": true,
+    "auth_and_invalid_query_checks": true,
+    "concurrent_7day_ms": [
+      190.4,
+      197.0,
+      193.2,
+      193.0
+    ],
+    "data_unchanged": true,
+    "billing_calls": 0
+  },
+  "large_journal_backup_test": {
+    "corruption_rejected": true,
+    "expanded_bytes": 2653851599,
+    "installed_updater_limits_unchanged": true,
+    "large_journal_backup_test": true,
+    "writer_guard_test": true
+  },
+  "browser": {
+    "browserPassed": true,
+    "realBackend": true,
+    "headline_before_delayed_records_and_status": true,
+    "chart_toggle_no_roundtrip": true,
+    "estimated_cost_nanos": 12460000,
+    "priced_observations": 2,
+    "explicit_partial_estimates": 2,
+    "desktop_mobile_no_overflow": true,
+    "runtime_errors": 0,
+    "method": "T3 preview connected to isolated synthetic dev fixture, then explicitly reported no automation host; Chromium headless used as permitted fallback"
+  },
+  "checks": {
+    "rust_tests_passed": 325,
+    "usage_ui_tests_passed": 18,
+    "clippy_all_targets_warnings_denied": true,
+    "rustfmt_and_diff_checks_passed": true,
+    "dev_service_rebuilt_and_restarted": true
+  },
+  "resolved_rollout_issues": {
+    "unsupported_initial_version_label_rejected_before_activation": true,
+    "first_activation_rolled_back_before_candidate_swap": {
+      "backup_step_failed": true,
+      "candidate_was_not_swapped": true,
+      "phase": "rolled-back",
+      "production_recovered": true,
+      "reason": "usage database exceeded installed 512 MiB core backup bound",
+      "transaction": "68ccd3a9c07b469184d6d9b69d94e931"
+    },
+    "large_journal_backup_separate_from_bounded_core_snapshot": true
+  },
+  "billing_calls_for_validation": 0
+}

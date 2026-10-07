@@ -285,9 +285,20 @@ async fn analytics_authentication_and_collector_scope() {
     let proxy = serve(crate::server::router(app.clone())).await;
     let client = reqwest::Client::new();
     for key in ["", "synthetic-inference", "fbxc_invalid"] {
-        let r = client.get(format!("{}/api/usage/summary", proxy.url)).bearer_auth(key).send().await.unwrap();
-        assert_eq!(r.status(), StatusCode::UNAUTHORIZED);
+        for endpoint in ["summary", "dashboard"] {
+            let r = client.get(format!("{}/api/usage/{endpoint}", proxy.url)).bearer_auth(key).send().await.unwrap();
+            assert_eq!(r.status(), StatusCode::UNAUTHORIZED);
+        }
     }
+    let r = client
+        .get(format!("{}/api/usage/dashboard", proxy.url))
+        .bearer_auth("synthetic-management")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), StatusCode::OK);
+    let v: Value = r.json().await.unwrap();
+    assert!(v["combined"]["trends"]["model"].is_array());
     let r = client
         .post(format!("{}/api/usage/collectors", proxy.url))
         .bearer_auth("synthetic-management")

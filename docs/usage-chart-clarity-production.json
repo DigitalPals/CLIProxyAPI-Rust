@@ -1,0 +1,154 @@
+{
+  "verified_at_utc": "2026-10-07T11:24:30.532095+00:00",
+  "version": "0.3.2+gui.3697a4b98262",
+  "previous_version": "0.3.2+gui.31af9badd922",
+  "source_sha256": "3697a4b982620d2a636984a9725048c31ac89cc92e411ee6e24f09735ea84583",
+  "binary_sha256": "c6b44fac7a898a9b288d230c76c0db7eb58890b702e5183c358f51aefcedeb53",
+  "config_sha256": "ea8d2de4d99f4263f13b4c6257ab92f8ec2cef822cd8d3b87607806b58b0da86",
+  "ui_assets": {
+    "/ui/index.html": "c56747b4f42db50f4fe270f659576409516fa4438727ecb28ea50ba09fffc714",
+    "/ui/app.js": "aa33ff811ec6f3bbd27545a61f62c8374036e2dd5252f0046d1211dc8d1a30ad",
+    "/ui/style.css": "36c01647bf014aa50ac2a8df1042545ef91744231de980c23ae4b2845032f746",
+    "/ui/usage.js": "b367e2bbb5434ea2f87e02560e0f3a0debeb75a83ee0b27f2521ac7b00ca3405",
+    "/ui/config.js": "0b4f67e74bf5878cc599e8e747c896195c86764866f718d4a10b7ae83e0347d8"
+  },
+  "deployment": {
+    "backup_sha256": "0cad681c105e3b1aa63b589958966703d8d0f20376e486ec88a222268c778063",
+    "billing_calls": 0,
+    "database": "/var/lib/cli-proxy-api/usage/usage.sqlite3",
+    "gate_released": true,
+    "outcome": "deployed",
+    "rollback_version": "0.3.2+gui.31af9badd922",
+    "transaction": "f85ee9a6b4234eafadef9e6f6202cf8e",
+    "version": "0.3.2+gui.3697a4b98262"
+  },
+  "maintenance": {
+    "active_requests_at_stop": 0,
+    "forced": true,
+    "quiet_samples": 0,
+    "stopped_at_ms": 1791372160930
+  },
+  "verification": {
+    "accounts": 5,
+    "analytics_health": "healthy",
+    "billing_calls": 0,
+    "binary_sha256": "c6b44fac7a898a9b288d230c76c0db7eb58890b702e5183c358f51aefcedeb53",
+    "collectors_enrolled": 0,
+    "config_and_routing_verified": true,
+    "configured_imports": 0,
+    "gate_unchanged": true,
+    "ok": true,
+    "sessions": {
+      "current_assignments": 60,
+      "expired_assignments": 0,
+      "preserved_assignments": 60,
+      "snapshot_assignments": 60
+    },
+    "usage_backup_bytes": 1339954048,
+    "usage_backup_sha256": "63382cee560095f009688ba319e1129334e23077e622bfb38800b17d0f3a5332",
+    "version": "0.3.2+gui.3697a4b98262"
+  },
+  "preservation": {
+    "all_previous_observations_byte_for_byte": true,
+    "application_id": 1179996997,
+    "closed_range_display_fields_exact": true,
+    "health": {
+      "accepted": 7,
+      "dropped": 0,
+      "prior_unclosed_sessions": 0,
+      "rejected": 0,
+      "state": "healthy",
+      "writer_errors": 0,
+      "written": 7
+    },
+    "high_id": 196389,
+    "observation_sha256": "49a291e1e6209913ed225817b9cc8c0022fada5011244c9eaf824a50dfcd9993",
+    "observations": 196389,
+    "priced": 106357,
+    "schema_version": 3,
+    "total_observations": 196398
+  },
+  "live_graph": {
+    "fable": {
+      "calls": 1896,
+      "known_cost_nanos": 6900000,
+      "missing_usage": 16,
+      "model": "claude-fable-5-1",
+      "unknown_cache_write_ttl": 1879,
+      "unpriced": 1895
+    },
+    "live_data_verified": true,
+    "model_count": 15,
+    "oct1_claude": {
+      "calls": 2446,
+      "known_cost_nanos": 280000,
+      "unpriced": 2444
+    },
+    "provider_day_and_range_sums_exact": true
+  },
+  "browser": {
+    "browserPassed": true,
+    "backendAssets": true,
+    "sanitizedProductionAggregateFixture": true,
+    "headline_before_delayed_records_and_status": true,
+    "chart_toggle_no_roundtrip": true,
+    "daily_vs_range_labels": true,
+    "daily_claude_priced_coverage": true,
+    "initial_models": 15,
+    "fable_calls": 1896,
+    "fable_filter_desktop_and_mobile": true,
+    "all_unpriced_headline_and_chart": true,
+    "desktop_mobile_no_overflow": true,
+    "runtime_errors": 0
+  },
+  "javascript_tests": {
+    "total": 32,
+    "usage": 23,
+    "failures": 0
+  },
+  "public_performance": {
+    "billing_calls": 0,
+    "cache_ttl_seconds": 0,
+    "dashboard": [
+      {
+        "first_ms": 14.0,
+        "max_ms": 14.5,
+        "median_ms": 10.8,
+        "observations": 3684,
+        "range": "today",
+        "samples": 8
+      },
+      {
+        "first_ms": 76.9,
+        "max_ms": 76.9,
+        "median_ms": 72.15,
+        "observations": 28466,
+        "range": "7days",
+        "samples": 8
+      },
+      {
+        "first_ms": 647.2,
+        "max_ms": 706.2,
+        "median_ms": 679.9,
+        "observations": 196400,
+        "range": "30days",
+        "samples": 8
+      }
+    ],
+    "health": {
+      "accepted": 9,
+      "dropped": 0,
+      "prior_unclosed_sessions": 0,
+      "rejected": 0,
+      "state": "healthy",
+      "writer_errors": 0,
+      "written": 9
+    },
+    "management_auth_verified": true,
+    "public_assets_verified": true,
+    "public_tls_verified": true,
+    "records_page_ms": 23.4,
+    "version": "0.3.2+gui.3697a4b98262"
+  },
+  "runtime_and_rates_unchanged_from_previous_release": true
+}

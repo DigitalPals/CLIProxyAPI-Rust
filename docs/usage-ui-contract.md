@@ -23,6 +23,38 @@ grouping of `combined.trend`. Observations and exports accept
 `view=combined|raw`; a missing `view` means `raw`. Any other value of `stack`
 or `view` is a 400.
 
+## GET /api/usage/dashboard
+
+The page uses this focused endpoint for a fast first load and refresh. Its
+`range`, `facets`, `pricing` and `combined` fields have the same displayed
+accounting meaning as the full summary below. It computes totals, both chart
+groupings, and all four breakdowns in one streaming pass over accounting
+entries, plus one pass for raw-record facets. Each response reads one independent
+WAL snapshot; no TTL cache or eventual background estimate is involved.
+
+`combined.trends.provider` and `combined.trends.model` contain both groupings,
+so switching the chart needs no request. `combined.stack` and `combined.trend`
+still reflect the requested stack. Aggregate metrics include costs, token sums,
+unknown counts, completeness and overflow evidence. Request/attempt lifecycle
+counts and the legacy per-source/reconciliation sections are supplied by the
+full summary endpoint, rather than computed for this page.
+
+The browser renders dashboard, observations and collection status as each
+read finishes. Pagination reads only observations. Range/filter changes discard
+prior results and guard against older responses overwriting the current view.
+
+The chart readout is explicitly a single **day** (the peak day until another
+day is selected); the headline and breakdown cover the entire selected range.
+Cost bars contain only priced calls. Each readout group retains its call and
+unpriced counts, including wholly unpriced groups with no cost bar. Unknown
+costs display as `Unpriced`; a reported zero remains `$0.00`. More than six
+groups merge into `Other`, including their coverage counts.
+
+Model breakdowns initially show up to twenty models, so smaller unpriced or
+lightly priced models remain discoverable. Other dimensions initially show
+eight rows; either limit can be expanded. Mixed coverage prioritizes the
+unpriced count, while its title preserves partial and missing-usage details.
+
 ## GET /api/usage/summary
 
 ```json

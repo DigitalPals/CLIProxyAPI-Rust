@@ -19,6 +19,7 @@ use std::sync::Arc;
 pub fn router() -> Router<Arc<App>> {
     Router::new()
         .route("/usage/summary", get(summary))
+        .route("/usage/dashboard", get(dashboard))
         .route("/usage/observations", get(observations))
         .route("/usage/status", get(status))
         .route("/usage/export", get(export))
@@ -81,6 +82,19 @@ async fn summary(State(app): State<Arc<App>>, Query(q): Query<UsageQuery>) -> Re
         Err(r) => return *r,
     };
     match s.query(q).await {
+        Ok(mut v) => {
+            labels(&app, &mut v);
+            Json(v).into_response()
+        }
+        Err(e) => result(Err(e)),
+    }
+}
+async fn dashboard(State(app): State<Arc<App>>, Query(q): Query<UsageQuery>) -> Response {
+    let s = match store(&app) {
+        Ok(s) => s,
+        Err(r) => return *r,
+    };
+    match s.dashboard(q).await {
         Ok(mut v) => {
             labels(&app, &mut v);
             Json(v).into_response()

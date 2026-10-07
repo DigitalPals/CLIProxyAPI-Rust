@@ -3,6 +3,7 @@ pub mod api;
 pub mod capture;
 pub mod collector;
 pub mod imports;
+pub mod keeper;
 pub mod pricing;
 pub mod store;
 pub mod types;

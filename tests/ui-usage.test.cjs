@@ -168,17 +168,108 @@ test('readout shows the hovered day with each group, and history-only days befor
   const trend = [{ date: '2026-10-05', group: 'anthropic', observations: 4, estimated_cost_nanos: 3e9, unpriced: 1 }, { date: '2026-10-06', group: 'openai', observations: 9, estimated_cost_nanos: 9e9 }];
   d.seed({ range: { start: '2026-10-05', end: '2026-10-07', through: '2026-10-06' }, timezone: 'Europe/Amsterdam', summary: { combined: { trend, proxy_first_event_at_ms: Date.UTC(2026, 9, 5, 23, 30), totals: {} } } });
   let html = d.run('usageChartHTML()');
-  assert.match(html, /Peak · Tue Oct 6/);
+  assert.match(html, /Peak day · Tue Oct 6/);
   assert.equal(html.includes('Before the proxy was set up'), false);
   d.run('Usage.hoverDay = "2026-10-05"');
   html = d.run('usageChartHTML()');
   assert.match(html, /Mon Oct 5/);
   assert.match(html, /4 calls/);
-  assert.match(html, /Claude<span class="mono">\$3\.00/);
+  assert.match(html, /Claude<\/span> <span class="mono">\$3\.00/);
+  assert.match(html, /3 priced · 1 unpriced/);
   assert.match(html, /1 unpriced/);
   assert.match(html, /Before the proxy was set up · history only/);
   assert.equal(helpers.beforeProxy('2026-10-06', Date.UTC(2026, 9, 5, 23, 30), 'Europe/Amsterdam'), false);
   assert.equal(helpers.beforeProxy('2026-10-05', null, 'UTC'), false);
+});
+
+test('daily priced subset is distinct from the range breakdown and Fable is visible initially', () => {
+  const d = dashboard();
+  const trend = [
+    { date: '2026-10-01', group: 'anthropic', observations: 2446, estimated_cost_nanos: 280000, unpriced: 2444 },
+    { date: '2026-10-01', group: 'openai', observations: 13323, estimated_cost_nanos: 2111131084260, unpriced: 5 },
+  ];
+  const models = Array.from({ length: 15 }, (_, i) => ({ id: i === 10 ? 'claude-fable-5-1' : `model-${i}`, provider: 'anthropic', observations: 10, estimated_cost_nanos: 1e9 }));
+  models[10] = { ...models[10], observations: 1896, estimated_cost_nanos: 6900000, unpriced: 1895, partial: 1880, missing_usage: 16 };
+  d.seed({ preset: '30', range: { start: '2026-09-08', end: '2026-10-08', through: '2026-10-07' }, summary: { combined: { trend, totals: { estimated_cost_nanos: 14568080000000 }, breakdowns: { model: models } } } });
+  const chart = d.run('usageChartHTML()');
+  assert.match(chart, /Peak day · Thu Oct 1/);
+  assert.match(chart, /Priced calls only/);
+  assert.match(chart, /Claude<\/span> <span class="mono">\$0\.0003<\/span><span class="dim">\(2 priced · 2,444 unpriced\)/);
+  const breakdown = d.run('usageBreakdownHTML()');
+  assert.match(breakdown, /BREAKDOWN · LAST 30 DAYS/);
+  assert.match(breakdown, /claude-fable-5-1/);
+  assert.match(breakdown, /\$0\.0069/);
+  assert.match(breakdown, /1,895 unpriced/);
+  assert.match(breakdown, /title="[^"]*1,880 partial · 16 missing usage/);
+  assert.equal(d.run('Usage.rows.length'), 15);
+  assert.equal(d.run('Usage.rows[10]'), 'claude-fable-5-1');
+  assert.equal(breakdown.includes('Show all 15'), false);
+  d.run('Usage.hoverDay = "2026-10-01"');
+  assert.match(d.run('usageChartHTML()'), /Day · Thu Oct 1/);
+  assert.match(d.run('usageBreakdownHTML()'), /BREAKDOWN · LAST 30 DAYS/);
+});
+
+test('cost charts preserve wholly unpriced groups, known zero and empty days', () => {
+  const d = dashboard();
+  const trend = [
+    { date: '2026-10-05', group: 'anthropic', observations: 4, estimated_cost_nanos: null, unpriced: 4 },
+    { date: '2026-10-06', group: 'openai', observations: 1, estimated_cost_nanos: 0, unpriced: 0 },
+  ];
+  const chart = helpers.chart(trend, ['2026-10-05', '2026-10-06', '2026-10-07'], 'cost');
+  assert.deepEqual(chart.keys, ['anthropic', 'openai']);
+  assert.equal(chart.max, 0);
+  assert.equal(chart.peak, 0);
+  assert.equal(chart.series[0].groups[0].priced, false);
+  assert.equal(chart.series[1].groups[1].priced, true);
+  d.seed({ range: { start: '2026-10-05', end: '2026-10-08', through: '2026-10-07' }, hoverDay: '2026-10-05', summary: { combined: { trend } } });
+  let html = d.run('usageChartHTML()');
+  assert.match(html, /Claude<\/span> <span class="mono">Unpriced/);
+  assert.match(html, /0 priced · 4 unpriced/);
+  assert.match(html, /aria-label="Mon Oct 5: Unpriced · 0 priced calls · 4 unpriced"/);
+  assert.match(html, /aria-label="Tue Oct 6: \$0\.00 · 1 priced calls"/);
+  assert.match(html, /aria-label="Wed Oct 7: \$0\.00 · 0 priced calls"/);
+  d.run('Usage.hoverDay = null');
+  html = d.run('usageChartHTML()');
+  assert.match(html, /Busiest day · Mon Oct 5/);
+  assert.match(html, /Claude<\/span> <span class="mono">Unpriced/);
+  d.run('Usage.metric = "calls"');
+  html = d.run('usageChartHTML()');
+  assert.match(html, /Claude<\/span> <span class="mono">4 calls/);
+  assert.match(html, /\(4 unpriced\)/);
+});
+
+test('a range with only unknown costs has an unpriced headline while an empty range is zero', () => {
+  const d = dashboard();
+  d.seed({ summary: { combined: { totals: { observations: 4, estimated_cost_nanos: null, unpriced: 4 } } } });
+  assert.match(d.run('usageCostHTML()'), /u-total-v">Unpriced/);
+  d.seed({ summary: { combined: { totals: { observations: 0, estimated_cost_nanos: null, unpriced: 0 } } } });
+  assert.match(d.run('usageCostHTML()'), /u-total-v">\$0\.00/);
+});
+
+test('Other retains the priced and unpriced coverage of every merged group', () => {
+  const trend = Array.from({ length: 8 }, (_, i) => ({ date: '2026-10-05', group: `model-${i}`, observations: 10, estimated_cost_nanos: i < 6 ? (8 - i) * 1e9 : null, unpriced: i < 6 ? 1 : 10 }));
+  const c = helpers.chart(trend, ['2026-10-05'], 'cost');
+  assert.equal(c.keys[5], helpers.OTHER);
+  assert.deepEqual(c.series[0].groups[5], { calls: 30, cost: 3e9, priced: true, unpriced: 21 });
+  assert.equal(c.series[0].calls, 80);
+  assert.equal(c.series[0].unpriced, 26);
+  assert.equal(c.series[0].cost, 33e9);
+});
+
+test('model rows beyond the initial twenty can expand and coverage explains unknown costs', () => {
+  const d = dashboard();
+  const rows = Array.from({ length: 21 }, (_, i) => ({ id: `model-${i}`, observations: 2, estimated_cost_nanos: i ? 1e9 : null, unpriced: i ? 0 : 2 }));
+  d.seed({ summary: { combined: { totals: { estimated_cost_nanos: 20e9 }, breakdowns: { model: rows } } } });
+  let html = d.run('usageBreakdownHTML()');
+  assert.equal(d.run('Usage.rows.length'), 20);
+  assert.match(html, /Show all 21/);
+  assert.match(html, /u-bd-cost dim">Unpriced/);
+  assert.equal(html.includes('model-20'), false);
+  d.run('Usage.showAll = true');
+  html = d.run('usageBreakdownHTML()');
+  assert.equal(d.run('Usage.rows.length'), 21);
+  assert.match(html, /Show top 20/);
+  assert.match(html, /model-20/);
 });
 
 test('late responses from a superseded filter do not replace current results', async () => {
@@ -202,4 +293,69 @@ test('a status failure preserves successful summary and observation reads with v
   assert.equal(d.run('Usage.observations.marker'), 'loaded');
   assert.match(d.run('Usage.error'), /database unavailable/);
   assert.equal(d.run('Usage.loading'), false);
+});
+
+test('counts render immediately while status and records are still pending', async () => {
+  let finishStatus, finishRecords;
+  const status = new Promise((resolve) => { finishStatus = resolve; });
+  const records = new Promise((resolve) => { finishRecords = resolve; });
+  let renders = 0;
+  const d = dashboard({ api: (endpoint) => endpoint === '/usage/status' ? status : endpoint.includes('/observations?') ? records : Promise.resolve({ marker: 'counts-ready' }) });
+  d.context.markRender = () => { renders++; };
+  d.run('usageRender = markRender');
+  const loading = d.run('usageLoad()');
+  await new Promise(setImmediate);
+  assert.equal(d.run('Usage.summary.marker'), 'counts-ready');
+  assert.equal(d.run('Usage.loading'), true);
+  assert.equal(d.run('Usage.recordsLoading'), true);
+  assert.ok(renders >= 2);
+  finishRecords({ items: [], total: 0 });
+  await new Promise(setImmediate);
+  assert.equal(d.run('Usage.recordsLoading'), false);
+  finishStatus({ health: {} });
+  await loading;
+  assert.equal(d.run('Usage.loading'), false);
+});
+
+test('paging reads only records and cannot replace results from newer filters', async () => {
+  let finishOld;
+  const oldPage = new Promise((resolve) => { finishOld = resolve; });
+  const calls = [];
+  const d = dashboard({ api: (endpoint) => {
+    calls.push(endpoint);
+    return calls.length === 1 ? oldPage : Promise.resolve({ marker: 'new-filter', items: [], total: 0 });
+  } });
+  d.seed({ summary: { marker: 'existing-counts' }, status: { marker: 'existing-status' }, offset: 50 });
+  const paging = d.run('usageLoadRecords()');
+  assert.equal(calls.length, 1);
+  assert.match(calls[0], /\/usage\/observations\?.*&offset=50/);
+  assert.equal(d.run('Usage.summary.marker'), 'existing-counts');
+  assert.equal(d.run('Usage.status.marker'), 'existing-status');
+  d.run('Usage.filters.provider = "openai"');
+  await d.run('usageReload()');
+  finishOld({ marker: 'old-page', items: [], total: 0 });
+  await paging;
+  assert.equal(d.run('Usage.summary.marker'), 'new-filter');
+  assert.equal(d.run('Usage.observations.marker'), 'new-filter');
+  assert.equal(d.run('Usage.offset'), 0);
+  assert.equal(d.run('Usage.recordsLoading'), false);
+});
+
+test('chart stacking uses the loaded snapshot without another request, including during initial load', async () => {
+  let finishSummary;
+  let calls = 0;
+  const response = { combined: { stack: 'provider', trend: [{ marker: 'provider' }], trends: { provider: [{ marker: 'provider' }], model: [{ marker: 'model' }] } } };
+  const d = dashboard({ api: (endpoint) => {
+    calls++;
+    return endpoint.includes('/dashboard?') ? new Promise((resolve) => { finishSummary = resolve; }) : Promise.resolve({ items: [], total: 0 });
+  } });
+  const loading = d.run('usageLoad()');
+  d.run('Usage.stack = "model"; usageLoadStack()');
+  finishSummary(response);
+  await loading;
+  assert.equal(d.run('Usage.summary.combined.trend[0].marker'), 'model');
+  assert.equal(d.run('Usage.summary.combined.stack'), 'model');
+  d.run('Usage.stack = "provider"; usageLoadStack()');
+  assert.equal(d.run('Usage.summary.combined.trend[0].marker'), 'provider');
+  assert.equal(calls, 3);
 });

@@ -1075,7 +1075,8 @@ details[open] > summary .cfg-chevron { transform: rotate(90deg); }
 .u-days span { flex: 1; min-width: 0; display: flex; justify-content: center; white-space: nowrap; }
 .u-days .today { color: var(--brand); }
 .u-readout { display: flex; flex-wrap: wrap; align-items: center; gap: 4px 16px; min-height: 22px; font-size: 13px; }
-.u-rp { display: flex; align-items: center; gap: 6px; color: var(--fg-2); }
+.u-rp { display: flex; flex-wrap: wrap; align-items: center; gap: 2px 6px; max-width: 100%; color: var(--fg-2); }
+.u-rp-name { overflow-wrap: anywhere; }
 .u-rp .mono { color: var(--fg); }
 .u-foot { display: flex; flex-wrap: wrap; gap: 6px 18px; padding-top: 12px; border-top: 1px solid var(--line); font-size: 12px; color: var(--fg-3); }
 
@@ -1221,6 +1222,7 @@ details[open] > summary .cfg-chevron { transform: rotate(90deg); }
   .u-stats dd { font-size: 16px; line-height: 1.25; }
   .u-stats dt { font-size: 11.5px; }
   .u-chart-head { flex-wrap: nowrap; gap: 10px; }
+  .u-chart-scope { display: none; }
   .u-seg button { display: flex; align-items: center; height: 30px; padding: 0 10px; font-size: 12.5px; }
   .u-legend { gap: 4px 12px; font-size: 11.5px; }
   .u-bars { height: 96px; gap: 5px; }
@@ -1241,7 +1243,7 @@ details[open] > summary .cfg-chevron { transform: rotate(90deg); }
   .u-bd-name { flex: 1; min-width: 0; font-size: 13.5px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
   .u-bd-name.mono { font-size: 13px; }
   .u-bd-cost { flex: none; font-size: 14px; }
-  .u-bd-l2 { display: flex; align-items: center; gap: 10px; padding-left: 24px; font-size: 12px; white-space: nowrap; }
+  .u-bd-l2 { display: flex; flex-wrap: wrap; align-items: center; gap: 4px 10px; padding-left: 24px; font-size: 12px; }
   .u-bd-l2 .u-share-bar { min-width: 0; height: 5px; }
   .u-bd-list .u-more { height: 44px; padding: 0 14px; border-top: 0; }
   .u-bd-list .u-empty { padding: 18px 14px; border-top: 0; }

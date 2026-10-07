@@ -359,6 +359,15 @@ async fn generated_history_measurement() {
     let summary = store.query(Query::default()).await.unwrap();
     let query = start.elapsed();
     let start = std::time::Instant::now();
+    let dashboard = store.dashboard(Query::default()).await.unwrap();
+    let dashboard_query = start.elapsed();
+    assert_eq!(dashboard["combined"]["totals"]["observations"], summary["combined"]["totals"]["observations"]);
+    assert_eq!(dashboard["combined"]["totals"]["tokens"], summary["combined"]["totals"]["tokens"]);
+    assert_eq!(
+        dashboard["combined"]["totals"]["estimated_cost_nanos"],
+        summary["combined"]["totals"]["estimated_cost_nanos"]
+    );
+    let start = std::time::Instant::now();
     let empty = store
         .query(Query { start: Some("2026-01-01".into()), end: Some("2026-01-02".into()), ..Default::default() })
         .await
@@ -380,7 +389,7 @@ async fn generated_history_measurement() {
     );
     let narrow_query = start.elapsed();
     let querying = store.clone();
-    let active = tokio::spawn(async move { querying.query(Query::default()).await.unwrap() });
+    let active = tokio::spawn(async move { querying.dashboard(Query::default()).await.unwrap() });
     for i in 0..1000 {
         assert!(store.enqueue(event("proxy", &format!("concurrent-{i}"))));
         if i % 10 == 0 {
@@ -394,7 +403,7 @@ async fn generated_history_measurement() {
     assert_eq!(store.details(Query::default()).await.unwrap()["total"], 101000);
     let page = start.elapsed();
     println!(
-        "SYNTHETIC 100000 records: insert={ingest:?}; summary={query:?}; empty={empty_query:?}; narrow2={narrow_query:?}; concurrent1000_dropped=0; details100={page:?}; database_bytes={}; proxy_entries={}",
+        "SYNTHETIC 100000 records: insert={ingest:?}; summary={query:?}; dashboard={dashboard_query:?}; empty={empty_query:?}; narrow2={narrow_query:?}; concurrent1000_dropped=0; details100={page:?}; database_bytes={}; proxy_entries={}",
         std::fs::metadata(p).unwrap().len(),
         summary["proxy"]["observations"]
     );
@@ -612,8 +621,146 @@ async fn large_exact_integer_cost_overflow_returns_explicit_null() {
     assert!(source["estimated_cost_nanos"].is_null());
     assert!(source["known_cost_nanos"].is_null());
     assert_eq!(source["tokens"]["output"], 200_000_000_000_000_u64);
+    assert_dashboard_matches(&store, all()).await;
     assert_eq!(store.details(all()).await.unwrap()["total"], 200);
     assert_eq!(store.health()["writer_errors"], 0);
+    store.shutdown().await.unwrap();
+}
+
+// Compare independent SQL and streaming implementations at their shared contract.
+fn dashboard_metrics(value: &mut Value) {
+    match value {
+        Value::Object(fields) => {
+            for key in ["logical_requests", "attempts", "logical_requests_unknown", "attempts_unknown", "trends"] {
+                fields.remove(key);
+            }
+            for value in fields.values_mut() {
+                dashboard_metrics(value);
+            }
+        }
+        Value::Array(values) => {
+            for value in values {
+                dashboard_metrics(value);
+            }
+        }
+        _ => {}
+    }
+}
+async fn assert_dashboard_matches(store: &Store, q: Query) {
+    let mut full = store.query(q.clone()).await.unwrap();
+    let mut fast = store.dashboard(q).await.unwrap();
+    dashboard_metrics(&mut full);
+    dashboard_metrics(&mut fast);
+    for field in ["range", "combined", "facets"] {
+        assert_eq!(fast[field], full[field], "dashboard contract differs at {field}");
+    }
+    for field in ["version", "verified_at"] {
+        assert_eq!(fast["pricing"][field], full["pricing"][field]);
+    }
+}
+#[tokio::test]
+async fn dashboard_matches_full_summary_with_overlap_revisions_filters_and_fresh_writes() {
+    let store = Store::open(&path("dashboard-equivalence"), 64, 3650, None).unwrap();
+    let enrollment = super::super::collector::enroll(&store, "Test laptop".into()).await.unwrap();
+    let origin = format!("collector:{}", enrollment["collector"]["id"].as_str().unwrap());
+    let mut records = Vec::new();
+    for i in 0..40 {
+        let mut o = event(["proxy", "codex", "claude_code"][i % 3], &format!("dashboard-{i}"));
+        o.event_at_ms = boundary("2026-10-01T22:00:00Z", chrono_tz::UTC).unwrap() + i as i64 * 3_600_000;
+        o.provider = if i % 2 == 0 { "anthropic" } else { "openai" }.into();
+        o.actual_model =
+            if i % 5 == 0 { None } else { Some(if i % 2 == 0 { "claude-sonnet-4-6" } else { "gpt-6.1-sol" }.into()) };
+        o.account_id = (i % 4 != 0).then(|| format!("account-{}", i % 3));
+        o.client_id = (i % 7 == 0).then(|| "named-client".into());
+        if i % 3 != 0 {
+            o.origin_id = origin.clone();
+        }
+        if i % 11 == 0 {
+            o.tokens = Tokens::default();
+            o.completeness = "missing".into();
+        } else if i % 5 == 0 {
+            o.tokens.cache_write = None;
+            o.completeness = "partial".into();
+        }
+        records.push(o);
+    }
+    let mut proxy = anthropic("proxy", "trusted", Some("shared"), "2026-10-01T21:59:00Z");
+    proxy.account_id = Some("outside-filter".into());
+    let mut history = anthropic("claude_code", "matched", Some("shared"), "2026-10-02T22:01:00Z");
+    history.origin_id = origin.clone();
+    records.extend([proxy, history]);
+    let mut copy = records[1].clone();
+    copy.origin_id = "local-copy".into();
+    records.push(copy);
+    store.call(move |c| insert_batch(c, &records)).await.unwrap();
+    let base = Query {
+        start: Some("2026-10-02".into()),
+        end: Some("2026-10-04".into()),
+        timezone: Some("Europe/Amsterdam".into()),
+        ..Default::default()
+    };
+    let filters = [
+        Query::default(),
+        Query { stack: Some("model".into()), ..Default::default() },
+        Query { provider: Some("anthropic".into()), ..Default::default() },
+        Query { model: Some("gpt-6.1-sol".into()), ..Default::default() },
+        Query { account: Some("account-1".into()), ..Default::default() },
+        Query { client: Some(origin), ..Default::default() },
+        Query { source: Some("claude_code".into()), ..Default::default() },
+        Query { client: Some("does-not-exist".into()), ..Default::default() },
+    ];
+    for filter in filters {
+        assert_dashboard_matches(
+            &store,
+            Query { start: base.start.clone(), end: base.end.clone(), timezone: base.timezone.clone(), ..filter },
+        )
+        .await;
+    }
+    let before = store.dashboard(base.clone()).await.unwrap();
+    let mut fresh = anthropic("proxy", "fresh", None, "2026-10-02T10:00:00Z");
+    fresh.client_id = Some("just-arrived".into());
+    store.call(move |c| insert_batch(c, &[fresh])).await.unwrap();
+    let after = store.dashboard(base.clone()).await.unwrap();
+    assert_eq!(
+        after["combined"]["totals"]["observations"].as_i64().unwrap(),
+        before["combined"]["totals"]["observations"].as_i64().unwrap() + 1
+    );
+    assert_dashboard_matches(&store, base.clone()).await;
+    store.purge(boundary("2026-10-03T00:00:00Z", chrono_tz::UTC).unwrap()).await.unwrap();
+    assert_dashboard_matches(&store, base).await;
+    assert!(store.dashboard(Query { timezone: Some("invalid".into()), ..all() }).await.is_err());
+    store.shutdown().await.unwrap();
+}
+#[tokio::test]
+async fn dashboard_groups_dst_days_and_bounds_facets_and_breakdowns() {
+    let store = Store::open(&path("dashboard-bounds-dst"), 64, 3650, None).unwrap();
+    let mut records = Vec::new();
+    for i in 0..520 {
+        let mut o = event("proxy", &format!("dst-{i}"));
+        o.event_at_ms = boundary("2026-03-28T22:30:00Z", chrono_tz::UTC).unwrap() + i * 900_000;
+        o.actual_model = Some(format!("unknown-{i:03}"));
+        o.account_id = Some(format!("account-{i:03}"));
+        o.client_id = Some(format!("client-{i:03}"));
+        records.push(o);
+    }
+    store.call(move |c| insert_batch(c, &records)).await.unwrap();
+    for tz in ["Europe/Amsterdam", "America/Los_Angeles", "Asia/Kathmandu"] {
+        assert_dashboard_matches(
+            &store,
+            Query {
+                start: Some("2026-03-27".into()),
+                end: Some("2026-04-06".into()),
+                timezone: Some(tz.into()),
+                stack: Some("model".into()),
+                ..Default::default()
+            },
+        )
+        .await;
+    }
+    let q = Query { start: Some("2026-03-27".into()), end: Some("2026-04-06".into()), ..Default::default() };
+    let fast = store.dashboard(q).await.unwrap();
+    assert_eq!(fast["facets"]["models"].as_array().unwrap().len(), 500);
+    assert_eq!(fast["combined"]["breakdowns"]["account"].as_array().unwrap().len(), 500);
     store.shutdown().await.unwrap();
 }
 
@@ -990,6 +1137,67 @@ async fn startup_reprice_prices_old_unpriced_rows_once_and_keeps_priced_rows() {
     assert_eq!(item["pricing_basis"], "current_rate_equivalent");
     assert_eq!(item["pricing_snapshot"]["backdated"], true);
     assert_eq!(item["pricing_snapshot"]["partial"], false);
+    store.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn startup_repairs_unpriced_claude_regions_and_preserves_priced_snapshots() {
+    let p = path("region-reprice");
+    let store = Store::open(&p, 8, 3650, None).unwrap();
+    let mut unavailable = anthropic("proxy", "unavailable", Some("msg-unavailable"), &Utc::now().to_rfc3339());
+    unavailable.inference_geo = Some("not_available".into());
+    let mut unknown = unavailable.clone();
+    unknown.source_event_id = "unknown".into();
+    unknown.response_id = Some("msg-unknown".into());
+    unknown.inference_geo = Some("unknown_region".into());
+    let priced = event("proxy", "priced");
+    store.call(move |c| {
+        insert_batch(c, &[unavailable, unknown, priced])?;
+        // Recreate an old build's unpriced snapshot while retaining its native
+        // metadata. The same startup path is used on the production database.
+        c.execute("UPDATE usage_observations SET cost_nanos=NULL,pricing_basis='unsupported_inference_region',snapshot_json='{}' WHERE source_event_id='unavailable'", [])?;
+        let key: String = c.query_row("SELECT canonical_key FROM usage_observations WHERE source_event_id='unavailable'", [], |r| r.get(0))?;
+        rebuild_entries(c, &key, "proxy")?;
+        Ok(())
+    }).await.unwrap();
+    let before: String = store
+        .call(|c| {
+            Ok(c.query_row("SELECT snapshot_json FROM usage_observations WHERE source_event_id='priced'", [], |r| {
+                r.get(0)
+            })?)
+        })
+        .await
+        .unwrap();
+    store.shutdown().await.unwrap();
+    let store = Store::open(&p, 8, 3650, None).unwrap();
+    assert_eq!(store.startup_repriced(), 1);
+    assert_eq!(store.query(all()).await.unwrap()["proxy"]["unpriced"], 1);
+    store
+        .call(move |c| {
+            let (cost, raw): (i64, String) = c.query_row(
+                "SELECT cost_nanos,snapshot_json FROM usage_observations WHERE source_event_id='unavailable'",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )?;
+            assert!(cost > 0);
+            let snapshot: Value = serde_json::from_str(&raw)?;
+            assert_eq!(snapshot["partial"], true);
+            assert!(
+                snapshot["assumptions"]
+                    .as_array()
+                    .unwrap()
+                    .contains(&json!("inference_region_unavailable_global_rate_assumed"))
+            );
+            let after: String =
+                c.query_row("SELECT snapshot_json FROM usage_observations WHERE source_event_id='priced'", [], |r| {
+                    r.get(0)
+                })?;
+            assert_eq!(before, after);
+            Ok(())
+        })
+        .await
+        .unwrap();
+    assert_eq!(store.call(reprice).await.unwrap(), 0);
     store.shutdown().await.unwrap();
 }
 #[tokio::test]

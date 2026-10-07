@@ -16,9 +16,10 @@ use std::{
     },
 };
 use tokio::sync::{OnceCell, Semaphore, mpsc, oneshot};
+mod dashboard;
 
-const VERSION: i64 = 3;
-const APPLICATION_ID: i64 = 0x46555345;
+pub(super) const VERSION: i64 = 3;
+pub(super) const APPLICATION_ID: i64 = 0x46555345;
 const MAX_QUERY_DAYS: i64 = 3660;
 const ENTRY_COLUMNS: &str = "id,source,origin_id,source_event_id,canonical_key,association_key,event_at_ms,provider,model,account_id,client_id,logical_request_id,attempt_id,response_id,completeness,input,cache_read,cache_write,write_5m,write_1h,output,reasoning,cost_nanos,pricing_basis,catalogue_version,json_extract(snapshot_json,'$.partial') AS pricing_partial";
 const WINNER_ORDER: &str = "trust_rank,CASE completeness WHEN 'complete' THEN 0 WHEN 'partial' THEN 1 ELSE 2 END,known_fields DESC,COALESCE(output,-1) DESC,source,origin_id,source_event_id,fingerprint";
@@ -214,7 +215,7 @@ impl Store {
         // Collector outboxes only forward evidence; the server prices it on ingestion.
         let startup_repriced = if byte_limit.is_none() { reprice(&mut conn)? } else { 0 };
         if startup_repriced > 0 {
-            tracing::info!(repriced = startup_repriced, "priced older usage at current-rate equivalents");
+            tracing::info!(repriced = startup_repriced, "updated previously unpriced usage estimates");
         }
         let (tx, mut rx) = mpsc::channel(queue_capacity);
         let (historical_dropped,historical_rejected,historical_errors,prior_unclosed):(u64,u64,u64,u64)=conn.query_row("SELECT COALESCE(SUM(dropped),0),COALESCE(SUM(rejected),0),COALESCE(SUM(writer_errors),0),COALESCE(SUM(clean=0),0) FROM usage_writer_sessions",[],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?)))?;
@@ -476,6 +477,10 @@ impl Store {
     pub async fn query(&self, q: Query) -> Result<Value> {
         self.read(move |conn| summary(conn, &q)).await
     }
+    /// Dashboard metrics share one exact WAL snapshot without the legacy source/lifecycle scans.
+    pub async fn dashboard(&self, q: Query) -> Result<Value> {
+        self.read(move |conn| dashboard::summary(conn, &q)).await
+    }
     pub async fn details(&self, q: Query) -> Result<Value> {
         self.read(move |conn| details(conn, &q)).await
     }
@@ -571,20 +576,20 @@ fn canonical_key(o: &Observation) -> String {
     base
 }
 /// Reselect the global and per-source accounting entry for one canonical group.
-fn rebuild_entries(conn: &Connection, key: &str, source: &str) -> Result<()> {
+pub(super) fn rebuild_entries(conn: &Connection, key: &str, source: &str) -> Result<()> {
     conn.prepare_cached(&format!("INSERT OR REPLACE INTO usage_entries SELECT {ENTRY_COLUMNS} FROM usage_observations INDEXED BY usage_canonical WHERE canonical_key=?1 AND NOT EXISTS(SELECT 1 FROM usage_suppressed s WHERE s.source=usage_observations.source AND s.source_event_id=usage_observations.source_event_id AND (s.origin_id='' OR s.origin_id=usage_observations.origin_id)) ORDER BY {WINNER_ORDER} LIMIT 1"))?.execute([key])?;
     conn.prepare_cached(&format!("INSERT OR REPLACE INTO usage_source_entries SELECT {ENTRY_COLUMNS} FROM usage_observations INDEXED BY usage_canonical WHERE canonical_key=?1 AND source=?2 AND NOT EXISTS(SELECT 1 FROM usage_suppressed s WHERE s.source=usage_observations.source AND s.source_event_id=usage_observations.source_event_id AND (s.origin_id='' OR s.origin_id=usage_observations.origin_id)) ORDER BY {WINNER_ORDER} LIMIT 1"))?.execute(params![key,source])?;
     Ok(())
 }
-/// Price again observations stored unpriced only because their event predates the
-/// catalogue. Rows that already carry a price are never touched; safe to repeat.
+/// Retry unpriced observations affected by corrected date/region semantics.
+/// Rows that already carry a price are never touched; safe to repeat.
 pub fn reprice(conn: &mut Connection) -> Result<u64> {
     let raw: String = conn.query_row("SELECT value FROM usage_meta WHERE key='catalogue'", [], |r| r.get(0))?;
     let catalogue: Catalogue = serde_json::from_str(&raw)?;
     let (mut cursor, mut repriced) = (0_i64, 0_u64);
     loop {
         let tx = conn.savepoint()?;
-        let rows = tx.prepare("SELECT id,payload,canonical_key,source,pricing_basis FROM usage_observations WHERE id>?1 AND cost_nanos IS NULL AND pricing_basis IN ('outside_effective_period','local_override:outside_effective_period') ORDER BY id LIMIT 2000")?.query_map([cursor], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?, r.get::<_, String>(2)?, r.get::<_, String>(3)?, r.get::<_, String>(4)?)))?.collect::<rusqlite::Result<Vec<_>>>()?;
+        let rows = tx.prepare("SELECT id,payload,canonical_key,source,pricing_basis FROM usage_observations WHERE id>?1 AND cost_nanos IS NULL AND pricing_basis IN ('outside_effective_period','local_override:outside_effective_period','unsupported_inference_region','local_override:unsupported_inference_region') ORDER BY id LIMIT 2000")?.query_map([cursor], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?, r.get::<_, String>(2)?, r.get::<_, String>(3)?, r.get::<_, String>(4)?)))?.collect::<rusqlite::Result<Vec<_>>>()?;
         let Some(last) = rows.last() else { break };
         cursor = last.0;
         let mut groups = BTreeSet::new();

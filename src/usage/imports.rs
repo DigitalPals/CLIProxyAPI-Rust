@@ -1,7 +1,7 @@
 //! Explicitly consented, bounded native history imports. Raw records never enter SQLite.
 use super::{
     store::{self, Store},
-    types::{MAX_TOKENS, Observation, Tokens},
+    types::{MAX_TOKENS, Observation, Tokens, anthropic_service_tier},
 };
 use anyhow::{Result, anyhow, bail};
 use clap::Subcommand;
@@ -17,7 +17,7 @@ use std::{
     sync::OnceLock,
 };
 
-const PARSER: &str = "native-2026-10-07-v1";
+const PARSER: &str = "native-2026-10-07-v2";
 const MAX_FILES: usize = 4096;
 const MAX_BYTES: u64 = 32 * 1024 * 1024;
 const MAX_FILE: u64 = 256 * 1024 * 1024;
@@ -62,13 +62,47 @@ pub enum UsageCommand {
         #[arg(long)]
         source: Option<String>,
     },
-    /// Price unpriced rows that predate the catalogue at current-rate equivalents.
+    /// Retry unpriced rows affected by corrected date or region semantics.
     Reprice {
         #[arg(long)]
         database: PathBuf,
     },
+    /// Import normalized CPA usage keeper events; read-only preview unless --apply is supplied.
+    ImportKeeper {
+        #[arg(long)]
+        database: PathBuf,
+        #[arg(long)]
+        input_database: PathBuf,
+        /// Stable identity of this keeper database, also used when importing its backups.
+        #[arg(long)]
+        origin: String,
+        #[arg(long)]
+        apply: bool,
+    },
+    /// Estimate imported keeper cache writes at the five-minute rate; preview unless --apply is supplied.
+    EstimateKeeperCache {
+        #[arg(long)]
+        database: PathBuf,
+        #[arg(long)]
+        origin: String,
+        #[arg(long)]
+        apply: bool,
+    },
 }
 pub async fn run_command(command: UsageCommand) -> Result<()> {
+    if let UsageCommand::EstimateKeeperCache { database, origin, apply } = command {
+        let result =
+            tokio::task::spawn_blocking(move || super::keeper::estimate_cache(&database, &origin, apply)).await??;
+        println!("{}", serde_json::to_string_pretty(&result)?);
+        return Ok(());
+    }
+    if let UsageCommand::ImportKeeper { database, input_database, origin, apply } = command {
+        let result =
+            tokio::task::spawn_blocking(move || super::keeper::import(&database, &input_database, &origin, apply))
+                .await??;
+        println!("{}", serde_json::to_string_pretty(&result)?);
+        return Ok(());
+    }
     let database = match &command {
         UsageCommand::Status { database }
         | UsageCommand::Enable { database, .. }
@@ -76,6 +110,7 @@ pub async fn run_command(command: UsageCommand) -> Result<()> {
         | UsageCommand::Scan { database, .. }
         | UsageCommand::Backfill { database, .. }
         | UsageCommand::Reprice { database } => database,
+        UsageCommand::ImportKeeper { .. } | UsageCommand::EstimateKeeperCache { .. } => unreachable!(),
     };
     let database = database.clone();
     let store = tokio::task::spawn_blocking(move || Store::open_existing(&database, 128)).await??;
@@ -86,6 +121,7 @@ pub async fn run_command(command: UsageCommand) -> Result<()> {
         UsageCommand::Scan { source, .. } => scan(&store, source).await,
         UsageCommand::Backfill { source, .. } => backfill(&store, source).await,
         UsageCommand::Reprice { .. } => reprice(&store).await,
+        UsageCommand::ImportKeeper { .. } | UsageCommand::EstimateKeeperCache { .. } => unreachable!(),
     };
     let shutdown = store.shutdown().await;
     let result = result?;
@@ -221,6 +257,8 @@ pub(crate) struct Context {
     model: Option<String>,
     provider: Option<String>,
     #[serde(default)]
+    service_tier: Option<String>,
+    #[serde(default)]
     meta_seen: bool,
     #[serde(default)]
     legacy_fork: bool,
@@ -232,6 +270,8 @@ pub(crate) struct Context {
     superseded: Vec<String>,
     #[serde(default)]
     turns: BTreeMap<String, String>,
+    #[serde(default)]
+    turn_tiers: BTreeMap<String, Option<String>>,
     cumulative: Option<NativeTokens>,
     #[serde(default)]
     modern_totals: Vec<String>,
@@ -246,6 +286,13 @@ struct NativeTokens {
     reasoning: Option<u64>,
 }
 impl NativeTokens {
+    fn same_billed_usage(&self, other: &Self) -> bool {
+        self.input == other.input
+            && self.read == other.read
+            && self.write == other.write
+            && self.output == other.output
+            && self.reasoning.zip(other.reasoning).is_none_or(|(a, b)| a == b)
+    }
     fn key(&self) -> String {
         format!(
             "{}:{}:{}:{}:{}",
@@ -400,7 +447,7 @@ fn parse_record_inner(source: &str, v: &Value, context: &mut Context) -> Result<
             valid_numbers(ttl, &["ephemeral_5m_input_tokens", "ephemeral_1h_input_tokens"])?;
         }
         if let Some(details) = usage.get("output_tokens_details") {
-            valid_numbers(details, &["reasoning_tokens"])?;
+            valid_numbers(details, &["reasoning_tokens", "thinking_tokens"])?;
         }
         let Some(at) = timestamp(v) else { bail!("missing timestamp") };
         let message_id = label(message.get("id"));
@@ -413,7 +460,7 @@ fn parse_record_inner(source: &str, v: &Value, context: &mut Context) -> Result<
         o.response_id = message_id;
         o.provider_request_id = request_id;
         o.session_id = label(v.get("sessionId"));
-        o.service_tier = label(usage.get("service_tier"));
+        o.service_tier = anthropic_service_tier(label(usage.get("service_tier")), usage["speed"].as_str());
         o.inference_geo = label(usage.get("inference_geo"));
         o.tokens = Tokens {
             input: number(usage.get("input_tokens")),
@@ -422,7 +469,8 @@ fn parse_record_inner(source: &str, v: &Value, context: &mut Context) -> Result<
             write_5m: number(usage.pointer("/cache_creation/ephemeral_5m_input_tokens")),
             write_1h: number(usage.pointer("/cache_creation/ephemeral_1h_input_tokens")),
             output: number(usage.get("output_tokens")),
-            reasoning: number(usage.pointer("/output_tokens_details/reasoning_tokens")),
+            reasoning: number(usage.pointer("/output_tokens_details/thinking_tokens"))
+                .or_else(|| number(usage.pointer("/output_tokens_details/reasoning_tokens"))),
         };
         o.completeness = if o.tokens.total().is_some() { "complete" } else { "partial" }.into();
         o.validate().map_err(|_| anyhow!("invalid usage metadata"))?;
@@ -439,17 +487,35 @@ fn parse_record_inner(source: &str, v: &Value, context: &mut Context) -> Result<
                 context.session = label(payload.get("session_id")).or_else(|| label(payload.get("id")));
                 context.thread = label(payload.get("id"));
                 context.provider = label(payload.get("model_provider"));
-                context.legacy_fork = payload.get("forked_from_id").is_some_and(|v| !v.is_null());
+                context.legacy_fork = payload.get("forked_from_id").is_some_and(|v| !v.is_null())
+                    || payload.pointer("/source/subagent/thread_spawn/parent_thread_id").is_some_and(|v| !v.is_null());
             }
             Ok(None)
         }
         Some("turn_context") => {
             context.model = label(payload.get("model"));
+            if payload.get("service_tier").is_some() {
+                context.service_tier = label(payload.get("service_tier"));
+            }
             if let (Some(turn), Some(model)) = (label(payload.get("turn_id")), context.model.clone()) {
                 if context.turns.len() >= 64 {
                     context.turns.clear();
+                    context.turn_tiers.clear();
                 }
+                context.turn_tiers.insert(turn.clone(), context.service_tier.clone());
                 context.turns.insert(turn, model);
+            }
+            Ok(None)
+        }
+        Some("event_msg") if payload["type"] == "thread_settings_applied" => {
+            if let Some(settings) = payload.get("thread_settings").filter(|v| v.is_object()) {
+                // An applied settings snapshot with no requested tier resets
+                // Codex to its standard speed; the old fast tier must not stick.
+                context.service_tier = if settings.get("service_tier").is_none_or(Value::is_null) {
+                    Some("standard".into())
+                } else {
+                    Some(label(settings.get("service_tier")).ok_or_else(|| anyhow!("invalid service tier"))?)
+                };
             }
             Ok(None)
         }
@@ -480,6 +546,10 @@ fn parse_record_inner(source: &str, v: &Value, context: &mut Context) -> Result<
                 Some(id) => context.turns.get(&id).cloned(),
                 None => context.model.clone(),
             };
+            o.service_tier = label(payload.get("service_tier")).or_else(|| match label(payload.get("turn_id")) {
+                Some(id) => context.turn_tiers.get(&id).cloned().flatten(),
+                None => context.service_tier.clone(),
+            });
             o.tokens = codex_tokens(usage);
             o.completeness = if o.tokens.total().is_some() { "complete" } else { "partial" }.into();
             if number(usage.get("input_tokens")).is_some()
@@ -531,14 +601,16 @@ fn parse_record_inner(source: &str, v: &Value, context: &mut Context) -> Result<
             o.parser_version = PARSER.into();
             o.session_id = Some(session);
             o.actual_model = context.model.clone();
+            o.service_tier = context.service_tier.clone();
             o.tokens = total.tokens().ok_or_else(|| anyhow!("inconsistent cumulative categories"))?;
             // Legacy token_count can contain estimates/replay; explicitly partial evidence.
             o.completeness = "partial".into();
             // Validate timestamps and cumulative subsets before recording a reset.
             o.validate().map_err(|_| anyhow!("invalid usage metadata"))?;
+            let first = context.cumulative.is_none();
             let previous = context
                 .cumulative
-                .replace(total.clone())
+                .clone()
                 .unwrap_or_else(|| NativeTokens { reasoning: Some(0), ..NativeTokens::default() });
             if total == previous {
                 return Ok(None);
@@ -547,6 +619,13 @@ fn parse_record_inner(source: &str, v: &Value, context: &mut Context) -> Result<
                 context.legacy_reset = true;
                 bail!("unsupported ambiguous legacy usage after counter reset")
             };
+            let last = info.get("last_token_usage").filter(|v| !v.is_null()).map(validated_native).transpose()?;
+            if let Some(last) = &last
+                && total.diff(last).is_none()
+            {
+                bail!("inconsistent last-response categories")
+            }
+            context.cumulative = Some(total.clone());
             if context.modern_totals.contains(&total.key()) {
                 return Ok(None);
             }
@@ -554,7 +633,18 @@ fn parse_record_inner(source: &str, v: &Value, context: &mut Context) -> Result<
                 context.legacy_emitted.remove(0);
             }
             context.legacy_emitted.push(o.source_event_id.clone());
-            o.tokens = delta.tokens().ok_or_else(|| anyhow!("inconsistent cumulative categories"))?;
+            // A first snapshot after resume can contain the thread's entire old
+            // history. Its last response is the only per-request observation.
+            // Later last values must reconcile with cumulative growth; a jump
+            // can cover several requests and cannot select a context rate.
+            let response = last.filter(|last| first || delta.same_billed_usage(last));
+            let selected = response.as_ref().unwrap_or(&delta);
+            o.tokens = selected.tokens().ok_or_else(|| anyhow!("inconsistent cumulative categories"))?;
+            if response.is_some() {
+                o.numeric_metadata.insert("per_request_usage".into(), 1);
+                o.numeric_metadata.insert("input_total".into(), selected.input);
+                o.completeness = "complete".into();
+            }
             o.validate().map_err(|_| anyhow!("invalid usage metadata"))?;
             Ok(Some(o))
         }

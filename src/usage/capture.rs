@@ -1,7 +1,7 @@
 //! Allowlisted native usage tap. Never retains a body, prompt, tool or transcript.
 use super::{
     store::Store,
-    types::{Observation, Tokens},
+    types::{Observation, Tokens, anthropic_service_tier},
 };
 use crate::{accounts::Account, ir::Usage};
 use parking_lot::Mutex;
@@ -165,6 +165,7 @@ pub fn observe(o: &mut Observation, v: &Value) {
     if let Some(s) = v["id"].as_str().or_else(|| v["responseId"].as_str()).and_then(safe) {
         o.response_id = Some(s);
     }
+    let prior_tier = o.service_tier.clone();
     if let Some(s) = v["service_tier"].as_str().and_then(safe) {
         o.service_tier = Some(s);
     }
@@ -201,7 +202,11 @@ pub fn observe(o: &mut Observation, v: &Value) {
             (&["/cache_creation/ephemeral_5m_input_tokens"][..], "5m"),
             (&["/cache_creation/ephemeral_1h_input_tokens"][..], "1h"),
             (
-                &["/output_tokens_details/reasoning_tokens", "/completion_tokens_details/reasoning_tokens"][..],
+                &[
+                    "/output_tokens_details/reasoning_tokens",
+                    "/output_tokens_details/thinking_tokens",
+                    "/completion_tokens_details/reasoning_tokens",
+                ][..],
                 "reasoning",
             ),
         ] {
@@ -227,10 +232,25 @@ pub fn observe(o: &mut Observation, v: &Value) {
     }
     let mut t = Tokens::default();
     if u.is_object() {
-        if o.provider == "anthropic"
-            || u.get("cache_creation_input_tokens").is_some()
-            || u.get("cache_read_input_tokens").is_some()
+        let inclusive = u.get("prompt_tokens").is_some()
+            || u.get("input_tokens_details").is_some()
+            || u.get("prompt_tokens_details").is_some();
+        if !inclusive
+            && (o.provider == "anthropic"
+                || u.get("cache_creation_input_tokens").is_some()
+                || u.get("cache_read_input_tokens").is_some())
         {
+            let tier = if u.get("speed").is_none()
+                && prior_tier.as_deref() == Some("fast")
+                && matches!(o.service_tier.as_deref(), Some("standard" | "default" | "auto"))
+            {
+                // A delta can repeat the ordinary tier while omitting speed;
+                // the fast mode already reported for this response still applies.
+                prior_tier
+            } else {
+                o.service_tier.take()
+            };
+            o.service_tier = anthropic_service_tier(tier, u["speed"].as_str());
             t.input = number(&u["input_tokens"]);
             t.output = number(&u["output_tokens"]);
             // Anthropic optional caching fields default to zero when input is reported.
@@ -238,6 +258,8 @@ pub fn observe(o: &mut Observation, v: &Value) {
             t.cache_write = u.get("cache_creation_input_tokens").map(number).unwrap_or_else(|| t.input.map(|_| 0));
             t.write_5m = number(&u["cache_creation"]["ephemeral_5m_input_tokens"]);
             t.write_1h = number(&u["cache_creation"]["ephemeral_1h_input_tokens"]);
+            t.reasoning = number(&u["output_tokens_details"]["thinking_tokens"])
+                .or_else(|| number(&u["output_tokens_details"]["reasoning_tokens"]));
             if t.cache_write == Some(0) {
                 if u["cache_creation"].get("ephemeral_5m_input_tokens").is_none() {
                     t.write_5m = Some(0);
@@ -254,9 +276,15 @@ pub fn observe(o: &mut Observation, v: &Value) {
                 &u["prompt_tokens_details"]
             };
             t.cache_read = number(&d["cached_tokens"]);
-            t.cache_write = number(&d["cache_creation_tokens"])
-                .or_else(|| number(&d["cache_write_tokens"]))
-                .or_else(|| number(&u["cache_creation_input_tokens"]));
+            let write = d
+                .get("cache_creation_tokens")
+                .or_else(|| d.get("cache_write_tokens"))
+                .or_else(|| u.get("cache_creation_input_tokens"));
+            // OpenAI omits writes when none were reported (including older
+            // models). An explicitly null/invalid value remains unknown, as do
+            // omitted categories from an arbitrary compatible provider.
+            t.cache_write =
+                write.map(number).unwrap_or_else(|| (o.provider == "openai").then_some(0).filter(|_| input.is_some()));
             t.input = input.and_then(|n| n.checked_sub(t.cache_read?).and_then(|n| n.checked_sub(t.cache_write?)));
             if input.is_some() && t.input.is_none() {
                 o.tokens.input = None;
@@ -381,7 +409,7 @@ mod tests {
             &mut o,
             &json!({"message":{"id":"msg_1","usage":{"input_tokens":100,"output_tokens":0,"cache_creation_input_tokens":20,"cache_read_input_tokens":30,"cache_creation":{"ephemeral_5m_input_tokens":5,"ephemeral_1h_input_tokens":15}}}}),
         );
-        observe(&mut o, &json!({"usage":{"output_tokens":50}}));
+        observe(&mut o, &json!({"usage":{"output_tokens":50,"service_tier":"standard"}}));
         assert_eq!(o.tokens.total(), Some(200));
         assert_eq!(o.tokens.write_1h, Some(15));
     }
@@ -393,6 +421,62 @@ mod tests {
         assert_eq!(o.tokens.cache_write, None);
         assert_eq!(o.tokens.input, None);
         assert_eq!(o.numeric_metadata["input_total"], 100);
+        assert_eq!(o.completeness, "partial");
+    }
+    #[test]
+    fn ordinary_openai_usage_without_cache_writes_is_priceable() {
+        for usage in [
+            json!({"input_tokens":100,"input_tokens_details":{"cached_tokens":20},"output_tokens":40}),
+            json!({"prompt_tokens":100,"prompt_tokens_details":{"cached_tokens":20},"completion_tokens":40}),
+        ] {
+            let mut o = Observation::new("proxy", "id".into(), "openai", chrono::Utc::now().timestamp_millis());
+            observe(&mut o, &json!({"model":"gpt-5.4-mini","usage":usage}));
+            assert_eq!((o.tokens.input, o.tokens.cache_read, o.tokens.cache_write), (Some(80), Some(20), Some(0)));
+            assert_eq!(o.tokens.total(), Some(140));
+            assert_eq!(o.completeness, "complete");
+            assert_eq!(super::super::pricing::Catalogue::load(None).unwrap().price(&o).cost_nanos, Some(241_500));
+        }
+    }
+    #[test]
+    fn openai_invalid_writes_and_missing_reads_stay_unknown() {
+        for details in [
+            json!({"cached_tokens":20,"cache_write_tokens":null}),
+            json!({"cached_tokens":20,"cache_write_tokens":-1}),
+            json!({}),
+        ] {
+            let mut o = Observation::new("proxy", "id".into(), "openai", chrono::Utc::now().timestamp_millis());
+            observe(&mut o, &json!({"usage":{"input_tokens":100,"input_tokens_details":details,"output_tokens":40}}));
+            assert_eq!(o.tokens.input, None);
+            assert_eq!(o.completeness, "partial");
+        }
+    }
+    #[test]
+    fn inclusive_top_level_cache_writes_and_partial_snapshots_keep_categories() {
+        let mut o = Observation::new("proxy", "id".into(), "openai", chrono::Utc::now().timestamp_millis());
+        observe(
+            &mut o,
+            &json!({"usage":{"input_tokens":100,"input_tokens_details":{"cached_tokens":20},"cache_creation_input_tokens":10,"output_tokens":40}}),
+        );
+        assert_eq!((o.tokens.input, o.tokens.cache_read, o.tokens.cache_write), (Some(70), Some(20), Some(10)));
+        observe(&mut o, &json!({"usage":{"output_tokens":50}}));
+        assert_eq!(o.tokens.total(), Some(150));
+        assert_eq!(o.tokens.cache_write, Some(10));
+    }
+    #[test]
+    fn claude_fast_speed_and_thinking_are_metadata_subsets() {
+        let mut o = Observation::new("proxy", "id".into(), "anthropic", chrono::Utc::now().timestamp_millis());
+        observe(
+            &mut o,
+            &json!({"message":{"model":"claude-opus-5-5","usage":{"input_tokens":100,"output_tokens":40,"speed":"fast","service_tier":"standard","output_tokens_details":{"thinking_tokens":30}}}}),
+        );
+        assert_eq!(o.service_tier.as_deref(), Some("fast"));
+        assert_eq!(o.tokens.reasoning, Some(30));
+        assert_eq!(o.tokens.total(), Some(140));
+        observe(&mut o, &json!({"usage":{"output_tokens":50,"service_tier":"standard"}}));
+        assert_eq!(o.service_tier.as_deref(), Some("fast"));
+        assert_eq!(o.tokens.total(), Some(150));
+        observe(&mut o, &json!({"usage":{"output_tokens_details":{"thinking_tokens":51}}}));
+        assert_eq!(o.tokens.reasoning, None);
         assert_eq!(o.completeness, "partial");
     }
     #[test]

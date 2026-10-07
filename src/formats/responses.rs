@@ -392,13 +392,19 @@ pub fn usage_of(u: &Value) -> Option<Usage> {
         return None;
     }
     let input = u["input_tokens"].as_u64().unwrap_or(0);
-    let cached = u["input_tokens_details"]["cached_tokens"].as_u64().unwrap_or(0);
+    let details = &u["input_tokens_details"];
+    let cached = details["cached_tokens"].as_u64().unwrap_or(0);
+    let write = details["cache_creation_tokens"]
+        .as_u64()
+        .or_else(|| details["cache_write_tokens"].as_u64())
+        .or_else(|| u["cache_creation_input_tokens"].as_u64())
+        .unwrap_or(0);
     Some(Usage {
-        input: input.saturating_sub(cached),
+        input: input.saturating_sub(cached).saturating_sub(write),
         cache_read: cached,
         output: u["output_tokens"].as_u64().unwrap_or(0),
         reasoning: u["output_tokens_details"]["reasoning_tokens"].as_u64().unwrap_or(0),
-        cache_write: 0,
+        cache_write: write,
     })
 }
 
@@ -787,13 +793,17 @@ fn error_code(status: u16) -> &'static str {
 }
 
 fn usage_json(u: &Usage) -> Value {
-    json!({
+    let mut usage = json!({
         "input_tokens": u.prompt_total(),
         "input_tokens_details": { "cached_tokens": u.cache_read },
         "output_tokens": u.output,
         "output_tokens_details": { "reasoning_tokens": u.reasoning },
         "total_tokens": u.prompt_total() + u.output,
-    })
+    });
+    if u.cache_write > 0 {
+        usage["input_tokens_details"]["cache_creation_tokens"] = u.cache_write.into();
+    }
+    usage
 }
 
 impl StreamRenderer for Renderer {

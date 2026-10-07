@@ -1,0 +1,72 @@
+{
+  "verified_at": "2026-10-07T09:56:43.741817+00:00",
+  "t3code_commit": "cd41c4ada0c70cc2eec95ecd7266f3dab010c58c",
+  "version": "0.3.2+gui.2849cdfb943e",
+  "rollback_version": "0.3.2+gui.d002ee92a380",
+  "source_sha256": "2849cdfb943e5076bb2edc61676451d902a30bcb34e906e32298037b0cf55e62",
+  "binary_sha256": "52e19c5481d4b28f66028edfa8e4b434255ed76d16183e18a79617d9760a1b88",
+  "archive_sha256": "c04463af7fe1aa51699f2b159215de1f76d77123b2661a4d914e29b59a0f1818",
+  "validation": {
+    "rust_tests": 315,
+    "javascript_tests": 24,
+    "python_tests": 30,
+    "collector_acceptance_checks": 11,
+    "formatting": true,
+    "clippy_warnings_denied": true,
+    "release_built": true,
+    "browser": {
+      "browserPassed": true,
+      "realBackend": true,
+      "estimated_cost_nanos": 12460000,
+      "priced_observations": 2,
+      "explicit_partial_estimates": 2,
+      "resumed_counter_input_verified": true,
+      "desktop_mobile_no_overflow": true,
+      "runtime_errors": 0
+    }
+  },
+  "production": {
+    "ok": true,
+    "version": "0.3.2+gui.2849cdfb943e",
+    "binary_sha256": "52e19c5481d4b28f66028edfa8e4b434255ed76d16183e18a79617d9760a1b88",
+    "accounts": 5,
+    "billing_calls": 0,
+    "gate_unchanged": true,
+    "config_and_routing_verified": true,
+    "sessions": {
+      "snapshot_assignments": 66,
+      "preserved_assignments": 66,
+      "expired_assignments": 0,
+      "current_assignments": 66
+    },
+    "analytics_health": "healthy",
+    "configured_imports": 0,
+    "collectors_enrolled": 0,
+    "public_https_health_and_assets": true,
+    "outcome_counters_present": true,
+    "native_health": {
+      "state": "healthy",
+      "written": 2,
+      "dropped": 0,
+      "rejected": 0,
+      "writer_errors": 0,
+      "prior_unclosed_sessions": 0
+    },
+    "journal_completed_requests": 2,
+    "journal_structured_fields_verified": true,
+    "journal_outcomes": {
+      "success": 2
+    },
+    "journal_failure_categories": {},
+    "journal_ansi_free": true,
+    "source_commit": "311df0953b9569346136131e4dcdc15e0a791a51+working-tree",
+    "repaired_existing_claude_observations": 135,
+    "repaired_cost_nanos": 11994608800,
+    "saved_priced_snapshots_preserved": 2364,
+    "saved_priced_snapshot_sha256": "72f0890db5875273ed5cebab110d4b5dee49003daf78e6c7e8db402e6b79007b",
+    "sqlite_quick_check": "ok",
+    "region_assumptions_verified": true,
+    "forced_restart": true,
+    "active_requests_at_stop": 1
+  }
+}

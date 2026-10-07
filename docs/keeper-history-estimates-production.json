@@ -1,0 +1,319 @@
+{
+  "verified_at_utc": "2026-10-07T11:50:12.848427+00:00",
+  "helper_version": "0.3.2+history.a464acdc0f8a",
+  "helper_binary_sha256": "3b2385c2180c995edb12a512dbb03cd0f09e105d34f20e8a9a8908c027f546fd",
+  "helper_source_sha256": "a464acdc0f8a734bd0d79f737cc96493e10391011a088858f4914f6608412f9c",
+  "production_version": "0.3.2+gui.3697a4b98262",
+  "production_binary_sha256": "c6b44fac7a898a9b288d230c76c0db7eb58890b702e5183c358f51aefcedeb53",
+  "pricing_catalogue": "2026-10-07.3",
+  "method": "keeper-cache-5m-2026-10-07-v1",
+  "assumption": "All cache writes with unknown lifetime use the five-minute rate. Original reported tokens remain unchanged.",
+  "backup": {
+    "observations": 196564,
+    "high_id": 196564,
+    "sha256": "3e9548d597fc231215cea99c661fd4705e5eff143165e3052b782602642f4039",
+    "bytes": 1328553984,
+    "consistent_sqlite_backup": true,
+    "created_at_ms": 1791372920297
+  },
+  "trial": {
+    "preview": {
+      "assumption": "All cache writes with unknown lifetime use the five-minute rate. Original reported tokens remain unchanged.",
+      "cache_lifetime_max_cost_nanos": 12083557913400,
+      "cache_lifetime_min_cost_nanos": 10084681399650,
+      "catalogue_version": "2026-10-07.3",
+      "completed_at_utc": "2026-10-07T11:45:49.124164105+00:00",
+      "estimated": 89536,
+      "estimated_cost_nanos": 10084681399650,
+      "method": "keeper-cache-5m-2026-10-07-v1",
+      "mode": "preview",
+      "models": {
+        "claude-fable-5-1": {
+          "cache_lifetime_max_cost_nanos": 676801670000,
+          "cache_lifetime_min_cost_nanos": 524091387500,
+          "estimated_cost_nanos": 524091387500,
+          "observations": 1879
+        },
+        "claude-opus-4-8": {
+          "cache_lifetime_max_cost_nanos": 60522301500,
+          "cache_lifetime_min_cost_nanos": 53151650250,
+          "estimated_cost_nanos": 53151650250,
+          "observations": 227
+        },
+        "claude-opus-5": {
+          "cache_lifetime_max_cost_nanos": 338748863500,
+          "cache_lifetime_min_cost_nanos": 317474423500,
+          "estimated_cost_nanos": 317474423500,
+          "observations": 1867
+        },
+        "claude-opus-5-5": {
+          "cache_lifetime_max_cost_nanos": 10799050047200,
+          "cache_lifetime_min_cost_nanos": 8998942251200,
+          "estimated_cost_nanos": 8998942251200,
+          "observations": 80349
+        },
+        "claude-sonnet-5": {
+          "cache_lifetime_max_cost_nanos": 208435031200,
+          "cache_lifetime_min_cost_nanos": 191021687200,
+          "estimated_cost_nanos": 191021687200,
+          "observations": 5214
+        }
+      },
+      "origin": "keeper:production-20260912-v1.15.4",
+      "updated": 0
+    },
+    "applied": {
+      "assumption": "All cache writes with unknown lifetime use the five-minute rate. Original reported tokens remain unchanged.",
+      "cache_lifetime_max_cost_nanos": 12083557913400,
+      "cache_lifetime_min_cost_nanos": 10084681399650,
+      "catalogue_version": "2026-10-07.3",
+      "completed_at_utc": "2026-10-07T11:46:12.663342717+00:00",
+      "estimated": 89536,
+      "estimated_cost_nanos": 10084681399650,
+      "method": "keeper-cache-5m-2026-10-07-v1",
+      "mode": "applied",
+      "models": {
+        "claude-fable-5-1": {
+          "cache_lifetime_max_cost_nanos": 676801670000,
+          "cache_lifetime_min_cost_nanos": 524091387500,
+          "estimated_cost_nanos": 524091387500,
+          "observations": 1879
+        },
+        "claude-opus-4-8": {
+          "cache_lifetime_max_cost_nanos": 60522301500,
+          "cache_lifetime_min_cost_nanos": 53151650250,
+          "estimated_cost_nanos": 53151650250,
+          "observations": 227
+        },
+        "claude-opus-5": {
+          "cache_lifetime_max_cost_nanos": 338748863500,
+          "cache_lifetime_min_cost_nanos": 317474423500,
+          "estimated_cost_nanos": 317474423500,
+          "observations": 1867
+        },
+        "claude-opus-5-5": {
+          "cache_lifetime_max_cost_nanos": 10799050047200,
+          "cache_lifetime_min_cost_nanos": 8998942251200,
+          "estimated_cost_nanos": 8998942251200,
+          "observations": 80349
+        },
+        "claude-sonnet-5": {
+          "cache_lifetime_max_cost_nanos": 208435031200,
+          "cache_lifetime_min_cost_nanos": 191021687200,
+          "estimated_cost_nanos": 191021687200,
+          "observations": 5214
+        }
+      },
+      "origin": "keeper:production-20260912-v1.15.4",
+      "updated": 89536
+    },
+    "verification": {
+      "added_cost_nanos": 10084681399650,
+      "canonical_and_source_entries_verified": true,
+      "estimated": 89536,
+      "integer_math_independently_verified": true,
+      "one_hour_cost_nanos": 12083557913400,
+      "original_snapshot_digests_verified": true
+    },
+    "preview_read_only": true,
+    "original_evidence_and_existing_prices_preserved": true,
+    "second_apply_updates": 0
+  },
+  "live": {
+    "accounts": 5,
+    "added_cost_nanos": 10084681399650,
+    "backend_pid_unchanged": true,
+    "billing_calls": 0,
+    "environment_unchanged": true,
+    "evidence": {
+      "application_id": 1179996997,
+      "evidence_sha256": "8fe5f5d4168e362507cb98688847a20ccc7b36fd7570f89f6648322a55a93869",
+      "high_id": 196710,
+      "observations": 196710,
+      "schema_version": 3,
+      "target_observations": 89536,
+      "unaffected_observations": 107174,
+      "unaffected_priced": 106644,
+      "unaffected_sha256": "a2889333fa898fe8e21256ce058098a8d82c08690492f77697c5993312dea2da"
+    },
+    "gate_unchanged": true,
+    "history": {
+      "calls": 192716,
+      "estimated_cost_nanos": 24304739596670,
+      "unpriced": 190
+    },
+    "live_replay_updates": 0,
+    "models": [
+      {
+        "calls": 72783,
+        "estimated_cost_nanos": 13223699509000,
+        "model": "gpt-6-astra",
+        "unpriced": 45
+      },
+      {
+        "calls": 80515,
+        "estimated_cost_nanos": 9005161760200,
+        "model": "claude-opus-5-5",
+        "unpriced": 45
+      },
+      {
+        "calls": 18772,
+        "estimated_cost_nanos": 599962556400,
+        "model": "gpt-6-sol",
+        "unpriced": 9
+      },
+      {
+        "calls": 1896,
+        "estimated_cost_nanos": 524098287500,
+        "model": "claude-fable-5-1",
+        "unpriced": 16
+      },
+      {
+        "calls": 1887,
+        "estimated_cost_nanos": 317712763500,
+        "model": "claude-opus-5",
+        "unpriced": 5
+      },
+      {
+        "calls": 8528,
+        "estimated_cost_nanos": 239973307600,
+        "model": "gpt-6.1-sol",
+        "unpriced": 2
+      },
+      {
+        "calls": 5219,
+        "estimated_cost_nanos": 191077309200,
+        "model": "claude-sonnet-5",
+        "unpriced": 2
+      },
+      {
+        "calls": 2272,
+        "estimated_cost_nanos": 148782115200,
+        "model": "gpt-5.6-sol",
+        "unpriced": 16
+      },
+      {
+        "calls": 227,
+        "estimated_cost_nanos": 53151650250,
+        "model": "claude-opus-4-8",
+        "unpriced": 0
+      },
+      {
+        "calls": 411,
+        "estimated_cost_nanos": 916990440,
+        "model": "gpt-5.6-luna",
+        "unpriced": 2
+      },
+      {
+        "calls": 97,
+        "estimated_cost_nanos": 138087380,
+        "model": "gpt-6-luna",
+        "unpriced": 0
+      },
+      {
+        "calls": 62,
+        "estimated_cost_nanos": 62440000,
+        "model": "gpt-5.5",
+        "unpriced": 25
+      },
+      {
+        "calls": 30,
+        "estimated_cost_nanos": 2820000,
+        "model": "claude-sonnet-4-6",
+        "unpriced": 6
+      },
+      {
+        "calls": 5,
+        "estimated_cost_nanos": null,
+        "model": "codex-auto-review",
+        "unpriced": 5
+      },
+      {
+        "calls": 12,
+        "estimated_cost_nanos": null,
+        "model": "claude-haiku-4-5-20251001",
+        "unpriced": 12
+      }
+    ],
+    "original_evidence_and_existing_prices_preserved": true,
+    "outcome": "verified",
+    "production_version": "0.3.2+gui.3697a4b98262",
+    "record_api_assumption_verified": true,
+    "updated": 89536,
+    "verification": {
+      "added_cost_nanos": 10084681399650,
+      "canonical_and_source_entries_verified": true,
+      "estimated": 89536,
+      "integer_math_independently_verified": true,
+      "one_hour_cost_nanos": 12083557913400,
+      "original_snapshot_digests_verified": true
+    }
+  },
+  "rust_tests": {
+    "total": 330,
+    "failures": 0
+  },
+  "clippy_warnings": 0,
+  "ui_record": {
+    "actualProductionRecord": true,
+    "historicalAssumptionVisible": true,
+    "partialEstimateVisible": true,
+    "reportedLifetimeRemainsUnknown": true
+  },
+  "public_performance": {
+    "billing_calls": 0,
+    "cache_ttl_seconds": 0,
+    "dashboard": [
+      {
+        "first_ms": 20.7,
+        "max_ms": 28.3,
+        "median_ms": 22.6,
+        "observations": 4009,
+        "range": "today",
+        "samples": 8
+      },
+      {
+        "first_ms": 125.5,
+        "max_ms": 157.9,
+        "median_ms": 98.3,
+        "observations": 28791,
+        "range": "7days",
+        "samples": 8
+      },
+      {
+        "first_ms": 748.3,
+        "max_ms": 782.7,
+        "median_ms": 721.5,
+        "observations": 196726,
+        "range": "30days",
+        "samples": 8
+      }
+    ],
+    "health": {
+      "accepted": 335,
+      "dropped": 0,
+      "prior_unclosed_sessions": 0,
+      "rejected": 0,
+      "state": "healthy",
+      "writer_errors": 0,
+      "written": 335
+    },
+    "management_auth_verified": true,
+    "public_assets_verified": true,
+    "public_tls_verified": true,
+    "records_page_ms": 21.3,
+    "version": "0.3.2+gui.3697a4b98262"
+  },
+  "display_examples": {
+    "claude-opus-5-5": {
+      "calls": 80650,
+      "estimated_cost_nanos": 9017156369000,
+      "unpriced": 45
+    },
+    "claude-fable-5-1": {
+      "calls": 1896,
+      "estimated_cost_nanos": 524098287500,
+      "unpriced": 16
+    }
+  }
+}

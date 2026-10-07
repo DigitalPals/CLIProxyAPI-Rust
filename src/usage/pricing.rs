@@ -175,15 +175,19 @@ impl Catalogue {
         };
         snapshot.rate = Some(rate.clone());
         if o.source == "codex" && o.source_event_id.starts_with("counter:") {
-            snapshot.basis = "cumulative_usage_not_per_request".into();
             snapshot.partial = true;
-            return snapshot;
+            if o.numeric_metadata.get("per_request_usage") != Some(&1) {
+                snapshot.basis = "cumulative_usage_not_per_request".into();
+                return snapshot;
+            }
         }
         if o.service_tier.is_none() || o.service_tier.as_deref() == Some("auto") {
             snapshot.assumptions.push("standard_api_tier_assumed".into());
         }
         if o.inference_geo.is_none() {
             snapshot.assumptions.push("global_standard_region_assumed".into());
+        } else if o.provider == "anthropic" && o.inference_geo.as_deref() == Some("not_available") {
+            snapshot.assumptions.push("inference_region_unavailable_global_rate_assumed".into());
         }
         if o.actual_model.is_none() {
             snapshot.assumptions.push("requested_model_rate_assumed".into());
@@ -191,6 +195,7 @@ impl Catalogue {
         snapshot.partial |= !snapshot.assumptions.is_empty();
         let regional = match o.inference_geo.as_deref() {
             None | Some("global") => false,
+            Some("not_available") if o.provider == "anthropic" => false,
             Some("us" | "us-only") => true,
             Some(_) => {
                 snapshot.basis = "unsupported_inference_region".into();
@@ -363,6 +368,24 @@ mod tier_tests {
         o.actual_model = None;
         o.requested_model = Some("claude-sonnet-5-5".into());
         assert_eq!(c.price(&o).basis, "unknown_model");
+    }
+    #[test]
+    fn unavailable_claude_region_is_an_explicit_global_estimate() {
+        let c = Catalogue::load(None).unwrap();
+        let mut o = event("anthropic", "claude-opus-5-5");
+        o.service_tier = Some("standard".into());
+        let global = c.price(&o).cost_nanos.unwrap();
+        o.inference_geo = Some("not_available".into());
+        let assumed = c.price(&o);
+        assert_eq!(assumed.cost_nanos, Some(global));
+        assert!(assumed.partial);
+        assert!(assumed.assumptions.contains(&"inference_region_unavailable_global_rate_assumed".into()));
+        o.service_tier = Some("fast".into());
+        assert_eq!(c.price(&o).cost_nanos, Some(global * 2));
+        o.service_tier = Some("batch+fast".into());
+        assert_eq!(c.price(&o).basis, "unsupported_service_tier");
+        o.inference_geo = Some("unknown_region".into());
+        assert_eq!(c.price(&o).basis, "unsupported_inference_region");
     }
     #[test]
     fn override_is_distinct_and_historical_boundary_is_exclusive() {

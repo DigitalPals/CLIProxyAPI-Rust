@@ -21,9 +21,9 @@ Provider-native fields do not always line up. Claude Code and Anthropic report u
 
 ## Cost estimates and subscription quotas
 
-Fusebox bundles rate catalogue `2026-10-07.2`, verified on 2026-10-07. Its published source links, supported model IDs, rate periods, and assumptions are shown in the Usage page. The catalogue contains selected OpenAI and Anthropic API model rates. Other providers and models remain unpriced unless a matching rate is configured. Rates are stored at nanodollar precision to avoid rounding each request to cents. A price is calculated only when Fusebox has an actual model identity and all token categories needed by that rate; a requested model by itself is not enough to price an observation.
+Fusebox bundles rate catalogue `2026-10-07.3`, verified on 2026-10-07. Its published source links, supported model IDs, rate periods, and assumptions are shown in the Usage page. The catalogue contains selected OpenAI and Anthropic API model rates. Other providers and models remain unpriced unless a matching rate is configured. Rates are stored at nanodollar precision to avoid rounding each request to cents. A price is calculated only when Fusebox has an actual model identity and all token categories needed by that rate; a requested model by itself is not enough to price an observation.
 
-The bundled rows do not declare historical effective dates, so each has no start date. Usage older than the catalogue is priced at today's published rates and labelled a **current-rate equivalent**: its pricing basis is `current_rate_equivalent` and its saved price snapshot carries `"backdated": true`. That figure is what the same usage would cost at today's list prices; it is not what you actually paid at the time. Backdating alone does not mark an estimate partial. A rate that declares `effective_from` keeps a strict start: events before it, unknown models, unsupported explicitly reported tiers, unavailable cache-write TTL detail, unsupported regions, and incomplete token categories can be unpriced. When a tier is omitted or reported as `auto`, Fusebox applies the standard rate as an explicit assumption and marks the estimate partial. An override can supply an organization-specific USD rate card; its content hash becomes part of the catalogue version, and it changes Fusebox's estimate, not a provider invoice. Unknown prices remain blank rather than `$0`.
+The bundled rows do not declare historical effective dates, so each has no start date. Usage older than the catalogue is priced at today's published rates and labelled a **current-rate equivalent**: its pricing basis is `current_rate_equivalent` and its saved price snapshot carries `"backdated": true`. That figure is what the same usage would cost at today's list prices; it is not what you actually paid at the time. Backdating alone does not mark an estimate partial. A rate that declares `effective_from` keeps a strict start: events before it, unknown models, unsupported explicitly reported tiers, unavailable cache-write TTL detail, unsupported regions, and incomplete token categories can be unpriced. Claude fast mode is read from `usage.speed`, and Codex native tiers from applied thread settings and their associated turn. Anthropic `inference_geo: "not_available"` uses an explicitly assumed global rate and a partial estimate; unknown region names remain unpriced. When a tier is omitted or reported as `auto`, Fusebox applies the standard rate as an explicit assumption and marks the estimate partial. An override can supply an organization-specific USD rate card; its content hash becomes part of the catalogue version, and it changes Fusebox's estimate, not a provider invoice. Unknown prices remain blank rather than `$0`.
 
 The catalogue has a limited set of explicit service-tier multipliers. For GPT-6 and GPT-5.6 models, Batch and Flex use one-half of standard, Fast and Priority use twice standard, and Astra Ultrafast uses six times standard. For the listed Anthropic models, Batch uses one-half of standard; Fast uses twice standard only for Opus 5.5, Opus 5, and Opus 4.8. Other model/tier combinations are unpriced rather than assigned a guessed discount. The catalogue applies the published 272,000-token request threshold only to the OpenAI models that have threshold rates. It applies a 10% US-region adjustment only to model families whose listed rates support that assumption; an unknown region does not imply US processing.
 
@@ -60,7 +60,7 @@ Native-history import is disabled until you explicitly enable a source root. Fus
 
 The source formats are version-sensitive. The importer recognizes Claude Code assistant rows carrying `message.usage`, and Codex `token_usage_record` events plus legacy cumulative `token_count` snapshots. Prompt history and generic token estimates are not usage records. Codex's durable response record is preferred over its overlapping cumulative snapshots. Copied Codex histories deduplicate by stable response identity when available; filename or ordinal alone is not treated as a reliable event identity. Claude Code message IDs are preferred, with the transcript row UUID as a fallback. The native Claude Code JSONL billing schema and universal request-ID guarantee are not published as a stable contract, so weaker identities can leave visible duplicates or conflicts. Imports never infer the account currently signed in to Fusebox as the account that produced old local history.
 
-The parser is versioned as `native-2026-10-07-v1`. Its format references are the [Codex configuration and state locations](https://developers.openai.com/codex/config-advanced#config-and-state-locations), the pinned [Codex rollout event definitions](https://github.com/openai/codex/blob/5a3140176e668a2f72f3c098490eb7f7052d9d85/codex-rs/history/src/rollout_payload.rs) and [token usage protocol types](https://github.com/openai/codex/blob/5a3140176e668a2f72f3c098490eb7f7052d9d85/codex-rs/protocol/src/protocol.rs#L2295-L2326), plus Anthropic's [Agent SDK session locations](https://platform.claude.com/docs/en/agent-sdk/sessions) and [settings for `CLAUDE_CONFIG_DIR`](https://code.claude.com/docs/en/settings). Codex history is an implementation format that can change between CLI releases. Claude's public documentation establishes history locations and API usage fields, but not a complete stable Claude Code billing transcript schema. Fusebox's parser version and these source references describe the formats checked for this release; they do not promise that every installed client version records identical fields.
+The parser is versioned as `native-2026-10-07-v2`. Its format references are the [Codex configuration and state locations](https://developers.openai.com/codex/config-advanced#config-and-state-locations), the pinned [Codex rollout event definitions](https://github.com/openai/codex/blob/5a3140176e668a2f72f3c098490eb7f7052d9d85/codex-rs/history/src/rollout_payload.rs) and [token usage protocol types](https://github.com/openai/codex/blob/5a3140176e668a2f72f3c098490eb7f7052d9d85/codex-rs/protocol/src/protocol.rs#L2295-L2326), plus Anthropic's [Agent SDK session locations](https://platform.claude.com/docs/en/agent-sdk/sessions) and [settings for `CLAUDE_CONFIG_DIR`](https://code.claude.com/docs/en/settings). Codex history is an implementation format that can change between CLI releases. Claude's public documentation establishes history locations and API usage fields, but not a complete stable Claude Code billing transcript schema. Fusebox's parser version and these source references describe the formats checked for this release; they do not promise that every installed client version records identical fields.
 
 Use the CLI to see candidate locations, enable only the roots you consent to import, then scan:
 
@@ -74,11 +74,11 @@ fusebox usage status --database ./usage.sqlite3
 fusebox usage reprice --database ./usage.sqlite3
 ```
 
-Use the actual Claude Code project root if you keep it in a different location. The CLI requires an absolute root path; repeat `enable` with the same source and root to re-enable it. `usage scan` can take `--source codex` or `--source claude_code`. `usage disable` stops future scans but keeps imported metadata. `usage backfill` clears scan checkpoints so enabled roots can be read again; stable events remain idempotent. `usage reprice` prices observations that earlier releases saved as unpriced only because they predated the catalogue (`outside_effective_period`), then prints `{"repriced": N}`; the server runs the same step at every startup, so the command is only needed to apply it without a restart. Rows that already have a price are never changed, and running it again is harmless. These commands open an existing usage database and do not start the proxy or create a new database.
+Use the actual Claude Code project root if you keep it in a different location. The CLI requires an absolute root path; repeat `enable` with the same source and root to re-enable it. `usage scan` can take `--source codex` or `--source claude_code`. `usage disable` stops future scans but keeps imported metadata. `usage backfill` clears scan checkpoints so enabled roots can be read again; stable events remain idempotent. `usage reprice` retries previously unpriced observations affected by corrected date or region semantics (`outside_effective_period` or `unsupported_inference_region`), then prints `{"repriced": N}`; the server runs the same step at every startup, so the command is only needed to apply it without a restart. Rows that already have a price are never changed, and running it again is harmless. These commands open an existing usage database and do not start the proxy or create a new database.
 
 Once a root is enabled, the running server scans it about every 30 seconds; `usage scan` requests a scan immediately. A source root stays opt-in, and the status command only reports candidate paths until one is enabled. Scanning is bounded to protect the machine: no symlink traversal or network filesystem roots, at most 4,096 files/directories, 32 MiB scanned per root per pass, 256 MiB per file, 512 KiB per line, and 2,000 usage observations per file per pass. A long history continues over later scans. A trailing incomplete line is retried from its start. Status reports imported, duplicate, skipped, unsupported, failed, or deferred rows. Unsupported rows are not silently translated into guessed charges.
 
-Codex legacy cumulative snapshots are converted to component-wise differences. Repeated snapshots do not add usage again. Counter resets, copied fork prefixes, estimates, and ambiguous records are treated as incomplete or deferred instead of manufacturing negative usage. The source parser/version is stored so changes to future import support do not rewrite existing history without a reimport.
+Codex legacy cumulative snapshots are converted to component-wise differences. When a validated `last_token_usage` is available, the first snapshot records only that response; later last-response counts must match cumulative growth to support per-request pricing. Those prices stay partial estimates. Counter jumps covering multiple responses remain unpriced. Repeated snapshots do not add usage again. Counter resets, copied fork prefixes, estimates, and ambiguous records are treated as incomplete or deferred instead of manufacturing negative usage. The source parser/version is stored so changes to future import support do not rewrite existing history without a reimport.
 
 ## Reconciliation and overlap
 
@@ -87,6 +87,47 @@ Each observation retains its source and origin. Repeated ingestion is idempotent
 The Usage page shows one combined total with one entry per provider response. An imported Claude Code or Codex entry is left out when a proxy entry has the same provider response ID, wherever that proxy entry falls in time, so the proxy evidence wins and a call is not counted twice. Imported entries without a response ID cannot be matched to the proxy; the page counts them and reports how many there are, because they may still duplicate proxy traffic. The per-source totals remain available in the API and may overlap; do not add them together. Imported histories may contain activity outside Fusebox, may be incomplete, and may reflect subscription usage rather than API billing.
 
 Retention purges old observations and source entries at startup and approximately hourly and leaves a watermark so an ordinary future scan does not resurrect manually purged history. `usage backfill` clears checkpoints for enabled roots and performs an explicit reimport, temporarily allowing those source records past the manual-purge watermark. It does not extend the configured age-retention period: older records can be purged again at startup or the next hourly sweep. Keep native source histories if you may want to import them later.
+
+## Import previous CPA usage keeper history
+
+The CLI can import the normalized `usage_events` table from CPA usage keeper v1.15.4 into an existing Fusebox database. Start with a read-only preview, using the same origin identity for every import of this database or one of its backups:
+
+```sh
+fusebox usage import-keeper --database /var/lib/fusebox/usage.sqlite3 \
+  --input-database /var/lib/cpa-usage-keeper/data/app.db --origin keeper:production
+```
+
+Add `--apply` to insert the eligible records. Take a consistent SQLite backup first. The importer reads the source through a read-only snapshot and commits small batches through Fusebox's existing pricing and deduplication path, allowing native recording to continue. It preserves event times, separates keeper's inclusive input into uncached input/cache reads/cache writes, keeps reasoning inside output, and prefers the returned service tier over the requested tier. Repeated imports are idempotent by origin and keeper row ID; reused client request IDs do not merge distinct historical events. Imports overlapping native proxy history are refused because keeper did not retain reliable response identities to reconcile that overlap.
+
+Imported observations have source `proxy`, the chosen `keeper:` origin, and a versioned keeper parser. Historical account references are namespaced hashes, without assigning them to today's accounts. Credentials, account email labels, IP addresses, user agents and raw messages are excluded. Unknown request/attempt grouping remains unknown. Failed all-zero usage remains unpriced. Keeper did not retain cache-write TTL, inference region or Claude fast-mode speed; those details are not inferred. Costs use the configured catalogue and retain partial/current-rate-equivalent labels, including unpriced cache writes whose TTL is unknown. Invalid, unsupported, non-generation and out-of-retention rows are reported separately. A failure after a committed batch can be retried safely with the same origin.
+
+### Estimate historical cache writes
+
+For an opted-in keeper history, the CLI can price calls whose only missing
+pricing detail is cache-write lifetime. Preview the affected records first:
+
+```sh
+fusebox usage estimate-keeper-cache --database /var/lib/fusebox/usage.sqlite3 \
+  --origin keeper:production
+```
+
+Add `--apply` after taking a consistent SQLite backup. This assumes that the
+known cache-write tokens use the five-minute rate, calculates the remaining
+charges from the recorded tokens and model/tier/context rates, and updates
+the existing raw/canonical/source pricing entries in atomic 100-record batches.
+It applies only to the named `keeper:` origin and verified keeper parser,
+previously unpriced Claude calls, and records with complete required token
+categories. Already-priced snapshots, native capture and missing-usage or
+unsupported-model records are unchanged. Repeating the command is harmless.
+
+The original payload, identity, token columns and unknown lifetime splits are
+preserved. Pricing snapshots use `historical_cache_write_estimate`, are marked
+partial, and include `historical_cache_write_lifetime_5_minutes_assumed`. The
+`historical_estimate` metadata records the method/version, original snapshot
+digest and basis, application time, and the corresponding five-minute/one-hour
+cost bounds. These bounds vary only cache lifetime while holding other pricing
+assumptions fixed. The dashboard's record detail displays the assumption.
+Native pricing and automatic repricing never apply this estimation policy.
 
 ## Standalone collector
 
@@ -146,3 +187,5 @@ The read API is under `/api/usage` and uses the existing dashboard management au
 See [`usage-ui-contract.md`](usage-ui-contract.md) for the response and dashboard contract, and [`usage-provenance.md`](usage-provenance.md) for the native-format field references, pricing source links, and parser confidence boundaries.
 
 Collector/client filters select named clients or `collector:<server-id>` identities. Source records include retained revisions and copies; selected accounting entries remain globally deduplicated. A filtered collector can have raw records whose preferred accounting evidence belongs to another collector or a local import. The page explains this exclusion and retains the matching detail records.
+
+The T3 Code comparison, calculation examples, implementation decisions, and production evidence are in [the usage research report](t3code-usage-research.md).

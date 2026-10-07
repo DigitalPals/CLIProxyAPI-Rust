@@ -148,6 +148,7 @@ fn legacy_reasoning_is_unknown_when_current_or_baseline_is_missing() {
         let mut state = Context::default();
         parse_record("codex", &meta("openai"), &mut state).unwrap();
         let mut row = legacy();
+        row["payload"]["info"].as_object_mut().unwrap().remove("last_token_usage");
         if explicit_null {
             row["payload"]["info"]["total_token_usage"]["reasoning_output_tokens"] = Value::Null;
         } else {
@@ -176,6 +177,7 @@ fn legacy_cache_write_null_is_rejected_but_absence_defaults_zero() {
     let mut state = Context::default();
     parse_record("codex", &meta("openai"), &mut state).unwrap();
     let mut row = legacy();
+    row["payload"]["info"].as_object_mut().unwrap().remove("last_token_usage");
     row["payload"]["info"]["total_token_usage"]["cache_write_input_tokens"] = Value::Null;
     let before = serde_json::to_value(&state).unwrap();
     assert!(parse_record("codex", &row, &mut state).is_err());
@@ -188,6 +190,107 @@ fn legacy_cache_write_null_is_rejected_but_absence_defaults_zero() {
     row["payload"]["info"]["total_token_usage"]["cache_write_input_tokens"] = Value::Null;
     assert!(parse_record("codex", &row, &mut state).is_err());
     assert_eq!(serde_json::to_value(&state).unwrap(), before);
+}
+
+#[test]
+fn legacy_resume_counts_only_last_response_and_prices_its_context() {
+    let mut state = Context::default();
+    parse_record("codex", &meta("openai"), &mut state).unwrap();
+    parse_record("codex", &context(), &mut state).unwrap();
+    let mut row = legacy();
+    row["payload"]["info"]["total_token_usage"] = json!({"input_tokens":500000,"cached_input_tokens":300000,"cache_write_input_tokens":50000,"output_tokens":100000,"reasoning_output_tokens":40000});
+    let o = parse_record("codex", &row, &mut state).unwrap().unwrap();
+    assert_eq!(o.tokens, codex_tokens(&usage()));
+    assert_eq!(o.numeric_metadata["per_request_usage"], 1);
+    let snapshot = super::super::pricing::Catalogue::load(None).unwrap().price(&o);
+    assert_eq!(snapshot.cost_nanos, Some(2_910_000));
+    assert!(snapshot.partial, "legacy evidence remains an estimate");
+    assert!(parse_record("codex", &row, &mut state).unwrap().is_none());
+    // A distinct response with identical counts has a larger cumulative total.
+    // It must survive even though last_token_usage repeats byte for byte.
+    row["payload"]["info"]["total_token_usage"] = json!({"input_tokens":501000,"cached_input_tokens":300600,"cache_write_input_tokens":50100,"output_tokens":100200,"reasoning_output_tokens":40080});
+    state = serde_json::from_value(serde_json::to_value(&state).unwrap()).unwrap();
+    let next = parse_record("codex", &row, &mut state).unwrap().unwrap();
+    assert_ne!(o.source_event_id, next.source_event_id);
+    assert_eq!(next.tokens, o.tokens);
+    assert_eq!(next.numeric_metadata["per_request_usage"], 1);
+}
+
+#[test]
+fn legacy_gaps_are_unpriced_and_bad_last_usage_cannot_move_baseline() {
+    let mut state = Context::default();
+    parse_record("codex", &meta("openai"), &mut state).unwrap();
+    parse_record("codex", &context(), &mut state).unwrap();
+    parse_record("codex", &legacy(), &mut state).unwrap();
+    let mut gap = legacy();
+    gap["payload"]["info"]["total_token_usage"] = json!({"input_tokens":3000,"cached_input_tokens":1800,"cache_write_input_tokens":300,"output_tokens":600,"reasoning_output_tokens":240});
+    let mut invalid = gap.clone();
+    invalid["payload"]["info"]["last_token_usage"]["cached_input_tokens"] = json!(-1);
+    let before = serde_json::to_value(&state).unwrap();
+    assert!(parse_record("codex", &invalid, &mut state).is_err());
+    assert_eq!(serde_json::to_value(&state).unwrap(), before);
+    let o = parse_record("codex", &gap, &mut state).unwrap().unwrap();
+    assert_eq!(o.tokens.total(), Some(2400));
+    assert!(!o.numeric_metadata.contains_key("per_request_usage"));
+    assert_eq!(
+        super::super::pricing::Catalogue::load(None).unwrap().price(&o).basis,
+        "cumulative_usage_not_per_request"
+    );
+}
+
+#[test]
+fn codex_speed_switches_survive_checkpoints_and_late_responses() {
+    let settings =
+        |tier: Value| json!({"type":"event_msg","payload":{"type":"thread_settings_applied","thread_settings":tier}});
+    let mut state = Context::default();
+    parse_record("codex", &meta("openai"), &mut state).unwrap();
+    parse_record("codex", &settings(json!({"service_tier":"priority"})), &mut state).unwrap();
+    parse_record("codex", &context(), &mut state).unwrap();
+    state = serde_json::from_value(serde_json::to_value(&state).unwrap()).unwrap();
+    assert_eq!(
+        parse_record("codex", &legacy(), &mut state).unwrap().unwrap().service_tier.as_deref(),
+        Some("priority")
+    );
+    parse_record("codex", &settings(json!({"service_tier":"ultrafast"})), &mut state).unwrap();
+    let mut second = context();
+    second["payload"]["turn_id"] = json!("turn-two");
+    parse_record("codex", &second, &mut state).unwrap();
+    let first = parse_record("codex", &modern(), &mut state).unwrap().unwrap();
+    assert_eq!(first.service_tier.as_deref(), Some("priority"));
+    let mut late = modern();
+    late["payload"]["turn_id"] = json!("turn-two");
+    assert_eq!(parse_record("codex", &late, &mut state).unwrap().unwrap().service_tier.as_deref(), Some("ultrafast"));
+    parse_record("codex", &settings(json!({"model":"gpt-6.1-sol"})), &mut state).unwrap();
+    late["payload"].as_object_mut().unwrap().remove("turn_id");
+    assert_eq!(parse_record("codex", &late, &mut state).unwrap().unwrap().service_tier.as_deref(), Some("standard"));
+}
+
+#[test]
+fn subagent_parent_copies_are_ambiguous_but_response_id_usage_is_kept() {
+    let mut m = meta("openai");
+    m["payload"]["source"] = json!({"subagent":{"thread_spawn":{"parent_thread_id":"parent"}}});
+    let mut state = Context::default();
+    parse_record("codex", &m, &mut state).unwrap();
+    let mut parent = meta("openai");
+    parent["payload"]["id"] = json!("parent");
+    parse_record("codex", &parent, &mut state).unwrap();
+    assert_eq!(state.thread.as_deref(), Some("synthetic-thread"));
+    assert!(parse_record("codex", &legacy(), &mut state).unwrap_err().to_string().starts_with("unsupported"));
+    assert!(parse_record("codex", &modern(), &mut state).unwrap().is_some());
+}
+
+#[test]
+fn claude_native_speed_and_thinking_follow_reported_usage() {
+    let mut row = claude("fast", 50);
+    row["message"]["model"] = json!("claude-opus-5-5");
+    row["message"]["usage"]["speed"] = json!("fast");
+    row["message"]["usage"]["output_tokens_details"] = json!({"thinking_tokens":40});
+    let o = parse_record("claude_code", &row, &mut Context::default()).unwrap().unwrap();
+    assert_eq!(o.service_tier.as_deref(), Some("fast"));
+    assert_eq!(o.tokens.reasoning, Some(40));
+    assert_eq!(o.tokens.total(), Some(1050));
+    row["message"]["usage"]["output_tokens_details"]["thinking_tokens"] = json!(51);
+    assert!(parse_record("claude_code", &row, &mut Context::default()).is_err());
 }
 
 #[test]

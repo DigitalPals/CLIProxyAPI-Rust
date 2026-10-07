@@ -473,8 +473,24 @@ pub fn usage_of(u: &Value) -> Usage {
         output: u["output_tokens"].as_u64().unwrap_or(0),
         cache_read: u["cache_read_input_tokens"].as_u64().unwrap_or(0),
         cache_write: u["cache_creation_input_tokens"].as_u64().unwrap_or(0),
-        reasoning: 0,
+        reasoning: u["output_tokens_details"]["thinking_tokens"]
+            .as_u64()
+            .or_else(|| u["output_tokens_details"]["reasoning_tokens"].as_u64())
+            .unwrap_or(0),
     }
+}
+
+fn usage_json(u: &Usage) -> Value {
+    let mut usage = json!({
+        "input_tokens": u.input,
+        "output_tokens": u.output,
+        "cache_read_input_tokens": u.cache_read,
+        "cache_creation_input_tokens": u.cache_write,
+    });
+    if u.reasoning > 0 {
+        usage["output_tokens_details"] = json!({"thinking_tokens": u.reasoning});
+    }
+    usage
 }
 
 fn status_of_error(kind: &str) -> u16 {
@@ -783,11 +799,7 @@ impl StreamRenderer for Renderer {
             json!({
                 "type": "message_delta",
                 "delta": { "stop_reason": stop_reason(f), "stop_sequence": null },
-                "usage": {
-                    "input_tokens": self.usage.input, "output_tokens": self.usage.output,
-                    "cache_read_input_tokens": self.usage.cache_read,
-                    "cache_creation_input_tokens": self.usage.cache_write
-                }
+                "usage": usage_json(&self.usage)
             })
             .to_string(),
         ));
@@ -820,11 +832,6 @@ pub fn render_full(agg: &Aggregate, model: &str) -> Value {
         "content": content,
         "stop_reason": stop_reason(agg.finish_reason()),
         "stop_sequence": null,
-        "usage": {
-            "input_tokens": agg.usage.input,
-            "output_tokens": agg.usage.output,
-            "cache_read_input_tokens": agg.usage.cache_read,
-            "cache_creation_input_tokens": agg.usage.cache_write
-        }
+        "usage": usage_json(&agg.usage)
     })
 }

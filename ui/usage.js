@@ -47,26 +47,36 @@ const UsageTools = (() => {
   const HUES = [30, 90, 150, 210, 270, 330];
   const chart = (trend, days, metric) => {
     const value = (r) => metric === 'calls' ? Number(r.observations || 0) : Number(r.estimated_cost_nanos || 0) / 1e9;
-    const totals = new Map();
-    for (const r of trend || []) totals.set(r.group ?? '', (totals.get(r.group ?? '') || 0) + value(r));
-    const ranked = [...totals.keys()].filter((k) => totals.get(k) > 0).sort((a, b) => totals.get(b) - totals.get(a) || a.localeCompare(b));
+    const totals = new Map(), volumes = new Map();
+    for (const r of trend || []) {
+      const k = r.group ?? '';
+      totals.set(k, (totals.get(k) || 0) + value(r));
+      volumes.set(k, (volumes.get(k) || 0) + Number(r.observations || 0));
+    }
+    const ranked = [...totals.keys()].filter((k) => totals.get(k) > 0 || volumes.get(k) > 0).sort((a, b) => totals.get(b) - totals.get(a) || volumes.get(b) - volumes.get(a) || a.localeCompare(b));
     const shown = ranked.length > 6 ? ranked.slice(0, 5) : ranked;
     const keys = shown.concat(ranked.length > shown.length ? [OTHER] : []);
     const colors = keys.map((k, i) => (k === OTHER ? '#57534b' : `oklch(0.74 0.09 ${HUES[i]})`));
     const index = new Map(days.map((d, i) => [d, i]));
-    const series = days.map((date) => ({ date, parts: keys.map(() => 0), total: 0, calls: 0, cost: 0, priced: false, unpriced: 0 }));
+    const series = days.map((date) => ({ date, parts: keys.map(() => 0), groups: keys.map(() => ({ calls: 0, cost: 0, priced: false, unpriced: 0 })), total: 0, calls: 0, cost: 0, priced: false, unpriced: 0 }));
     for (const r of trend || []) {
       const day = series[index.get(r.date)];
       if (!day) continue;
       const v = value(r), k = keys.indexOf(shown.includes(r.group ?? '') ? r.group ?? '' : OTHER);
-      if (k >= 0) day.parts[k] += v;
+      if (k >= 0) {
+        day.parts[k] += v;
+        const group = day.groups[k];
+        group.calls += Number(r.observations || 0);
+        group.unpriced += Number(r.unpriced || 0);
+        if (r.estimated_cost_nanos != null) { group.cost += Number(r.estimated_cost_nanos); group.priced = true; }
+      }
       day.total += v;
       day.calls += Number(r.observations || 0);
       if (r.estimated_cost_nanos != null) { day.cost += Number(r.estimated_cost_nanos); day.priced = true; }
       day.unpriced += Number(r.unpriced || 0);
     }
     let peak = series.length - 1;
-    series.forEach((d, i) => { if (d.total > series[peak].total) peak = i; });
+    series.forEach((d, i) => { if (d.total > series[peak].total || d.total === series[peak].total && d.calls > series[peak].calls) peak = i; });
     return { keys, colors, series, peak, max: Math.max(0, ...series.map((d) => d.total)), OTHER };
   };
   // Local calendar date of an instant in the page's timezone.
@@ -86,8 +96,8 @@ const Usage = {
   stack: 'provider', metric: 'cost', hoverDay: null, dim: 'model', showAll: false,
   offset: 0, limit: 50, openRecord: null, drawerOpen: false, customError: '',
   summary: null, observations: null, status: null,
-  loading: false, loaded: false, error: '', actionError: '', busy: false,
-  sequence: 0, credential: null, confirm: null, roots: {}, collectorDraft: '', rows: [],
+  loading: false, recordsLoading: false, loaded: false, error: '', actionError: '', busy: false,
+  sequence: 0, recordSequence: 0, credential: null, confirm: null, roots: {}, collectorDraft: '', rows: [],
 };
 const ux = UsageTools.escape;
 const usageCount = (value) => value == null ? 'Unknown' : new Intl.NumberFormat('en-US').format(value);
@@ -113,6 +123,8 @@ const usageClientLabel = (id) => (Usage.summary?.facets?.clients || []).find((c)
 const usageStack = (k) => k === UsageTools.OTHER ? 'Other' : Usage.stack === 'model' ? k || 'Unknown model' : usageProvName(k);
 const usageDollarsShort = (v) => v >= 10 ? `$${Math.round(v).toLocaleString('en-US')}` : v > 0 ? `$${v.toFixed(2)}` : '$0';
 const usageToday = () => UsageTools.date(new Date());
+const usageRangeLabel = () => Usage.preset === '1' ? 'Today' : Usage.preset === '7' ? 'Last 7 days' : Usage.preset === '30' ? 'Last 30 days' : `${UsageTools.shortDate(Usage.range.start)} – ${UsageTools.shortDate(Usage.range.through)}`;
+const usageDayCost = (day) => day.priced ? UsageTools.dollars(day.cost) : day.calls ? 'Unpriced' : '$0.00';
 
 function usageHTML() {
   const u = Usage;
@@ -187,7 +199,7 @@ function usageStaleLine() {
 function usageCostHTML() {
   const u = Usage, s = u.summary, t = usageCombined().totals || {}, tokens = t.tokens || {}, phone = usagePhone();
   const days = UsageTools.dates(u.range);
-  const word = u.preset === '1' ? 'TODAY' : u.preset === '7' ? 'LAST 7 DAYS' : u.preset === '30' ? 'LAST 30 DAYS' : `${UsageTools.shortDate(u.range.start)} – ${UsageTools.shortDate(u.range.through)}`.toUpperCase();
+  const word = usageRangeLabel().toUpperCase();
   const cost = t.estimated_cost_nanos;
   const sub = u.preset === '1' ? 'So far today · priced calls only' : `Avg ${ux(UsageTools.dollars(cost == null ? null : Number(cost) / Math.max(1, days.length)))} a day · priced calls only`;
   const missingWrite = Number(t.missing_token_counts?.cache_write || 0);
@@ -195,7 +207,7 @@ function usageCostHTML() {
     [tokens.cache_write == null ? 'Unknown' : UsageTools.compact(tokens.cache_write), tokens.cache_write != null && missingWrite > 0 ? 'Cache write, partial' : 'Cache write']];
   const stale = usageStaleLine();
   return `<section class="card u-cost" aria-labelledby="usage-cost-label">
-    <div class="u-cost-top"><div class="u-total"><span class="label" id="usage-cost-label">ESTIMATED COST · ${ux(word)}</span><span class="u-total-v">${t.aggregation_overflow && cost == null ? 'Out of range' : ux(UsageTools.dollars(cost ?? 0))}</span><span class="u-total-sub">${sub}</span></div>
+    <div class="u-cost-top"><div class="u-total"><span class="label" id="usage-cost-label">ESTIMATED COST · ${ux(word)}</span><span class="u-total-v">${t.aggregation_overflow && cost == null ? 'Out of range' : ux(UsageTools.dollars(cost ?? (t.observations ? null : 0)))}</span><span class="u-total-sub">${sub}</span></div>
     <dl class="u-stats">${stats.map(([v, l]) => `<div><dd>${ux(v)}</dd><dt>${ux(l)}</dt></div>`).join('')}</dl></div>
     ${days.length > 1 ? `<div id="usage-chart" class="u-chart">${usageChartHTML()}</div>` : ''}
     <div class="u-foot"><span class="fg2">${ux(usageCoverageLine(t))}</span>${stale ? `<span class="warn">${stale}</span>` : ''}${phone ? '' : `<span class="grow"></span><span>Unknown usage and missing prices are left out, never counted as zero · catalogue ${ux(s.pricing?.version || u.status?.pricing?.version || 'unknown')}</span>`}</div>
@@ -210,16 +222,17 @@ function usageChartHTML() {
   const legend = c.keys.map((k, i) => `<span><i style="background:${c.colors[i]}"></i>${ux(usageStack(k))}</span>`).join('');
   const bars = c.series.map((d, i) => {
     const h = c.max > 0 ? Math.max(d.total > 0 ? 1.5 : 0, d.total / c.max * (showVals ? 84 : 100)) : 0;
-    const value = calls ? UsageTools.compact(d.total) : usageDollarsShort(d.total);
+    const value = calls ? UsageTools.compact(d.total) : d.priced || !d.calls ? usageDollarsShort(d.total) : 'Unpriced';
     const segs = d.parts.map((v, k) => (v > 0 ? `<i style="flex:${Math.max(1, Math.round(v / d.total * 1000))} 1 0px;background:${c.colors[k]}"></i>` : '')).join('');
-    return `<button type="button" class="u-bar${hover >= 0 && hover !== i ? ' dim' : ''}${hover === i ? ' on' : ''}" data-usage-day="${d.date}" aria-label="${ux(UsageTools.dayLabel(d.date))}: ${ux(calls ? `${usageCount(d.calls)} calls` : UsageTools.dollars(d.cost))}">${showVals ? `<span class="u-bar-v">${ux(value)}</span>` : ''}<span class="u-bar-s" style="height:${h.toFixed(2)}%">${segs}</span></button>`;
+    const description = calls ? `${usageCount(d.calls)} calls` : `${usageDayCost(d)} · ${usageCount(d.calls - d.unpriced)} priced calls${d.unpriced ? ` · ${usageCount(d.unpriced)} unpriced` : ''}`;
+    return `<button type="button" class="u-bar${hover >= 0 && hover !== i ? ' dim' : ''}${hover === i ? ' on' : ''}" data-usage-day="${d.date}" aria-label="${ux(UsageTools.dayLabel(d.date))}: ${ux(description)}">${showVals ? `<span class="u-bar-v">${ux(value)}</span>` : ''}<span class="u-bar-s" style="height:${h.toFixed(2)}%">${segs}</span></button>`;
   }).join('');
   const labels = c.series.map((d) => {
     const p = UsageTools.parts(d.date);
     const text = days.length <= 10 ? (phone ? p.w.slice(0, 2) : `${p.w} ${p.d}`) : p.monday ? `${p.m} ${p.d}` : '';
     return `<span${d.date === today ? ' class="today"' : ''}>${ux(text)}</span>`;
   }).join('');
-  return `<div class="u-chart-head"><span class="label">BY DAY</span><span class="grow"></span>${seg('stack', [['provider', 'Provider'], ['model', 'Model']], 'stack', 'Stack bars by')}${seg('metric', [['cost', 'Cost'], ['calls', 'Calls']], 'metric', 'Bar value')}</div>
+  return `<div class="u-chart-head"><span class="label">BY DAY</span>${calls ? '' : '<span class="meta u-chart-scope">Priced calls only</span>'}<span class="grow"></span>${seg('stack', [['provider', 'Provider'], ['model', 'Model']], 'stack', 'Stack bars by')}${seg('metric', [['cost', 'Cost'], ['calls', 'Calls']], 'metric', 'Bar value')}</div>
     ${legend ? `<div class="u-legend">${legend}</div>` : ''}
     <div class="u-bars${days.length > 20 ? ' dense' : ''}" data-usage-bars>${bars}</div>
     <div class="u-days${days.length > 20 ? ' dense' : ''}" aria-hidden="true">${labels}</div>
@@ -227,11 +240,11 @@ function usageChartHTML() {
 }
 function usageReadoutHTML(c, hover) {
   if (!c.series.length) return '';
-  const i = hover >= 0 ? hover : c.peak, d = c.series[i], phone = usagePhone(), calls = Usage.metric === 'calls';
-  const title = `${hover >= 0 ? '' : 'Peak · '}${UsageTools.dayLabel(d.date)}${d.date === usageToday() ? ', so far' : ''}`;
-  const parts = d.parts.map((v, k) => (v > 0 ? `<span class="u-rp"><i style="background:${c.colors[k]}"></i>${phone ? '' : ux(usageStack(c.keys[k]))}<span class="mono">${ux(calls ? usageCount(v) : UsageTools.dollars(Math.round(v * 1e9)))}</span></span>` : '')).join('');
+  const i = hover >= 0 ? hover : c.peak, d = c.series[i], calls = Usage.metric === 'calls';
+  const title = `${hover >= 0 ? 'Day' : !calls && !c.max && d.calls ? 'Busiest day' : 'Peak day'} · ${UsageTools.dayLabel(d.date)}${d.date === usageToday() ? ', so far' : ''}`;
+  const parts = d.groups.map((g, k) => (g.calls || g.priced ? `<span class="u-rp"><i style="background:${c.colors[k]}"></i><span class="u-rp-name">${ux(usageStack(c.keys[k]))}</span> <span class="mono">${ux(calls ? `${usageCount(g.calls)} calls` : usageDayCost(g))}</span>${g.unpriced ? `<span class="dim">(${calls ? '' : `${usageCount(g.calls - g.unpriced)} priced · `}${usageCount(g.unpriced)} unpriced)</span>` : ''}</span>` : '')).join('');
   const before = UsageTools.beforeProxy(d.date, usageCombined().proxy_first_event_at_ms, Usage.timezone);
-  return `<span class="${hover >= 0 ? '' : 'dim'}">${ux(title)}</span><span class="mono">${ux(d.priced ? UsageTools.dollars(d.cost) : d.calls ? 'Unpriced' : '$0.00')}</span><span class="fg2">${usageCount(d.calls)} call${d.calls === 1 ? '' : 's'}</span>${parts}${d.unpriced && !phone ? `<span class="dim">${usageCount(d.unpriced)} unpriced</span>` : ''}${before ? '<span class="dim">Before the proxy was set up · history only</span>' : ''}`;
+  return `<span class="${hover >= 0 ? '' : 'dim'}">${ux(title)}</span><span class="mono">${ux(usageDayCost(d))}</span><span class="fg2">${usageCount(d.calls)} call${d.calls === 1 ? '' : 's'}</span>${parts}${before ? '<span class="dim">Before the proxy was set up · history only</span>' : ''}`;
 }
 
 const USAGE_DIMS = [['model', 'Model'], ['account', 'Account'], ['provider', 'Provider'], ['client', 'Client / origin']];
@@ -249,15 +262,16 @@ function usageBreakdownRow(dim, r) {
 function usageCoverage(r) {
   const n = Number(r.observations || 0);
   if (n && Number(r.unpriced || 0) >= n) return ['Unpriced', 'fg2'];
+  if (r.unpriced) return [`${usageCount(r.unpriced)} unpriced`, 'warn'];
   if (r.partial) return [`${usageCount(r.partial)} partial`, 'warn'];
   if (r.missing_usage) return [`${usageCount(r.missing_usage)} no usage`, 'warn'];
-  if (r.unpriced) return [`${usageCount(r.unpriced)} unpriced`, 'fg2'];
   return ['Full', 'dim'];
 }
 function usageBreakdownHTML() {
   const u = Usage, b = usageCombined().breakdowns || {}, phone = usagePhone();
   const rows = b[u.dim] || [], total = Number(usageCombined().totals?.estimated_cost_nanos || 0);
-  const shown = u.showAll ? rows : rows.slice(0, 8);
+  const rowLimit = u.dim === 'model' ? 20 : 8;
+  const shown = u.showAll ? rows : rows.slice(0, rowLimit);
   u.rows = shown.map((r) => r.id);
   const tabs = `<div class="u-tabs" role="tablist" aria-label="Breakdown">${USAGE_DIMS.map(([k, l]) => `<button type="button" role="tab" data-usage-act="dim" data-value="${k}" aria-selected="${u.dim === k}">${l} <span class="mono dim">${(b[k] || []).length}</span></button>`).join('')}</div>`;
   const body = shown.map((r, i) => {
@@ -265,19 +279,20 @@ function usageBreakdownHTML() {
     const share = total > 0 && r.estimated_cost_nanos != null ? Number(r.estimated_cost_nanos) / total : 0;
     const pct = total > 0 && r.estimated_cost_nanos ? (share * 100 < 1 ? '<1%' : `${Math.round(share * 100)}%`) : '—';
     const [cov, covCls] = usageCoverage(r);
+    const coverageTitle = ux(usageCoverageLine(r));
     const name = x.sensitive ? usageSensitive(x.name) : ux(x.name);
     const icon = x.square ? '<span class="u-sq" aria-hidden="true"><i></i></span>' : x.logo || '<span class="u-sq" aria-hidden="true"><i></i></span>';
-    const cost = r.estimated_cost_nanos != null ? UsageTools.dollars(r.estimated_cost_nanos) : '—';
+    const cost = r.estimated_cost_nanos != null ? UsageTools.dollars(r.estimated_cost_nanos) : 'Unpriced';
     const attrs = r.id != null ? `data-usage-act="filter-row" data-index="${i}" aria-pressed="${selected}"` : 'disabled';
     const bar = `<span class="u-share-bar"><i style="width:${(share * 100).toFixed(1)}%"></i></span>`;
-    if (phone) return `<button type="button" class="u-bd-item${selected ? ' on' : ''}" ${attrs}><span class="u-bd-l1">${icon}<span class="u-bd-name${x.mono ? ' mono' : ''}">${name}</span><span class="u-bd-cost${cost === '—' ? ' dim' : ''}">${ux(cost)}</span></span><span class="u-bd-l2">${bar}<span class="dim">${ux(pct)} · ${usageCount(r.observations)} calls</span>${cov !== 'Full' ? `<span class="${covCls}">${ux(cov)}</span>` : ''}</span></button>`;
-    return `<button type="button" class="u-bd-row${selected ? ' on' : ''}" ${attrs}><span class="u-bd-who">${icon}<span class="cell2"><span class="${x.mono ? 'mono' : ''}">${name}</span>${x.sub ? `<span class="dim">${ux(x.sub)}</span>` : ''}</span></span><span class="u-share">${bar}<span class="fg2">${ux(pct)}</span></span><span class="r">${usageCount(r.observations)}</span><span class="r mono fg2 u-wide">${ux(UsageTools.compact(r.tokens?.input))}</span><span class="r mono fg2 u-wide">${ux(UsageTools.compact(r.tokens?.output))}</span><span class="r u-bd-cost${cost === '—' ? ' dim' : ''}">${ux(cost)}</span><span class="r ${covCls}">${ux(cov)}</span></button>`;
+    if (phone) return `<button type="button" class="u-bd-item${selected ? ' on' : ''}" ${attrs}><span class="u-bd-l1">${icon}<span class="u-bd-name${x.mono ? ' mono' : ''}">${name}</span><span class="u-bd-cost${cost === 'Unpriced' ? ' dim' : ''}">${ux(cost)}</span></span><span class="u-bd-l2">${bar}<span class="dim">${ux(pct)} · ${usageCount(r.observations)} calls</span>${cov !== 'Full' ? `<span class="${covCls}" title="${coverageTitle}">${ux(cov)}</span>` : ''}</span></button>`;
+    return `<button type="button" class="u-bd-row${selected ? ' on' : ''}" ${attrs}><span class="u-bd-who">${icon}<span class="cell2"><span class="${x.mono ? 'mono' : ''}">${name}</span>${x.sub ? `<span class="dim">${ux(x.sub)}</span>` : ''}</span></span><span class="u-share">${bar}<span class="fg2">${ux(pct)}</span></span><span class="r">${usageCount(r.observations)}</span><span class="r mono fg2 u-wide">${ux(UsageTools.compact(r.tokens?.input))}</span><span class="r mono fg2 u-wide">${ux(UsageTools.compact(r.tokens?.output))}</span><span class="r u-bd-cost${cost === 'Unpriced' ? ' dim' : ''}">${ux(cost)}</span><span class="r ${covCls}" title="${coverageTitle}">${ux(cov)}</span></button>`;
   }).join('');
-  const more = rows.length > 8 ? `<button type="button" class="u-more" data-usage-act="show-all">${u.showAll ? 'Show top 8' : `Show all ${rows.length}`}</button>` : '';
+  const more = rows.length > rowLimit ? `<button type="button" class="u-more" data-usage-act="show-all">${u.showAll ? `Show top ${rowLimit}` : `Show all ${rows.length}`}</button>` : '';
   const empty = rows.length ? '' : '<p class="u-empty">No records match these filters.</p>';
-  if (phone) return `<section class="sec u-breakdown"><h2 class="h-sec">Breakdown</h2>${tabs}<div class="card u-bd-list">${body}${empty}${more}</div></section>`;
+  if (phone) return `<section class="sec u-breakdown"><h2 class="h-sec">Breakdown · ${ux(usageRangeLabel())}</h2>${tabs}<div class="card u-bd-list">${body}${empty}${more}</div></section>`;
   const dimLabel = USAGE_DIMS.find(([k]) => k === u.dim)[1].toUpperCase();
-  return `<section class="card u-breakdown"><div class="u-bd-head"><span class="label">BREAKDOWN</span>${tabs}<span class="grow"></span><span class="meta">Click a row to filter the page</span></div>
+  return `<section class="card u-breakdown"><div class="u-bd-head"><span class="label">BREAKDOWN · ${ux(usageRangeLabel().toUpperCase())}</span>${tabs}<span class="grow"></span><span class="meta">Priced calls only · Click a row to filter the page</span></div>
     <div class="u-bd-th" aria-hidden="true"><span>${ux(dimLabel)}</span><span>SHARE OF COST</span><span class="r">CALLS</span><span class="r u-wide">IN</span><span class="r u-wide">OUT</span><span class="r">EST. COST</span><span class="r">COVERAGE</span></div>
     ${body}${empty}${more}</section>`;
 }
@@ -356,9 +371,9 @@ function usageObservationsHTML() {
     if (phone) return `<div class="u-rec${open ? ' open' : ''}${r.superseded ? ' faded' : ''}"><button type="button" class="u-rec-card" data-usage-act="record" data-index="${i}" aria-expanded="${open}"><span class="u-rec-l1"><span class="mono fg2">${ux(when.join(' '))}</span><span class="grow"></span>${tagHTML}<span class="mono${cost === '—' ? ' dim' : ''}">${ux(cost)}</span></span><span class="u-rec-l2">${model}</span><span class="u-rec-l3">${acct} · ${client} · ${ux(tok(t.input))} in · ${ux(tok(t.output))} out</span></button>${open ? usageRecordDetailHTML(r, i) : ''}</div>`;
     return `<div class="u-rec${open ? ' open' : ''}${r.superseded ? ' faded' : ''}"><button type="button" class="u-rec-row" data-usage-act="record" data-index="${i}" aria-expanded="${open}"><span class="mono u-when"><span class="dim">${ux(when[0])}</span><span class="fg2">${ux(when[1])}</span></span><span class="u-model">${model}</span><span class="cell2"><span>${acct}</span><span class="dim">${client}</span></span><span class="r mono fg2">${ux(tok(t.input))}</span><span class="r mono fg2">${ux(tok(t.output))}</span><span class="r mono fg2 u-xwide">${ux(tok(t.cache_read))}</span><span class="r mono${cost === '—' ? ' dim' : ''}">${ux(cost)}</span><span class="r">${tagHTML}</span></button>${open ? usageRecordDetailHTML(r, i) : ''}</div>`;
   }).join('');
-  const exportBtns = `${usageButton('export-csv', 'CSV', 'aria-label="Export this page as CSV"', !items.length || u.loading, 'btn sm')}${usageButton('export-json', 'JSON', 'aria-label="Export this page as JSON"', !items.length || u.loading, 'btn sm')}`;
-  const empty = items.length ? '' : `<p class="u-empty">${Object.values(u.filters).some(Boolean) ? 'No records match these filters.' : 'No records match.'}</p>`;
-  const pager = `${usageButton('previous', 'Previous', '', u.offset === 0 || u.loading)}${usageButton('next', 'Next', '', end >= count || u.loading)}`;
+  const exportBtns = `${usageButton('export-csv', 'CSV', 'aria-label="Export this page as CSV"', !items.length || u.recordsLoading, 'btn sm')}${usageButton('export-json', 'JSON', 'aria-label="Export this page as JSON"', !items.length || u.recordsLoading, 'btn sm')}`;
+  const empty = items.length ? '' : `<p class="u-empty">${u.recordsLoading ? 'Loading records…' : Object.values(u.filters).some(Boolean) ? 'No records match these filters.' : 'No records match.'}</p>`;
+  const pager = `${usageButton('previous', 'Previous', '', u.offset === 0 || u.recordsLoading)}${usageButton('next', 'Next', '', end >= count || u.recordsLoading)}`;
   if (phone) return `<section class="sec u-records" aria-labelledby="usage-records-title"><div class="sec-head"><h2 class="h-sec" id="usage-records-title">Records</h2><span class="grow"></span>${exportBtns}</div><span class="meta u-rec-count">${label} · exports contain this page only</span><div class="card u-rec-list">${rows}${empty}</div><div class="u-pager">${pager}</div></section>`;
   return `<section class="sec u-records" aria-labelledby="usage-records-title"><div class="sec-head"><h2 class="h-sec" id="usage-records-title">Records</h2><span class="meta">One row per upstream response, newest first. Metadata only, no prompt or completion text.</span><span class="grow"></span><span class="meta u-export-label">Export this page</span>${exportBtns}</div>
     <div class="card u-rec-table"><div class="u-rec-th" aria-hidden="true"><span>TIME</span><span>MODEL</span><span>ACCOUNT · CLIENT / ORIGIN</span><span class="r">IN</span><span class="r">OUT</span><span class="r u-xwide">CACHE READ</span><span class="r">EST. COST</span><span class="r">COVERAGE</span></div>${rows}${empty}</div>
@@ -446,34 +461,60 @@ function usageRenderChart() {
   if (focus) el.querySelector(focus)?.focus({ preventScroll: true });
 }
 const usageQuery = () => UsageTools.query(Usage.range, Usage.filters, Usage.timezone);
+function usageSelectStack(summary) {
+  const combined = summary?.combined;
+  if (combined?.trends?.[Usage.stack]) {
+    combined.stack = Usage.stack; combined.trend = combined.trends[Usage.stack];
+  }
+  return summary;
+}
+async function usageRead(field, path, sequence, recordSequence) {
+  const current = () => sequence === Usage.sequence && (field !== 'observations' || recordSequence === Usage.recordSequence);
+  try {
+    const value = await api(path);
+    if (current()) Usage[field] = field === 'summary' ? usageSelectStack(value) : value;
+  } catch (e) {
+    if (current()) {
+      if (field !== 'status') Usage[field] = null;
+      Usage.error = e.message === 'locked' ? 'Management authentication required.' : e.message;
+    }
+  } finally {
+    if (current()) {
+      if (field === 'observations') Usage.recordsLoading = false;
+      usageRender();
+    }
+  }
+}
 async function usageLoad() {
-  const u = Usage, sequence = ++u.sequence;
-  u.loading = true; u.error = ''; u.loaded = true;
+  const u = Usage, sequence = ++u.sequence, recordSequence = ++u.recordSequence;
+  u.loading = true; u.recordsLoading = true; u.error = ''; u.loaded = true;
   usageRender();
   try {
     const query = usageQuery();
-    const results = await Promise.allSettled([api(`/usage/summary?${query}&stack=${u.stack}`), api(`/usage/observations?${query}&view=combined&limit=${u.limit}&offset=${u.offset}`), api('/usage/status')]);
-    if (sequence !== u.sequence) return;
-    if (results[0].status === 'fulfilled') u.summary = results[0].value;
-    else u.summary = null;
-    if (results[1].status === 'fulfilled') u.observations = results[1].value;
-    else u.observations = null;
-    if (results[2].status === 'fulfilled') u.status = results[2].value;
-    const failure = results.find((r) => r.status === 'rejected');
-    if (failure) throw failure.reason;
+    // Each section renders as soon as its own read completes.
+    await Promise.allSettled([
+      usageRead('summary', `/usage/dashboard?${query}&stack=${u.stack}`, sequence),
+      usageRead('observations', `/usage/observations?${query}&view=combined&limit=${u.limit}&offset=${u.offset}`, sequence, recordSequence),
+      usageRead('status', '/usage/status', sequence),
+    ]);
   } catch (e) { if (sequence === u.sequence) u.error = e.message === 'locked' ? 'Management authentication required.' : e.message; }
-  finally { if (sequence === u.sequence) { u.loading = false; usageRender(); } }
+  finally { if (sequence === u.sequence) { u.loading = false; if (recordSequence === u.recordSequence) u.recordsLoading = false; usageRender(); } }
 }
-// A new stacking only needs the summary's trend regrouped by the server.
-async function usageLoadStack() {
-  const u = Usage, sequence = ++u.sequence;
+// Both chart groupings arrive in the same snapshot; toggling needs no round trip.
+function usageLoadStack() {
+  usageSelectStack(Usage.summary); usageRenderChart();
+}
+async function usageLoadRecords() {
+  const u = Usage, sequence = u.sequence, recordSequence = ++u.recordSequence;
+  u.recordsLoading = true; u.error = ''; u.observations = null; usageRender();
   try {
-    const summary = await api(`/usage/summary?${usageQuery()}&stack=${u.stack}`);
-    if (sequence === u.sequence) { u.summary = summary; usageRenderChart(); }
-  } catch (e) { if (sequence === u.sequence) { u.error = e.message; usageRender(); } }
+    await usageRead('observations', `/usage/observations?${usageQuery()}&view=combined&limit=${u.limit}&offset=${u.offset}`, sequence, recordSequence);
+  } catch (e) {
+    if (sequence === u.sequence && recordSequence === u.recordSequence) { u.recordsLoading = false; u.error = e.message; usageRender(); }
+  }
 }
 // Range, filter and breakdown changes start the records from the first page.
-function usageReload() { Usage.offset = 0; Usage.openRecord = null; Usage.hoverDay = null; return usageLoad(); }
+function usageReload() { Usage.offset = 0; Usage.openRecord = null; Usage.hoverDay = null; Usage.summary = null; Usage.observations = null; return usageLoad(); }
 async function usageMutate(path, body, after) {
   Usage.busy = true; Usage.actionError = ''; usageRender();
   try {
@@ -603,7 +644,7 @@ if (typeof document !== 'undefined') {
       if (model) { Usage.filters.model = model; Usage.dim = 'account'; Usage.showAll = false; usageReload(); }
       return;
     }
-    if (act === 'previous' || act === 'next') { Usage.offset = Math.max(0, Usage.offset + (act === 'next' ? Usage.limit : -Usage.limit)); Usage.openRecord = null; return usageLoad(); }
+    if (act === 'previous' || act === 'next') { Usage.offset = Math.max(0, Usage.offset + (act === 'next' ? Usage.limit : -Usage.limit)); Usage.openRecord = null; return usageLoadRecords(); }
     if (act.startsWith('export-')) return usageExport(act.slice(7));
     if (act === 'open-collection') return usageOpenDrawer();
     if (act === 'close-collection') return usageCloseDrawer();
@@ -638,7 +679,7 @@ if (typeof document !== 'undefined') {
 
 // Refresh persistent analytics while the page is open; never interrupts a source action.
 if (typeof document !== 'undefined') setInterval(() => {
-  if (S.route !== 'usage' || S.locked || Usage.loading || Usage.busy || document.hidden) return;
+  if (S.route !== 'usage' || S.locked || Usage.loading || Usage.recordsLoading || Usage.busy || document.hidden) return;
   if (Usage.preset !== 'custom') Usage.range = UsageTools.range(Number(Usage.preset));
   usageLoad();
 }, 60000);

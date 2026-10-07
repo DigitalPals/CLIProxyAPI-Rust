@@ -160,12 +160,34 @@ impl Observation {
                         | "audio_output_tokens"
                         | "image_tokens"
                         | "tool_tokens"
+                        | "per_request_usage"
                 ) || *v > MAX_TOKENS
             })
         {
             return Err("unsupported numeric metadata".into());
         }
+        if let Some(n) = self.numeric_metadata.get("per_request_usage")
+            && (*n != 1
+                || self.source != "codex"
+                || !self.source_event_id.starts_with("counter:")
+                || self.numeric_metadata.get("input_total").copied() != self.tokens.input_total())
+        {
+            return Err("invalid per-request usage evidence".into());
+        }
         self.tokens.validate()
+    }
+}
+
+/// Claude fast mode is reported separately from its ordinary service tier.
+/// Preserve incompatible combinations as unpriceable rather than dropping a tier.
+pub fn anthropic_service_tier(tier: Option<String>, speed: Option<&str>) -> Option<String> {
+    match speed {
+        None | Some("standard") => tier,
+        Some("fast") => Some(match tier.as_deref() {
+            None | Some("default" | "standard" | "auto" | "fast") => "fast".into(),
+            Some(other) => format!("{other}+fast"),
+        }),
+        Some(_) => Some("unsupported_speed".into()),
     }
 }
 pub fn valid_label(s: &str) -> Result<(), String> {
