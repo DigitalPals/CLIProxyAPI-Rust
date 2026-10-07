@@ -59,6 +59,9 @@ pub struct Snapshot {
     pub tier_multiplier: [i64; 2],
     #[serde(default)]
     pub local_override: bool,
+    /// Priced through a rate without a start date for an event older than the catalogue.
+    #[serde(default)]
+    pub backdated: bool,
 }
 fn usd() -> String {
     "USD".into()
@@ -84,7 +87,7 @@ impl Catalogue {
         }
         chrono::NaiveDate::parse_from_str(&catalogue.verified_at, "%Y-%m-%d")?;
         for rate in &catalogue.rates {
-            let start = date_ms(rate.effective_from.as_deref().unwrap_or(&catalogue.verified_at))?;
+            let start = rate.start()?;
             if rate.effective_until.as_deref().map(date_ms).transpose()?.is_some_and(|end| end <= start) {
                 bail!("invalid pricing effective period");
             }
@@ -127,10 +130,8 @@ impl Catalogue {
             for b in &catalogue.rates[i + 1..] {
                 if a.provider == b.provider
                     && a.models.iter().any(|m| b.models.contains(m))
-                    && date_ms(a.effective_from.as_deref().unwrap_or(&catalogue.verified_at))?
-                        < b.effective_until.as_deref().map(date_ms).transpose()?.unwrap_or(i64::MAX)
-                    && date_ms(b.effective_from.as_deref().unwrap_or(&catalogue.verified_at))?
-                        < a.effective_until.as_deref().map(date_ms).transpose()?.unwrap_or(i64::MAX)
+                    && a.start()? < b.effective_until.as_deref().map(date_ms).transpose()?.unwrap_or(i64::MAX)
+                    && b.start()? < a.effective_until.as_deref().map(date_ms).transpose()?.unwrap_or(i64::MAX)
                 {
                     bail!("overlapping pricing periods");
                 }
@@ -150,13 +151,14 @@ impl Catalogue {
             service_tier: o.service_tier.clone().unwrap_or_else(|| "standard (assumed)".into()),
             tier_multiplier: [1, 1],
             local_override: self.local_override,
+            backdated: false,
         };
         let Some(model) = o.actual_model.as_ref() else {
             return snapshot;
         };
         let mut rates = self.rates.iter().filter(|r| r.provider == o.provider && r.models.contains(model));
         let Some(rate) = rates.find(|r| {
-            date_ms(r.effective_from.as_deref().unwrap_or(&self.verified_at)).is_ok_and(|s| s <= o.event_at_ms)
+            r.start().is_ok_and(|s| s <= o.event_at_ms)
                 && r.effective_until
                     .as_deref()
                     .map(date_ms)
@@ -274,6 +276,10 @@ impl Catalogue {
             sum.checked_mul(numerator)?.checked_add(denominator / 2)?.checked_div(denominator)
         })();
         snapshot.cost_nanos = cost;
+        // Today's rates applied to older usage: a labelled equivalent, never historical spend.
+        snapshot.backdated = cost.is_some()
+            && rate.effective_from.is_none()
+            && date_ms(&self.verified_at).is_ok_and(|v| o.event_at_ms < v);
         snapshot.basis = if snapshot.cost_nanos.is_some() {
             if rate.effective_from.is_some() { "api_rate_estimate" } else { "current_rate_equivalent" }
         } else if write > 0
@@ -291,6 +297,12 @@ impl Catalogue {
         snapshot
     }
 }
+impl Rate {
+    /// A rate without `effective_from` has no start date and applies to any earlier event.
+    fn start(&self) -> Result<i64> {
+        self.effective_from.as_deref().map(date_ms).transpose().map(|s| s.unwrap_or(i64::MIN))
+    }
+}
 pub fn date_ms(s: &str) -> Result<i64> {
     Ok(chrono::NaiveDate::parse_from_str(s, "%Y-%m-%d")?.and_hms_opt(0, 0, 0).unwrap().and_utc().timestamp_millis())
 }
@@ -299,7 +311,7 @@ pub fn date_ms(s: &str) -> Result<i64> {
 pub fn catalogue_info() -> serde_json::Value {
     match Catalogue::load(None) {
         Ok(c) => {
-            serde_json::json!({"version":c.version,"verified_at":c.verified_at,"currency":"USD","unit":"integer nanodollars","rate_count":c.rates.len(),"effective_dates":"null means current-rate equivalent from verification day; older events unpriced","basis":"API list-price equivalent, standard tier/global region assumptions explicit; never subscription bill","sources":c.rates.iter().map(|r|r.source_url.clone()).collect::<std::collections::BTreeSet<_>>()})
+            serde_json::json!({"version":c.version,"verified_at":c.verified_at,"currency":"USD","unit":"integer nanodollars","rate_count":c.rates.len(),"effective_dates":"null effective_from means no start date: usage older than the catalogue is priced at today's published rates, labelled a current-rate equivalent (backdated), and is not what was actually paid at the time; rates with an explicit effective_from leave earlier events unpriced","basis":"API list-price equivalent, standard tier/global region assumptions explicit; never subscription bill","sources":c.rates.iter().map(|r|r.source_url.clone()).collect::<std::collections::BTreeSet<_>>()})
         }
         Err(e) => serde_json::json!({"error":e.to_string()}),
     }
@@ -370,5 +382,36 @@ mod tier_tests {
         assert!(p.local_override);
         assert!(p.catalogue_version.starts_with("local:"));
         assert!(p.basis.starts_with("local_override:"));
+    }
+    #[test]
+    fn no_start_rate_backdates_older_events_without_partial() {
+        let c = Catalogue::load(None).unwrap();
+        let mut o = event("anthropic", "claude-sonnet-4-6");
+        o.service_tier = Some("standard".into());
+        o.event_at_ms = date_ms("2025-01-01").unwrap();
+        let p = c.price(&o);
+        assert!(p.cost_nanos.is_some(), "{}", p.basis);
+        assert_eq!(p.basis, "current_rate_equivalent");
+        assert_eq!(serde_json::to_value(&p).unwrap()["backdated"], true);
+        assert!(p.assumptions.is_empty() && !p.partial);
+        o.event_at_ms = date_ms("2026-10-07").unwrap();
+        let p = c.price(&o);
+        assert_eq!((p.cost_nanos.is_some(), p.basis.as_str()), (true, "current_rate_equivalent"));
+        assert_eq!(serde_json::to_value(&p).unwrap()["backdated"], false);
+    }
+    #[test]
+    fn explicit_start_rate_keeps_older_events_unpriced() {
+        let mut c = Catalogue::load(None).unwrap();
+        let rate = c.rates.iter_mut().find(|r| r.models.contains(&"claude-sonnet-4-6".into())).unwrap();
+        rate.effective_from = Some("2026-01-01".into());
+        let mut o = event("anthropic", "claude-sonnet-4-6");
+        o.service_tier = Some("standard".into());
+        o.event_at_ms = date_ms("2026-01-01").unwrap() - 1;
+        let p = c.price(&o);
+        assert_eq!((p.cost_nanos, p.basis.as_str()), (None, "outside_effective_period"));
+        o.event_at_ms += 1;
+        let p = c.price(&o);
+        assert_eq!(p.basis, "api_rate_estimate");
+        assert_ne!(serde_json::to_value(&p).unwrap()["backdated"], true);
     }
 }

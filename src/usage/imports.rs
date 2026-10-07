@@ -62,6 +62,11 @@ pub enum UsageCommand {
         #[arg(long)]
         source: Option<String>,
     },
+    /// Price unpriced rows that predate the catalogue at current-rate equivalents.
+    Reprice {
+        #[arg(long)]
+        database: PathBuf,
+    },
 }
 pub async fn run_command(command: UsageCommand) -> Result<()> {
     let database = match &command {
@@ -69,7 +74,8 @@ pub async fn run_command(command: UsageCommand) -> Result<()> {
         | UsageCommand::Enable { database, .. }
         | UsageCommand::Disable { database, .. }
         | UsageCommand::Scan { database, .. }
-        | UsageCommand::Backfill { database, .. } => database,
+        | UsageCommand::Backfill { database, .. }
+        | UsageCommand::Reprice { database } => database,
     };
     let database = database.clone();
     let store = tokio::task::spawn_blocking(move || Store::open_existing(&database, 128)).await??;
@@ -79,6 +85,7 @@ pub async fn run_command(command: UsageCommand) -> Result<()> {
         UsageCommand::Disable { source, root, .. } => configure(&store, &source, &root.to_string_lossy(), false).await,
         UsageCommand::Scan { source, .. } => scan(&store, source).await,
         UsageCommand::Backfill { source, .. } => backfill(&store, source).await,
+        UsageCommand::Reprice { .. } => reprice(&store).await,
     };
     let shutdown = store.shutdown().await;
     let result = result?;
@@ -870,6 +877,11 @@ pub async fn backfill(store: &Store, source: Option<String>) -> Result<Value> {
     let filter = source.clone();
     store.call(move |conn|{conn.execute("DELETE FROM usage_import_checkpoints WHERE root_id IN (SELECT id FROM usage_import_roots WHERE enabled=1 AND (?1 IS NULL OR source=?1))",[filter])?;Ok(())}).await?;
     scan_mode(store, source, false, true).await
+}
+/// Opening the database already runs the startup step; report both passes together.
+pub async fn reprice(s: &Store) -> Result<Value> {
+    let now = s.call(store::reprice).await?;
+    Ok(json!({"repriced": s.startup_repriced() + now}))
 }
 pub async fn poller(store: Store) {
     let mut interval = tokio::time::interval(std::time::Duration::from_secs(30));

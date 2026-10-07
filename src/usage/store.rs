@@ -17,7 +17,7 @@ use std::{
 };
 use tokio::sync::{OnceCell, Semaphore, mpsc, oneshot};
 
-const VERSION: i64 = 2;
+const VERSION: i64 = 3;
 const APPLICATION_ID: i64 = 0x46555345;
 const MAX_QUERY_DAYS: i64 = 3660;
 const ENTRY_COLUMNS: &str = "id,source,origin_id,source_event_id,canonical_key,association_key,event_at_ms,provider,model,account_id,client_id,logical_request_id,attempt_id,response_id,completeness,input,cache_read,cache_write,write_5m,write_1h,output,reasoning,cost_nanos,pricing_basis,catalogue_version,json_extract(snapshot_json,'$.partial') AS pricing_partial";
@@ -51,6 +51,7 @@ pub struct Store {
     read_slots: Arc<Semaphore>,
     shutdown_result: Arc<OnceCell<std::result::Result<(), String>>>,
     session_id: Arc<String>,
+    startup_repriced: u64,
 }
 #[derive(Debug, Clone, Default, Deserialize)]
 #[serde(default, deny_unknown_fields)]
@@ -66,6 +67,10 @@ pub struct Query {
     pub limit: Option<u32>,
     pub offset: Option<u32>,
     pub group_by: Option<String>,
+    /// Observation rows: `raw` (default, every stored record) or `combined` (one per response).
+    pub view: Option<String>,
+    /// Combined trend grouping: `provider` (default) or `model`.
+    pub stack: Option<String>,
 }
 #[derive(Default)]
 struct CheckedSum;
@@ -206,6 +211,11 @@ impl Store {
         conn.execute("INSERT INTO usage_meta(key,value) VALUES('retention_days',?1) ON CONFLICT(key) DO UPDATE SET value=excluded.value",[retention_days.to_string()])?;
         let cutoff = (Utc::now().timestamp_millis() - i64::from(retention_days) * 86_400_000).max(0);
         purge_conn(&mut conn, cutoff)?;
+        // Collector outboxes only forward evidence; the server prices it on ingestion.
+        let startup_repriced = if byte_limit.is_none() { reprice(&mut conn)? } else { 0 };
+        if startup_repriced > 0 {
+            tracing::info!(repriced = startup_repriced, "priced older usage at current-rate equivalents");
+        }
         let (tx, mut rx) = mpsc::channel(queue_capacity);
         let (historical_dropped,historical_rejected,historical_errors,prior_unclosed):(u64,u64,u64,u64)=conn.query_row("SELECT COALESCE(SUM(dropped),0),COALESCE(SUM(rejected),0),COALESCE(SUM(writer_errors),0),COALESCE(SUM(clean=0),0) FROM usage_writer_sessions",[],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?)))?;
         let session_id = hex::encode(Sha256::digest(
@@ -311,7 +321,12 @@ impl Store {
             read_slots: Arc::new(Semaphore::new(4)),
             shutdown_result: Arc::new(OnceCell::new()),
             session_id: Arc::new(session_id),
+            startup_repriced,
         })
+    }
+    /// Rows the startup reprice step updated when this handle opened the database.
+    pub fn startup_repriced(&self) -> u64 {
+        self.startup_repriced
     }
     pub fn enqueue(&self, observation: Observation) -> bool {
         if self.health.closed.load(Ordering::Acquire) {
@@ -483,26 +498,23 @@ fn migrate(conn: &mut Connection) -> Result<()> {
     if version == VERSION {
         return Ok(());
     }
-    if version == 1 {
-        let tx = conn.transaction()?;
-        tx.execute_batch(WRITER_SESSIONS_SCHEMA)?;
-        tx.pragma_update(None, "user_version", VERSION)?;
-        tx.commit()?;
-        return Ok(());
-    }
-    if version != 0 {
+    if version < 0 {
         bail!("unsupported usage database migration");
     }
-    let tables: i64 = conn.query_row(
-        "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%'",
-        [],
-        |r| r.get(0),
-    )?;
-    if tables > 0 {
-        bail!("refusing to initialize usage schema in a nonempty unversioned database");
+    if version == 0 {
+        let tables: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%'",
+            [],
+            |r| r.get(0),
+        )?;
+        if tables > 0 {
+            bail!("refusing to initialize usage schema in a nonempty unversioned database");
+        }
     }
+    // Each step upgrades exactly one version inside one transaction: 0→1→2→3.
     let tx = conn.transaction()?;
-    tx.execute_batch(&format!("CREATE TABLE usage_meta(key TEXT PRIMARY KEY,value TEXT NOT NULL);
+    if version < 1 {
+        tx.execute_batch(&format!("CREATE TABLE usage_meta(key TEXT PRIMARY KEY,value TEXT NOT NULL);
     INSERT INTO usage_meta VALUES('purge_before_ms','0');
     CREATE TABLE usage_observations(
       id INTEGER PRIMARY KEY,source TEXT NOT NULL,origin_id TEXT NOT NULL,source_event_id TEXT NOT NULL,
@@ -528,7 +540,14 @@ fn migrate(conn: &mut Connection) -> Result<()> {
     CREATE INDEX usage_source_entries_event_time ON usage_source_entries(event_at_ms);
     CREATE INDEX usage_source_entries_filters ON usage_source_entries(provider,model,account_id,client_id,event_at_ms);
     PRAGMA user_version=1; PRAGMA application_id=1179996997;"))?;
-    tx.execute_batch(WRITER_SESSIONS_SCHEMA)?;
+    }
+    if version < 2 {
+        tx.execute_batch(WRITER_SESSIONS_SCHEMA)?;
+    }
+    if version < 3 {
+        // Combined accounting drops imported copies of proxy responses by association key.
+        tx.execute_batch("CREATE INDEX usage_entries_association ON usage_entries(association_key,source);")?;
+    }
     tx.pragma_update(None, "user_version", VERSION)?;
     tx.commit()?;
     Ok(())
@@ -550,6 +569,42 @@ fn canonical_key(o: &Observation) -> String {
         return serde_json::to_string(&("account_response", base, account)).unwrap();
     }
     base
+}
+/// Reselect the global and per-source accounting entry for one canonical group.
+fn rebuild_entries(conn: &Connection, key: &str, source: &str) -> Result<()> {
+    conn.prepare_cached(&format!("INSERT OR REPLACE INTO usage_entries SELECT {ENTRY_COLUMNS} FROM usage_observations INDEXED BY usage_canonical WHERE canonical_key=?1 AND NOT EXISTS(SELECT 1 FROM usage_suppressed s WHERE s.source=usage_observations.source AND s.source_event_id=usage_observations.source_event_id AND (s.origin_id='' OR s.origin_id=usage_observations.origin_id)) ORDER BY {WINNER_ORDER} LIMIT 1"))?.execute([key])?;
+    conn.prepare_cached(&format!("INSERT OR REPLACE INTO usage_source_entries SELECT {ENTRY_COLUMNS} FROM usage_observations INDEXED BY usage_canonical WHERE canonical_key=?1 AND source=?2 AND NOT EXISTS(SELECT 1 FROM usage_suppressed s WHERE s.source=usage_observations.source AND s.source_event_id=usage_observations.source_event_id AND (s.origin_id='' OR s.origin_id=usage_observations.origin_id)) ORDER BY {WINNER_ORDER} LIMIT 1"))?.execute(params![key,source])?;
+    Ok(())
+}
+/// Price again observations stored unpriced only because their event predates the
+/// catalogue. Rows that already carry a price are never touched; safe to repeat.
+pub fn reprice(conn: &mut Connection) -> Result<u64> {
+    let raw: String = conn.query_row("SELECT value FROM usage_meta WHERE key='catalogue'", [], |r| r.get(0))?;
+    let catalogue: Catalogue = serde_json::from_str(&raw)?;
+    let (mut cursor, mut repriced) = (0_i64, 0_u64);
+    loop {
+        let tx = conn.savepoint()?;
+        let rows = tx.prepare("SELECT id,payload,canonical_key,source,pricing_basis FROM usage_observations WHERE id>?1 AND cost_nanos IS NULL AND pricing_basis IN ('outside_effective_period','local_override:outside_effective_period') ORDER BY id LIMIT 2000")?.query_map([cursor], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?, r.get::<_, String>(2)?, r.get::<_, String>(3)?, r.get::<_, String>(4)?)))?.collect::<rusqlite::Result<Vec<_>>>()?;
+        let Some(last) = rows.last() else { break };
+        cursor = last.0;
+        let mut groups = BTreeSet::new();
+        for (id, payload, key, source, basis) in rows {
+            // Payloads written by an incompatible build stay as stored rather than guessed.
+            let Ok(o) = serde_json::from_str::<Observation>(&payload) else { continue };
+            let snapshot = catalogue.price(&o);
+            if snapshot.cost_nanos.is_none() && snapshot.basis == basis {
+                continue;
+            }
+            tx.execute("UPDATE usage_observations SET cost_nanos=?2,pricing_basis=?3,catalogue_version=?4,snapshot_json=?5 WHERE id=?1 AND cost_nanos IS NULL",params![id,snapshot.cost_nanos,snapshot.basis,snapshot.catalogue_version,serde_json::to_string(&snapshot)?])?;
+            groups.insert((key, source));
+            repriced += 1;
+        }
+        for (key, source) in groups {
+            rebuild_entries(&tx, &key, &source)?;
+        }
+        tx.commit()?;
+    }
+    Ok(repriced)
 }
 /// Savepoint makes records + caller-owned checkpoint/outbox transactions atomic.
 pub fn insert_batch(conn: &mut Connection, observations: &[Observation]) -> Result<Value> {
@@ -597,8 +652,7 @@ pub fn insert_batch(conn: &mut Connection, observations: &[Observation]) -> Resu
         }
     }
     for (key, source) in changed_groups {
-        tx.prepare_cached(&format!("INSERT OR REPLACE INTO usage_entries SELECT {ENTRY_COLUMNS} FROM usage_observations INDEXED BY usage_canonical WHERE canonical_key=?1 AND NOT EXISTS(SELECT 1 FROM usage_suppressed s WHERE s.source=usage_observations.source AND s.source_event_id=usage_observations.source_event_id AND (s.origin_id='' OR s.origin_id=usage_observations.origin_id)) ORDER BY {WINNER_ORDER} LIMIT 1"))?.execute([&key])?;
-        tx.prepare_cached(&format!("INSERT OR REPLACE INTO usage_source_entries SELECT {ENTRY_COLUMNS} FROM usage_observations INDEXED BY usage_canonical WHERE canonical_key=?1 AND source=?2 AND NOT EXISTS(SELECT 1 FROM usage_suppressed s WHERE s.source=usage_observations.source AND s.source_event_id=usage_observations.source_event_id AND (s.origin_id='' OR s.origin_id=usage_observations.origin_id)) ORDER BY {WINNER_ORDER} LIMIT 1"))?.execute(params![key,source])?;
+        rebuild_entries(&tx, &key, &source)?;
     }
     tx.commit()?;
     Ok(json!({"inserted":inserted,"duplicates":duplicates,"purged":purged}))
@@ -643,8 +697,7 @@ pub fn suppress_origin_event(
     for key in &keys {
         tx.execute("DELETE FROM usage_entries WHERE canonical_key=?1", [key])?;
         tx.execute("DELETE FROM usage_source_entries WHERE canonical_key=?1 AND source=?2", params![key, source])?;
-        tx.prepare_cached(&format!("INSERT OR REPLACE INTO usage_entries SELECT {ENTRY_COLUMNS} FROM usage_observations INDEXED BY usage_canonical WHERE canonical_key=?1 AND NOT EXISTS(SELECT 1 FROM usage_suppressed s WHERE s.source=usage_observations.source AND s.source_event_id=usage_observations.source_event_id AND (s.origin_id='' OR s.origin_id=usage_observations.origin_id)) ORDER BY {WINNER_ORDER} LIMIT 1"))?.execute([key])?;
-        tx.prepare_cached(&format!("INSERT OR REPLACE INTO usage_source_entries SELECT {ENTRY_COLUMNS} FROM usage_observations INDEXED BY usage_canonical WHERE canonical_key=?1 AND source=?2 AND NOT EXISTS(SELECT 1 FROM usage_suppressed s WHERE s.source=usage_observations.source AND s.source_event_id=usage_observations.source_event_id AND (s.origin_id='' OR s.origin_id=usage_observations.origin_id)) ORDER BY {WINNER_ORDER} LIMIT 1"))?.execute(params![key,source])?;
+        rebuild_entries(&tx, key, source)?;
     }
     tx.commit()?;
     Ok(json!({"suppressed_groups":keys.len()}))
@@ -667,8 +720,7 @@ fn purge_conn(conn: &mut Connection, before_ms: i64) -> Result<Value> {
     tx.execute("DELETE FROM usage_source_entries WHERE event_at_ms<?1", [before_ms])?;
     tx.execute("DELETE FROM usage_suppressed WHERE NOT EXISTS(SELECT 1 FROM usage_observations o WHERE o.source=usage_suppressed.source AND o.source_event_id=usage_suppressed.source_event_id)",[])?;
     for (key, source) in affected {
-        tx.prepare_cached(&format!("INSERT OR REPLACE INTO usage_entries SELECT {ENTRY_COLUMNS} FROM usage_observations INDEXED BY usage_canonical WHERE canonical_key=?1 AND NOT EXISTS(SELECT 1 FROM usage_suppressed s WHERE s.source=usage_observations.source AND s.source_event_id=usage_observations.source_event_id AND (s.origin_id='' OR s.origin_id=usage_observations.origin_id)) ORDER BY {WINNER_ORDER} LIMIT 1"))?.execute([&key])?;
-        tx.prepare_cached(&format!("INSERT OR REPLACE INTO usage_source_entries SELECT {ENTRY_COLUMNS} FROM usage_observations INDEXED BY usage_canonical WHERE canonical_key=?1 AND source=?2 AND NOT EXISTS(SELECT 1 FROM usage_suppressed s WHERE s.source=usage_observations.source AND s.source_event_id=usage_observations.source_event_id AND (s.origin_id='' OR s.origin_id=usage_observations.origin_id)) ORDER BY {WINNER_ORDER} LIMIT 1"))?.execute(params![key,source])?;
+        rebuild_entries(&tx, &key, &source)?;
     }
     tx.execute(
         "UPDATE usage_meta SET value=CAST(MAX(CAST(value AS INTEGER),?1) AS TEXT) WHERE key='purge_before_ms'",
@@ -720,6 +772,12 @@ fn range(q: &Query) -> Result<Range> {
     {
         bail!("unsupported group_by");
     }
+    if q.view.as_deref().is_some_and(|s| !matches!(s, "combined" | "raw")) {
+        bail!("unsupported view");
+    }
+    if q.stack.as_deref().is_some_and(|s| !matches!(s, "provider" | "model")) {
+        bail!("unsupported stack");
+    }
     for s in [&q.provider, &q.model, &q.account, &q.client, &q.source].into_iter().flatten() {
         super::types::valid_label(s).map_err(|e| anyhow!(e))?;
     }
@@ -731,6 +789,14 @@ fn dimension(column: &str, alias: &str) -> String {
     } else {
         format!("{alias}.{column}")
     }
+}
+/// Combined accounting: one entry per provider response. An imported entry is dropped when
+/// any proxy entry shares its association key, even outside the range, so the trusted
+/// proxy evidence wins and a pair split across local midnight still counts once.
+fn combined(where_sql: &str) -> String {
+    format!(
+        "{where_sql} AND (o.source='proxy' OR NOT EXISTS(SELECT 1 FROM usage_entries p INDEXED BY usage_entries_association WHERE p.association_key=o.association_key AND p.source='proxy'))"
+    )
 }
 fn collector_label(conn: &Connection, origin: &str) -> Result<Option<String>> {
     let Some(id) = origin.strip_prefix("collector:") else { return Ok(None) };
@@ -994,8 +1060,58 @@ fn summary(conn: &mut Connection, q: &Query) -> Result<Value> {
     }
     let raw: String = conn.query_row("SELECT value FROM usage_meta WHERE key='catalogue'", [], |row| row.get(0))?;
     let catalogue: Catalogue = serde_json::from_str(&raw)?;
+    let combined = combined_summary(conn, q, &where_sql, &values, &date_expression)?;
     Ok(
-        json!({"range":{"start":r.start,"end":r.end,"timezone":r.tz.to_string()},"proxy":proxy,"sources":sources,"trend":trend,"group_by":q.group_by.as_deref().unwrap_or("day"),"breakdowns":breakdowns,"facets":facets,"pricing":{"version":catalogue.version,"verified_at":catalogue.verified_at,"basis":"API list-price equivalent estimate; source totals may overlap; historical undocumented periods unpriced"},"reconciliation":{"basis":"proxy evidence only","cross_source_grand_total":null,"identity":"provider response ID only; native stable source event ID within source","conflicts":conflicts}}),
+        json!({"range":{"start":r.start,"end":r.end,"timezone":r.tz.to_string()},"proxy":proxy,"sources":sources,"combined":combined,"trend":trend,"group_by":q.group_by.as_deref().unwrap_or("day"),"breakdowns":breakdowns,"facets":facets,"pricing":{"version":catalogue.version,"verified_at":catalogue.verified_at,"basis":"API list-price equivalent estimate; source totals may overlap; usage older than the catalogue is priced at today's rates as a backdated current-rate equivalent, not what was paid at the time"},"reconciliation":{"basis":"proxy evidence only","cross_source_grand_total":null,"identity":"provider response ID only; native stable source event ID within source","conflicts":conflicts}}),
+    )
+}
+fn combined_summary(
+    conn: &Connection,
+    q: &Query,
+    where_sql: &str,
+    values: &[SqlValue],
+    date_expression: &str,
+) -> Result<Value> {
+    let set = combined(where_sql);
+    let params = || rusqlite::params_from_iter(values);
+    let mut totals = aggregate(conn, "usage_entries", &set, values)?;
+    let (history_only, weak_identity): (i64, i64) = conn.query_row(&format!("SELECT COALESCE(SUM(o.source<>'proxy'),0),COALESCE(SUM(o.source<>'proxy' AND COALESCE(o.response_id,'')=''),0) FROM usage_entries o INDEXED BY usage_entries_event_time WHERE {set}"),params(),|r|Ok((r.get(0)?,r.get(1)?)))?;
+    let matched: i64 = conn.query_row(&format!("SELECT COUNT(*) FROM usage_entries o INDEXED BY usage_entries_event_time WHERE {where_sql} AND o.source<>'proxy' AND EXISTS(SELECT 1 FROM usage_entries p INDEXED BY usage_entries_association WHERE p.association_key=o.association_key AND p.source='proxy')"),params(),|r|r.get(0))?;
+    totals["history_only"] = json!(history_only);
+    totals["matched"] = json!(matched);
+    totals["weak_identity"] = json!(weak_identity);
+    let proxy_first: Option<i64> = conn.query_row("SELECT event_at_ms FROM usage_observations INDEXED BY usage_event_time WHERE source='proxy' ORDER BY event_at_ms LIMIT 1",[],|r|r.get(0)).optional()?;
+    let stack = q.stack.as_deref().unwrap_or("provider");
+    let mut trend = Vec::new();
+    let mut statement = conn.prepare(&format!("SELECT {date_expression},o.{stack},{AGG} FROM usage_entries o INDEXED BY usage_entries_event_time WHERE {set} GROUP BY 1,2 ORDER BY 1,2"))?;
+    for row in statement.query_map(params(), |row| {
+        let mut value = aggregate_row(row, 2)?;
+        value["date"] = json!(row.get::<_, String>(0)?);
+        value["group"] = json!(row.get::<_, Option<String>>(1)?);
+        Ok(value)
+    })? {
+        trend.push(row?);
+    }
+    let mut breakdowns = serde_json::Map::new();
+    for (name, column) in
+        [("provider", "provider"), ("model", "model"), ("account", "account_id"), ("client", "client_id")]
+    {
+        let column = dimension(column, "o");
+        let mut statement = conn.prepare(&format!("SELECT {column},COUNT(DISTINCT o.account_id),MIN(o.provider),{AGG} FROM usage_entries o INDEXED BY usage_entries_event_time WHERE {set} GROUP BY 1 ORDER BY usage_sum(o.cost_nanos) DESC,COUNT(*) DESC,1 LIMIT 500"))?;
+        let mut out = Vec::new();
+        for row in statement.query_map(params(), |row| {
+            let mut value = aggregate_row(row, 3)?;
+            value["id"] = json!(row.get::<_, Option<String>>(0)?);
+            value["accounts"] = json!(row.get::<_, i64>(1)?);
+            value["provider"] = json!(row.get::<_, Option<String>>(2)?);
+            Ok(value)
+        })? {
+            out.push(row?);
+        }
+        breakdowns.insert(name.into(), json!(out));
+    }
+    Ok(
+        json!({"basis":"One entry per provider response. Imported entries that share a response ID with a proxy entry are excluded.","totals":totals,"proxy_first_event_at_ms":proxy_first,"stack":stack,"trend":trend,"breakdowns":breakdowns}),
     )
 }
 fn details(conn: &mut Connection, q: &Query) -> Result<Value> {
@@ -1006,14 +1122,26 @@ fn details(conn: &mut Connection, q: &Query) -> Result<Value> {
     if offset > 1_000_000 {
         bail!("offset exceeds pagination bound");
     }
+    // Combined rows are accounting entries joined back to their stored observation.
+    let combined_view = q.view.as_deref() == Some("combined");
+    let (table, join, x, where_sql) = if combined_view {
+        (
+            "usage_entries o INDEXED BY usage_entries_event_time",
+            " JOIN usage_observations x ON x.id=o.id",
+            "x",
+            combined(&where_sql),
+        )
+    } else {
+        ("usage_observations o INDEXED BY usage_event_time", "", "o", where_sql)
+    };
     let total: i64 = conn.query_row(
-        &format!("SELECT COUNT(*) FROM usage_observations o INDEXED BY usage_event_time WHERE {where_sql}"),
+        &format!("SELECT COUNT(*) FROM {table} WHERE {where_sql}"),
         rusqlite::params_from_iter(&values),
         |row| row.get(0),
     )?;
     values.push(i64::from(limit).into());
     values.push(i64::from(offset).into());
-    let mut statement=conn.prepare(&format!("SELECT o.id,o.payload,o.cost_nanos,o.pricing_basis,o.snapshot_json,o.canonical_key,o.ingested_at_ms,EXISTS(SELECT 1 FROM usage_suppressed s WHERE s.source=o.source AND s.source_event_id=o.source_event_id AND (s.origin_id='' OR s.origin_id=o.origin_id)) FROM usage_observations o INDEXED BY usage_event_time WHERE {where_sql} ORDER BY o.event_at_ms DESC,o.id DESC LIMIT ? OFFSET ?"))?;
+    let mut statement=conn.prepare(&format!("SELECT {x}.id,{x}.payload,{x}.cost_nanos,{x}.pricing_basis,{x}.snapshot_json,{x}.canonical_key,{x}.ingested_at_ms,EXISTS(SELECT 1 FROM usage_suppressed s WHERE s.source={x}.source AND s.source_event_id={x}.source_event_id AND (s.origin_id='' OR s.origin_id={x}.origin_id)),{x}.association_key FROM {table}{join} WHERE {where_sql} ORDER BY o.event_at_ms DESC,o.id DESC LIMIT ? OFFSET ?"))?;
     let rows = statement.query_map(rusqlite::params_from_iter(&values), |row| {
         Ok((
             row.get::<_, i64>(0)?,
@@ -1024,11 +1152,12 @@ fn details(conn: &mut Connection, q: &Query) -> Result<Value> {
             row.get::<_, String>(5)?,
             row.get::<_, i64>(6)?,
             row.get::<_, bool>(7)?,
+            row.get::<_, String>(8)?,
         ))
     })?;
     let mut items = Vec::new();
     for row in rows {
-        let (id, payload, cost, basis, snapshot, key, ingested, suppressed) = row?;
+        let (id, payload, cost, basis, snapshot, key, ingested, suppressed, association) = row?;
         let mut value: Value = serde_json::from_str(&payload)?;
         value["id"] = json!(id);
         value["ingested_at_ms"] = json!(ingested);
@@ -1041,6 +1170,25 @@ fn details(conn: &mut Connection, q: &Query) -> Result<Value> {
             && let Some(label) = collector_label(conn, origin)?
         {
             value["collector_label"] = json!(label);
+        }
+        if combined_view {
+            let source = value["source"].as_str().unwrap_or("").to_owned();
+            let origin = value["origin_id"].as_str().unwrap_or("").to_owned();
+            value["matched_sources"] = if source == "proxy" {
+                let mut statement = conn.prepare_cached("SELECT DISTINCT source FROM usage_entries INDEXED BY usage_entries_association WHERE association_key=?1 AND source<>'proxy' ORDER BY source")?;
+                json!(
+                    statement
+                        .query_map([&association], |r| r.get::<_, String>(0))?
+                        .collect::<rusqlite::Result<Vec<_>>>()?
+                )
+            } else {
+                json!([])
+            };
+            value["origin_label"] = match (source.as_str(), origin.as_str()) {
+                ("proxy", _) => Value::Null,
+                (_, "local") => json!("This server"),
+                _ => json!(value["collector_label"].as_str()),
+            };
         }
         items.push(value);
     }

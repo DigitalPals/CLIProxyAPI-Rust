@@ -165,7 +165,11 @@ fn exact_price_cache_reasoning_thresholds_and_historical() {
     a.tokens.input = Some(271901);
     assert_eq!(c.price(&a).cost_nanos, Some(1_089_124_000));
     a.event_at_ms = 1_700_000_000_000;
-    assert_eq!(c.price(&a).basis, "outside_effective_period");
+    let old = c.price(&a);
+    assert_eq!(
+        (old.basis.as_str(), old.cost_nanos, old.backdated),
+        ("current_rate_equivalent", Some(1_089_124_000), true)
+    );
     a = event("proxy", "b");
     a.provider = "anthropic".into();
     a.actual_model = Some("claude-sonnet-4-6".into());
@@ -752,4 +756,282 @@ async fn collector_filter_retains_raw_evidence_when_local_copy_wins_accounting()
     assert_eq!(store.details(query).await.unwrap()["total"], 1);
     assert!(summary["facets"]["clients"].as_array().unwrap().iter().any(|client| client["id"] == "collector:X"));
     store.shutdown().await.unwrap();
+}
+
+fn query(v: Value) -> Query {
+    serde_json::from_value(v).unwrap()
+}
+fn anthropic(source: &str, id: &str, response: Option<&str>, at: &str) -> Observation {
+    let mut o = event(source, id);
+    o.provider = "anthropic".into();
+    o.actual_model = Some("claude-sonnet-4-6".into());
+    o.response_id = response.map(Into::into);
+    o.event_at_ms = boundary(at, chrono_tz::UTC).unwrap();
+    o
+}
+#[tokio::test]
+async fn combined_set_counts_shared_response_once_and_proxy_wins() {
+    let store = Store::open(&path("combined"), 8, 90, None).unwrap();
+    let mut p1 = anthropic("proxy", "p1", Some("r1"), "2026-10-01T10:00:00Z");
+    p1.account_id = Some("acct".into());
+    let mut c1 = anthropic("claude_code", "c1", Some("r1"), "2026-10-01T10:00:00Z");
+    c1.tokens.output = Some(999);
+    let c2 = anthropic("claude_code", "c2", Some("r2"), "2026-10-01T11:00:00Z");
+    // A proxy entry and its imported copy on opposite sides of midnight.
+    let mut p3 = anthropic("proxy", "p3", Some("r3"), "2026-10-01T23:59:30Z");
+    p3.account_id = Some("acct".into());
+    let c3 = anthropic("claude_code", "c3", Some("r3"), "2026-10-02T00:00:30Z");
+    let mut weak = event("codex", "weak");
+    weak.event_at_ms = boundary("2026-10-02T12:00:00Z", chrono_tz::UTC).unwrap();
+    let key = association_key(&p1);
+    store.call(move |c| insert_batch(c, &[p1, c1, c2, p3, c3, weak])).await.unwrap();
+    // Root cause: the account-scoped proxy key and the imported key both survive.
+    let copies: i64 = store
+        .call(move |c| {
+            Ok(c.query_row("SELECT COUNT(*) FROM usage_entries WHERE association_key=?1", [key], |r| r.get(0))?)
+        })
+        .await
+        .unwrap();
+    assert_eq!(copies, 2);
+    let range = |start: &str, end: &str| query(json!({"start":start,"end":end,"timezone":"UTC"}));
+    let summary = store.query(range("2026-10-01", "2026-10-03")).await.unwrap();
+    let combined = &summary["combined"];
+    assert_eq!(combined["totals"]["observations"], 4, "{combined}");
+    assert_eq!(combined["totals"]["history_only"], 2);
+    assert_eq!(combined["totals"]["matched"], 2);
+    assert_eq!(combined["totals"]["weak_identity"], 1);
+    assert_eq!(combined["totals"]["tokens"]["output"], 400);
+    assert_eq!(combined["totals"]["unpriced"], 0);
+    assert_eq!(combined["stack"], "provider");
+    assert!(combined["basis"].as_str().unwrap().contains("share a response ID"));
+    let account = combined["breakdowns"]["account"].as_array().unwrap();
+    let acct = account.iter().find(|a| a["id"] == "acct").unwrap();
+    assert_eq!((acct["observations"].as_i64(), acct["provider"].as_str()), (Some(2), Some("anthropic")));
+    let first = combined["proxy_first_event_at_ms"].as_i64().unwrap();
+    assert_eq!(first, boundary("2026-10-01T10:00:00Z", chrono_tz::UTC).unwrap());
+    // The imported copy after midnight is still matched to the proxy row before it.
+    let late = store.query(range("2026-10-02", "2026-10-03")).await.unwrap();
+    assert_eq!(late["combined"]["totals"]["observations"], 1);
+    assert_eq!(late["combined"]["totals"]["matched"], 1);
+    assert_eq!(late["combined"]["totals"]["history_only"], 1);
+    assert_eq!(late["combined"]["proxy_first_event_at_ms"], json!(first));
+    let early = store.query(range("2026-10-01", "2026-10-02")).await.unwrap();
+    assert_eq!(early["combined"]["totals"]["observations"], 3);
+    assert_eq!(early["combined"]["totals"]["matched"], 1);
+    // Existing per-source fields remain for older clients.
+    assert_eq!(summary["proxy"]["observations"], 2);
+    assert!(summary["reconciliation"]["cross_source_grand_total"].is_null());
+    store.shutdown().await.unwrap();
+}
+#[tokio::test]
+async fn combined_trend_groups_by_provider_and_model_across_dst() {
+    let store = Store::open(&path("combined-dst"), 8, 3650, None).unwrap();
+    // Amsterdam moves from CET (+1) to CEST (+2) at 2026-03-29T01:00Z.
+    let a = anthropic("claude_code", "a", Some("ra"), "2026-03-28T22:30:00Z");
+    let mut b = event("proxy", "b");
+    b.event_at_ms = boundary("2026-03-28T23:30:00Z", chrono_tz::UTC).unwrap();
+    let mut c = event("codex", "c");
+    c.event_at_ms = boundary("2026-03-29T21:30:00Z", chrono_tz::UTC).unwrap();
+    let d = anthropic("proxy", "d", Some("rd"), "2026-03-29T22:30:00Z");
+    store.call(move |conn| insert_batch(conn, &[a, b, c, d])).await.unwrap();
+    let base = json!({"start":"2026-03-27","end":"2026-04-01","timezone":"Europe/Amsterdam"});
+    let rows = |v: &Value| {
+        v["combined"]["trend"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|r| {
+                assert!(r["estimated_cost_nanos"].as_i64().unwrap() > 0, "{r}");
+                assert_eq!(r["unpriced"], 0);
+                (
+                    r["date"].as_str().unwrap().to_owned(),
+                    r["group"].as_str().unwrap().to_owned(),
+                    r["observations"].as_i64().unwrap(),
+                )
+            })
+            .collect::<Vec<_>>()
+    };
+    let summary = store.query(query(base.clone())).await.unwrap();
+    let expected = |a: &str, o: &str| {
+        vec![
+            ("2026-03-28".to_owned(), a.to_owned(), 1),
+            ("2026-03-29".to_owned(), o.to_owned(), 2),
+            ("2026-03-30".to_owned(), a.to_owned(), 1),
+        ]
+    };
+    assert_eq!(rows(&summary), expected("anthropic", "openai"));
+    let mut by_model = base.clone();
+    by_model["stack"] = json!("model");
+    let summary = store.query(query(by_model)).await.unwrap();
+    assert_eq!(summary["combined"]["stack"], "model");
+    assert_eq!(rows(&summary), expected("claude-sonnet-4-6", "gpt-6.1-sol"));
+    let mut bad = base;
+    bad["stack"] = json!("source");
+    assert!(store.query(query(bad)).await.is_err());
+    store.shutdown().await.unwrap();
+}
+#[tokio::test]
+async fn combined_observations_report_matched_sources_and_origin_label() {
+    let store = Store::open(&path("combined-records"), 8, 90, None).unwrap();
+    let enrolled = super::super::collector::enroll(&store, "Work laptop".into()).await.unwrap();
+    let origin = format!("collector:{}", enrolled["collector"]["id"].as_str().unwrap());
+    let mut p1 = anthropic("proxy", "p1", Some("r1"), "2026-10-01T10:00:00Z");
+    p1.account_id = Some("acct".into());
+    let c1 = anthropic("claude_code", "c1", Some("r1"), "2026-10-01T10:00:00Z");
+    let mut copy = c1.clone();
+    copy.origin_id = origin.clone();
+    let mut c2 = anthropic("claude_code", "c2", Some("r2"), "2026-10-01T11:00:00Z");
+    c2.origin_id = origin;
+    let mut weak = event("codex", "weak");
+    weak.event_at_ms = boundary("2026-10-01T12:00:00Z", chrono_tz::UTC).unwrap();
+    store.call(move |c| insert_batch(c, &[p1, c1, copy, c2, weak])).await.unwrap();
+    let base = json!({"start":"2026-10-01","end":"2026-10-02","timezone":"UTC"});
+    assert_eq!(store.details(query(base.clone())).await.unwrap()["total"], 5);
+    let mut raw = base.clone();
+    raw["view"] = json!("raw");
+    assert_eq!(store.details(query(raw)).await.unwrap()["total"], 5);
+    let mut combined = base.clone();
+    combined["view"] = json!("combined");
+    let page = store.details(query(combined)).await.unwrap();
+    assert_eq!(page["total"], 3, "{page}");
+    let items = page["items"].as_array().unwrap();
+    let ids = items.iter().map(|i| i["source_event_id"].as_str().unwrap()).collect::<Vec<_>>();
+    assert_eq!(ids, ["weak", "c2", "p1"]);
+    assert_eq!(items[0]["origin_label"], "This server");
+    assert_eq!(items[0]["matched_sources"], json!([]));
+    assert_eq!(items[1]["origin_label"], "Work laptop");
+    assert_eq!(items[1]["collector_label"], "Work laptop");
+    assert_eq!(items[2]["matched_sources"], json!(["claude_code"]));
+    assert!(items[2]["origin_label"].is_null());
+    assert!(items[2]["pricing_snapshot"]["cost_nanos"].is_i64());
+    let mut bad = base;
+    bad["view"] = json!("sources");
+    assert!(store.details(query(bad)).await.is_err());
+    store.shutdown().await.unwrap();
+}
+/// Insert observations as releases before current-rate backdating stored them: a rate
+/// without a start date began on the catalogue's verification day.
+fn insert_legacy(c: &mut Connection, observations: &[Observation]) -> Result<Value> {
+    let raw: String = c.query_row("SELECT value FROM usage_meta WHERE key='catalogue'", [], |r| r.get(0))?;
+    let mut legacy: Catalogue = serde_json::from_str(&raw)?;
+    for rate in &mut legacy.rates {
+        rate.effective_from = rate.effective_from.clone().or_else(|| Some(legacy.verified_at.clone()));
+    }
+    c.execute("UPDATE usage_meta SET value=?1 WHERE key='catalogue'", [serde_json::to_string(&legacy)?])?;
+    let result = insert_batch(c, observations)?;
+    c.execute("UPDATE usage_meta SET value=?1 WHERE key='catalogue'", [raw])?;
+    Ok(result)
+}
+#[tokio::test]
+async fn startup_reprice_prices_old_unpriced_rows_once_and_keeps_priced_rows() {
+    let p = path("reprice");
+    let store = Store::open(&p, 8, 3650, None).unwrap();
+    let mut old = (0..2100)
+        .map(|i| anthropic("claude_code", &format!("old-{i}"), Some(&format!("old-r{i}")), "2026-03-01T12:00:00Z"))
+        .collect::<Vec<_>>();
+    let mut proxy = anthropic("proxy", "old-proxy", Some("old-r0"), "2026-03-01T12:00:00Z");
+    proxy.account_id = Some("acct".into());
+    proxy.service_tier = Some("standard".into());
+    proxy.inference_geo = Some("global".into());
+    old.push(proxy);
+    let mut counter = event("codex", "counter:old");
+    counter.event_at_ms = boundary("2026-03-01T12:00:00Z", chrono_tz::UTC).unwrap();
+    old.push(counter);
+    let current = event("proxy", "current");
+    store.call(move |c| insert_legacy(c, &old)).await.unwrap();
+    store.call(move |c| insert_batch(c, &[current])).await.unwrap();
+    let snapshot = |s: Store| async move {
+        s.call(|c| {
+            let unpriced: i64 = c.query_row(
+                "SELECT COUNT(*) FROM usage_observations WHERE pricing_basis='outside_effective_period'",
+                [],
+                |r| r.get(0),
+            )?;
+            let current: String =
+                c.query_row("SELECT snapshot_json FROM usage_observations WHERE source_event_id='current'", [], |r| {
+                    r.get(0)
+                })?;
+            let entries: i64 =
+                c.query_row("SELECT COUNT(*) FROM usage_source_entries WHERE cost_nanos IS NULL", [], |r| r.get(0))?;
+            Ok((unpriced, current, entries))
+        })
+        .await
+        .unwrap()
+    };
+    let (unpriced, current_before, unpriced_entries) = snapshot(store.clone()).await;
+    assert_eq!((unpriced, unpriced_entries), (2102, 2102));
+    let q = || query(json!({"start":"2026-03-01","end":"2026-03-02","timezone":"UTC"}));
+    assert_eq!(store.query(q()).await.unwrap()["combined"]["totals"]["unpriced"], 2101);
+    store.shutdown().await.unwrap();
+    drop(store);
+    // The CLI path opens through the same startup step and reports its count.
+    let admin = Store::open_existing(&p, 8).unwrap();
+    assert_eq!(super::super::imports::reprice(&admin).await.unwrap(), json!({"repriced":2102}));
+    admin.shutdown().await.unwrap();
+    drop(admin);
+    let store = Store::open(&p, 8, 3650, None).unwrap();
+    assert_eq!(store.startup_repriced(), 0);
+    assert_eq!(super::super::imports::reprice(&store).await.unwrap(), json!({"repriced":0}));
+    let (unpriced, current_after, unpriced_entries) = snapshot(store.clone()).await;
+    // Codex cumulative counters keep their own unpriced basis.
+    assert_eq!((unpriced, unpriced_entries), (0, 1));
+    assert_eq!(current_before, current_after);
+    let summary = store.query(q()).await.unwrap();
+    let totals = &summary["combined"]["totals"];
+    assert_eq!((totals["observations"].as_i64(), totals["unpriced"].as_i64()), (Some(2101), Some(1)));
+    assert_eq!(totals["matched"], 1);
+    let page = store
+        .details(query(
+            json!({"start":"2026-03-01","end":"2026-03-02","timezone":"UTC","view":"combined","source":"proxy"}),
+        ))
+        .await
+        .unwrap();
+    let item = &page["items"][0];
+    assert_eq!(item["pricing_basis"], "current_rate_equivalent");
+    assert_eq!(item["pricing_snapshot"]["backdated"], true);
+    assert_eq!(item["pricing_snapshot"]["partial"], false);
+    store.shutdown().await.unwrap();
+}
+#[tokio::test]
+async fn migrations_chain_to_v3_and_keep_existing_rows() {
+    let indexed = |c: &Connection| -> rusqlite::Result<(i64, bool, bool)> {
+        Ok((
+            c.query_row("PRAGMA user_version", [], |r| r.get(0))?,
+            c.query_row(
+                "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE name='usage_entries_association')",
+                [],
+                |r| r.get(0),
+            )?,
+            c.query_row("SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE name='usage_writer_sessions')", [], |r| {
+                r.get(0)
+            })?,
+        ))
+    };
+    for from in [2, 1] {
+        let p = path(&format!("migrate-v{from}"));
+        let store = Store::open(&p, 8, 90, None).unwrap();
+        assert_eq!(store.call(move |c| Ok(indexed(c)?)).await.unwrap(), (3, true, true));
+        let mut proxy = anthropic("proxy", "p", Some("r"), "2026-10-01T10:00:00Z");
+        proxy.account_id = Some("acct".into());
+        let copy = anthropic("claude_code", "c", Some("r"), "2026-10-01T10:00:00Z");
+        store.call(move |c| insert_batch(c, &[proxy, copy])).await.unwrap();
+        store.shutdown().await.unwrap();
+        drop(store);
+        let c = Connection::open(&p).unwrap();
+        c.execute_batch("DROP INDEX usage_entries_association;").unwrap();
+        if from == 1 {
+            c.execute_batch("DROP TABLE usage_writer_sessions;").unwrap();
+        }
+        c.pragma_update(None, "user_version", from).unwrap();
+        assert_eq!(indexed(&c).unwrap(), (from, false, from == 2));
+        drop(c);
+        let store = Store::open(&p, 8, 90, None).unwrap();
+        assert_eq!(store.call(move |c| Ok(indexed(c)?)).await.unwrap(), (3, true, true));
+        let summary =
+            store.query(query(json!({"start":"2026-10-01","end":"2026-10-02","timezone":"UTC"}))).await.unwrap();
+        assert_eq!(summary["combined"]["totals"]["observations"], 1);
+        assert_eq!(summary["combined"]["totals"]["matched"], 1);
+        assert_eq!(store.details(all()).await.unwrap()["total"], 2);
+        store.shutdown().await.unwrap();
+    }
 }

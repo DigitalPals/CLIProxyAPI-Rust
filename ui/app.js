@@ -494,7 +494,7 @@ function renderFaults() {
   if (S.faults) renderFaultsMenu();
 }
 
-const TITLES = { overview: 'Overview', accounts: 'Accounts', requests: 'Requests', usage: 'Usage & costs', models: 'Models', config: 'Config' };
+const TITLES = { overview: 'Overview', accounts: 'Accounts', requests: 'Requests', usage: 'Usage', models: 'Models', config: 'Config' };
 
 function renderChrome() {
   for (const a of $$('.tabs a, .mtabs a')) {

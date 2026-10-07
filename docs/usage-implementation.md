@@ -52,11 +52,11 @@ The existing request ring remains an in-memory, 300-row live view. The persisten
 
 ## Data and version contracts
 
-`src/usage/types.rs` defines the strict, allowlisted observation. Observation envelope `schema_version` is 1. Collector wire `Batch.version` is also 1. The SQLite database's `user_version` is 2: opening version 1 transactionally adds writer-session health accounting; a newer or foreign application database is rejected. These versions describe different layers.
+`src/usage/types.rs` defines the strict, allowlisted observation. Observation envelope `schema_version` is 1. Collector wire `Batch.version` is also 1. The SQLite database's `user_version` is 3: migrations step 0→1→2→3 in one transaction, where 1→2 adds writer-session health accounting and 2→3 adds the `usage_entries_association` index; a newer or foreign application database is rejected. These versions describe different layers.
 
 Tokens use disjoint uncached input, cache read, cache write, and output categories. Cache-write TTL values are subsets of cache write; reasoning is a subset of output. Missing is `null`, not zero. Observations retain source, origin, parser version, provider/model, event/ingest time, optional evidenced identities, completion, and allowlisted numeric metadata. Prompt/completion bodies, tools, transcripts, credentials, and arbitrary provider JSON are not persisted.
 
-Idempotency uses source + origin + source event identity. Reliable provider response IDs can associate proxy and imported evidence; token/time similarity is never enough. Reconciliation selects trusted evidence deterministically, with proxy before local import before collector, and surfaces conflicts. Imported-only source totals remain separate and possibly overlapping. The reconciled total is based on proxy evidence and matching records; the UI does not make a guessed cross-source grand total.
+Idempotency uses source + origin + source event identity. Reliable provider response IDs can associate proxy and imported evidence; token/time similarity is never enough. Reconciliation selects trusted evidence deterministically, with proxy before local import before collector, and surfaces conflicts. Per-source totals remain available and possibly overlapping. The combined total takes the accounting entries in range and drops every imported entry whose association key also has a proxy entry (not limited to the range), so each provider response counts once and proxy evidence wins. Imported entries without a response ID are counted and reported as weak identity.
 
 ## Pricing provenance
 

@@ -467,3 +467,28 @@ fn explicit_unmatched_turn_is_unknown() {
     record["payload"]["turn_id"] = json!("unknown-turn");
     assert!(parse_record("codex", &record, &mut state).unwrap().unwrap().actual_model.is_none());
 }
+#[tokio::test]
+async fn imported_claude_history_is_priced_on_its_original_local_date() {
+    let dir = TestDir::new();
+    let logs = dir.0.join("logs");
+    fs::create_dir(&logs).unwrap();
+    // 00:30 CEST on 30 March in Amsterdam, the night after the spring DST change.
+    let mut row = claude("msg-history", 50);
+    row["timestamp"] = json!("2026-03-29T22:30:00Z");
+    write_rows(&logs.join("claude.jsonl"), &[row]);
+    let store = dir.store();
+    configure(&store, "claude_code", logs.to_str().unwrap(), true).await.unwrap();
+    scan(&store, None).await.unwrap();
+    let q = store::Query {
+        start: Some("2026-03-27".into()),
+        end: Some("2026-04-01".into()),
+        timezone: Some("Europe/Amsterdam".into()),
+        ..Default::default()
+    };
+    let summary = store.query(q).await.unwrap();
+    let day = summary["trend"].as_array().unwrap().iter().find(|d| d["source"] == "claude_code").unwrap();
+    assert_eq!(day["date"], "2026-03-30");
+    assert_eq!(day["unpriced"], 0, "{day}");
+    assert!(day["estimated_cost_nanos"].as_i64().unwrap() > 0);
+    store.shutdown().await.unwrap();
+}

@@ -13,8 +13,15 @@ Summary, observations and exports receive `start=YYYY-MM-DD`,
 Start is inclusive local midnight; end is exclusive local midnight. Today, 7 days
 and 30 days include today. The custom UI accepts an inclusive “Through” date
 and advances it by a calendar day, without adding a fixed 24-hour duration.
-Optional `provider`, `model` (actual model), `account`, `client`, `source`
-filters use stable server values. The `client` facet includes named client IDs and server-bound `collector:<id>` origins. Every read/action is authenticated.
+Optional `provider`, `model` (actual model), `account`, `client` filters use
+stable server values. `source` is still accepted by the API but the UI no longer
+offers it. The `client` facet includes named client IDs and server-bound
+`collector:<id>` origins. Every read/action is authenticated.
+
+Summary also accepts `stack=provider|model` (default `provider`), which sets the
+grouping of `combined.trend`. Observations and exports accept
+`view=combined|raw`; a missing `view` means `raw`. Any other value of `stack`
+or `view` is a 400.
 
 ## GET /api/usage/summary
 
@@ -41,13 +48,58 @@ filters use stable server values. The `client` facet includes named client IDs a
     "clients":[{"id":"stable-client-or-collector-id","label":"Work laptop"}],
     "sources":["proxy","claude_code","codex"]
   },
-  "pricing":{"version":"local-catalogue-v1","basis":"Published API rates"}
+  "pricing":{"version":"local-catalogue-v1","basis":"Published API rates"},
+  "combined": {
+    "basis":"One entry per provider response. Imported entries that share a response ID with a proxy entry are excluded.",
+    "totals":{"observations":1286,"estimated_cost_nanos":98123000000,"unpriced":3,"partial":0,
+              "missing_usage":0,"tokens":{"input":1000,"output":200,"...":0},
+              "history_only":1234,"matched":870,"weak_identity":12},
+    "proxy_first_event_at_ms":1789344000000,
+    "stack":"provider",
+    "trend":[{"date":"2026-10-01","group":"anthropic","observations":412,
+              "estimated_cost_nanos":98123000000,"unpriced":3,"partial":0,"tokens":{}}],
+    "breakdowns":{
+      "provider":[{"id":"anthropic","provider":"anthropic","accounts":2,"observations":412,"estimated_cost_nanos":98123000000}],
+      "model":[], "account":[], "client":[]
+    }
+  }
 }
 ```
 
 Proxy requests and attempts are separate. Source entries may also contain
-`tokens` with the same schema. Imported observations and their estimated costs
-are displayed separately; the UI never sums a grand total across sources.
+`tokens` with the same schema. The per-source `proxy`, `sources`, `trend` and
+`breakdowns` fields remain for older clients and may overlap.
+
+`combined` is the main number on the page. It counts the accounting entries in
+the range and filters, then drops every imported entry whose provider response
+ID also has a proxy entry. That check is not limited to the range, so a proxy
+call and its imported copy on opposite sides of midnight count once; the proxy
+entry wins. `totals`, each `trend` row and each breakdown row share the
+aggregate shape of the source totals (`observations`, `estimated_cost_nanos`,
+`known_cost_nanos`, `unpriced`, `partial`, `missing_usage`, `pricing_partial`,
+`tokens`, `missing_token_counts`, `aggregation_overflow`, ...).
+
+- `totals.history_only`: imported entries in the combined set.
+- `totals.matched`: imported entries in range that were dropped because a proxy
+  entry has the same response ID.
+- `totals.weak_identity`: imported entries in the combined set without a
+  response ID. They can never be matched, so they may still duplicate proxy
+  traffic; the UI shows this count.
+- `proxy_first_event_at_ms`: earliest proxy observation regardless of range or
+  filters, or null. Days before it predate the proxy.
+- `trend`: one row per local date (in `timezone`, DST-aware) and group, sorted
+  by date then group. `group` is the provider or the actual model per `stack`;
+  it can be null for an unknown model. Every group is returned; the UI keeps the
+  top five and merges the rest into "Other".
+- `breakdowns`: provider, model, account and client over the combined set, with
+  no split by source. Each row adds `id` (may be null), `accounts` (distinct
+  known accounts) and `provider` (lowest provider id in the group, for
+  sub-lines). Client ids include `collector:<id>` origins. At most 500 rows per
+  dimension, ordered by estimated cost, then observations, then id.
+
+Usage older than the pricing catalogue is priced at today's rates; its
+`pricing_snapshot.backdated` is true and the UI labels it a current-rate
+equivalent, not what was paid at the time.
 Missing/unknown quality counters render as Unknown. An absent/null estimate
 renders Unpriced; a literal zero renders $0.00. All server strings are escaped.
 Facets should represent the complete selectable filter domain for the range,
@@ -74,7 +126,18 @@ The server must use stable ordering and apply filters identically to summary.
 ```
 
 Optional labels may be null. `origin_id` is `local` or `collector:<server-id>`; a
-collector label takes precedence for presentation. `completeness` is
+collector label takes precedence for presentation.
+
+With `view=combined`, rows come from the combined set described above, ordered
+by `event_at_ms` then id (both descending), and `total` is the combined count.
+Each item has the raw fields plus:
+
+- `matched_sources`: on proxy rows, the sorted imported sources that have the
+  same response ID, for example `["claude_code"]`; `[]` otherwise.
+- `origin_label`: on imported rows, the collector label, or `"This server"` for
+  `origin_id = "local"`; null on proxy rows and for an unknown collector.
+
+`superseded` is normally false in the combined view. `completeness` is
 `complete`, `partial` or `missing`; completion `state` remains independently
 visible. Input is non-cache input; cache reads and writes are separate. Write
 5m/1h are subsets of cache_write. Reasoning is a subset of output. None of
@@ -114,7 +177,8 @@ No quota reset, credit purchase, or retention deletion controls are included.
 
 ## GET /api/usage/export
 
-Adds `format=csv|json&limit=50&offset=<current page>` to the same query.
+Adds `format=csv|json&limit=50&offset=<current page>` to the same query,
+including `view=combined|raw`.
 The response is downloadable metadata for the same page/filter/range, with
 correct content type. Every button and success message explicitly says “this
 page”; this is not a full-dataset export. Server CSV must neutralize formula

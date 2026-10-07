@@ -59,7 +59,7 @@ Confidence boundary: official SDK proves envelope and API docs prove `message.us
 
 ## Pricing and provenance
 
-**Current verification date is not rate effective date.** The fetched current tables mostly do not state historical effective dates. Store `verified_at=2026-10-07`, `effective_from=null` (or explicitly labeled assumed current estimate), source URL, currency USD, unit 1M tokens, model/tier/context/region, and rate-card version. Do not backdate new current prices over historical imports and claim historical actual spend. Unknown models/tiers/categories should remain unpriced, not $0. Local USD estimates are not subscription-plan charges, invoices, or provider truth.
+**Current verification date is not rate effective date.** The fetched current tables mostly do not state historical effective dates. Store `verified_at=2026-10-07`, `effective_from=null` (or explicitly labeled assumed current estimate), source URL, currency USD, unit 1M tokens, model/tier/context/region, and rate-card version. Do not backdate new current prices over historical imports and claim historical actual spend. (Fusebox prices such older usage only as a labelled current-rate equivalent with `backdated: true`; see [usage-costs.md](usage-costs.md).) Unknown models/tiers/categories should remain unpriced, not $0. Local USD estimates are not subscription-plan charges, invoices, or provider truth.
 
 ### OpenAI official current API pricing
 
