@@ -22,7 +22,7 @@ base64 = "0.22"
 bcrypt = "0.19"
 bytes = "1"
 chrono-tz = "0.10"
-rusqlite = { version = "0.37", features = ["bundled", "backup", "functions"] }
+rusqlite = { version = "0.37", features = ["bundled", "backup", "functions", "hooks"] }
 chrono = { version = "0.4", default-features = false, features = ["clock", "std", "serde"] }
 clap = { version = "4", features = ["derive", "env"] }
 flate2 = "1"

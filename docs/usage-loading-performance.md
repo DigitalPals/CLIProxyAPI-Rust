@@ -29,9 +29,9 @@ conditions add to visible page loading time. The next records page took
   Paging requests only records. Provider/model chart switches use both groupings
   returned in the same snapshot. New filters clear prior results and reject late
   responses from earlier requests.
-- The existing full summary endpoint retains source reconciliation and logical
-  request/attempt diagnostics for API clients. These expensive sections are not
-  requested by the dashboard.
+- At this deployment, the full summary endpoint still retained source reconciliation
+  and logical request/attempt diagnostics for API clients. The subsequent retirement
+  described below removes that computation from production builds.
 - There is no TTL result cache, price recalculation on reads or background estimate.
   Costs remain exact integer nanounits; missing values remain unknown. Overflows
   remain explicit null totals with overflow evidence. Reasoning and TTL subsets are
@@ -94,3 +94,27 @@ access and every deployed UI asset were verified after commit.
 Evidence: [sanitized production receipt](usage-loading-production.json),
 [API contract](usage-ui-contract.md), and private deployment/benchmark artifacts
 under `target/usage-speed-20261007/` and the matching production incoming directory.
+
+## Subsequent summary retirement
+
+The current source retires `/api/usage/summary` with a management-authenticated
+`410 Gone` response pointing to `/api/usage/dashboard`. The retired handler opens
+no database connection and occupies no read slot. The full SQL implementation is
+compiled only for independent accounting and lifecycle regression tests; it is
+absent from production builds. Native ingestion, saved observations, prices,
+deduplication, and ledger schema are unchanged by this retirement.
+
+The acceptance script now checks combined dashboard totals, raw-record evidence,
+management authentication, and the explicit retirement response. The synthetic
+benchmark measures `/api/usage/dashboard` and reports `dashboard_query` timings;
+older `summary_query` receipts remain historical evidence. Neither script relies
+on a successful response from the retired endpoint. Preserved one-off deployment
+helpers under `target/usage-speed-20261007` describe the earlier rollout and must
+not be reused unchanged for new deployments: their old/new equivalence or before
+snapshot calls use the retired API. New deployments compare the current dashboard
+with a retained baseline or the test-only reference.
+
+Removing the old endpoint prevents expensive legacy requests; it does not by
+itself accelerate the dashboard, which already uses the focused endpoint. The
+production timing table above describes the earlier dashboard rollout, not a new
+measurement of endpoint retirement.

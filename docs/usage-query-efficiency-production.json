@@ -1,0 +1,204 @@
+{
+  "verified_at": "2026-10-07T12:35:17.292943+00:00",
+  "version": "0.3.2+gui.c96b49fe73ba",
+  "rollback_version": "0.3.2+gui.3697a4b98262",
+  "source_commit": "84d1b5f510651227f7e4964d0ee625f0ed4bf059+working-tree",
+  "source_sha256": "c96b49fe73bafd9397b4f5a07f1ee0747c15b57cc2238d5aa8160ed23a9e8b4a",
+  "binary_sha256": "43d7cd0f3f78ef0ecbddf49c902fff34676c1c4b41ec2fcc6f0f8eb41cc18423",
+  "archive_sha256": "3aca12fc3ab9c519b3ce450c8903b24681f4e298f89cc43f4fd16b6575e6e2cb",
+  "validation": {
+    "rust_tests": 342,
+    "ui_tests": 36,
+    "python_tests": 30,
+    "collector_acceptance_checks_debug": 12,
+    "collector_acceptance_checks_release": 12,
+    "formatting": true,
+    "clippy_warnings_denied": true,
+    "benchmark_script_imported_records": 1000,
+    "rollout_wrapper_tests": 10
+  },
+  "isolated_production_copy": {
+    "observations": 196964,
+    "all_nine_complete_responses_match": true,
+    "all_four_ledger_tables_exact": true,
+    "startup_including_index_upgrade_ms": 1217.439,
+    "added_bytes": 29118464,
+    "storage_growth_percent": 2.177,
+    "collector_outboxes_keep_compact_index": true,
+    "no_measurable_write_regression": true,
+    "cases": [
+      {
+        "case": "1days",
+        "median_ms": 6.257,
+        "observations": 4248
+      },
+      {
+        "case": "7days",
+        "median_ms": 34.81,
+        "observations": 29030
+      },
+      {
+        "case": "30days",
+        "median_ms": 234.468,
+        "observations": 196964
+      },
+      {
+        "case": "provider",
+        "median_ms": 177.855,
+        "observations": 107043
+      },
+      {
+        "case": "model",
+        "median_ms": 153.75,
+        "observations": 80650
+      },
+      {
+        "case": "account",
+        "median_ms": 134.573,
+        "observations": 46693
+      },
+      {
+        "case": "source",
+        "median_ms": 233.161,
+        "observations": 196964
+      },
+      {
+        "case": "absent_account",
+        "median_ms": 129.833,
+        "observations": 0
+      },
+      {
+        "case": "empty",
+        "median_ms": 0.607,
+        "observations": 0
+      }
+    ]
+  },
+  "allocation_comparison": {
+    "complete_measured_responses_equal": 270,
+    "all_responses_exact": true,
+    "seven_days": {
+      "case": "7days",
+      "observations": 29030,
+      "median_ms": {
+        "before": 36.384,
+        "after": 35.126
+      },
+      "improvement_percent": 3.46,
+      "paired_win_count": 14,
+      "paired_median_improvement_percent": 3.94,
+      "paired_bootstrap_median_ratio_95pct_interval": [
+        2.21,
+        6.59
+      ]
+    },
+    "larger_ranges": "Request-order variation; no precise allocation-only larger-range speedup claimed"
+  },
+  "browser": {
+    "browser_passed": true,
+    "exact_candidate_assets_verified": true,
+    "full_refresh_cancels_obsolete_reads": true,
+    "filter_changes_cancel_obsolete_reads": true,
+    "records_paging_cancels_only_obsolete_records": true,
+    "pending_dashboard_survives_paging": true,
+    "route_exit_cancels_reads": true,
+    "route_reentry_loads_cleanly": true,
+    "independent_section_rendering": true,
+    "chart_toggle_no_fetch": true,
+    "cancellation_errors_hidden": true,
+    "native_fetch_cancellations": 10,
+    "server_observed_cancelled_reads": 10,
+    "runtime_exceptions": 0
+  },
+  "production": {
+    "outcome": "deployed",
+    "transaction": "b02fd0c301e34313a0bd7db7db5539c4",
+    "gate_released": true,
+    "gate_unchanged": true,
+    "usage_backup_sha256": "acae59c6c5f0e5d55ad54019356c8556bbdc5b3b6194ae3eedfde503f6990f24",
+    "usage_backup_bytes": 1355105152,
+    "accounts": 5,
+    "config_and_routing_verified": true,
+    "sessions": {
+      "current_assignments": 62,
+      "expired_assignments": 0,
+      "preserved_assignments": 62,
+      "snapshot_assignments": 62
+    },
+    "legacy_summary_retired": true,
+    "forced_restart": true,
+    "active_requests_at_stop": 4,
+    "data_preservation": {
+      "all_previous_observations_byte_for_byte": true,
+      "application_id": 1179996997,
+      "closed_range_display_fields_exact": true,
+      "exact_accounting_reference": "isolated frozen-journal comparison of retained and candidate binaries",
+      "health": {
+        "accepted": 20,
+        "dropped": 0,
+        "prior_unclosed_sessions": 0,
+        "rejected": 0,
+        "state": "healthy",
+        "writer_errors": 0,
+        "written": 20
+      },
+      "high_id": 197547,
+      "new_observations_during_verification": 132,
+      "observation_sha256": "fcf5716117059fb90d01e1410b4b8b26285ca81fe1963f854109214440dad026",
+      "observations": 197547,
+      "priced": 196916,
+      "schema_version": 3,
+      "total_observations": 197679
+    },
+    "public_tls_verified": true,
+    "public_assets_verified": true,
+    "management_auth_verified": true,
+    "dashboard": [
+      {
+        "first_ms": 9.6,
+        "max_ms": 9.8,
+        "median_ms": 8.5,
+        "observations": 4965,
+        "range": "today",
+        "samples": 8
+      },
+      {
+        "first_ms": 44.7,
+        "max_ms": 44.7,
+        "median_ms": 37.15,
+        "observations": 29747,
+        "range": "7days",
+        "samples": 8
+      },
+      {
+        "first_ms": 357.7,
+        "max_ms": 357.7,
+        "median_ms": 311.55,
+        "observations": 197681,
+        "range": "30days",
+        "samples": 8
+      }
+    ],
+    "records_page_ms": 21.4,
+    "native_health": {
+      "accepted": 22,
+      "dropped": 0,
+      "prior_unclosed_sessions": 0,
+      "rejected": 0,
+      "state": "healthy",
+      "writer_errors": 0,
+      "written": 22
+    },
+    "completed_requests_at_postflight": 22,
+    "request_outcomes_at_postflight": {
+      "cancelled": 3,
+      "success": 19
+    },
+    "billing_validation_calls": 0
+  },
+  "development": {
+    "service": "fusebox-reset-countdown-dev.service",
+    "healthy": true,
+    "rebuilt_and_restarted": true
+  }
+}

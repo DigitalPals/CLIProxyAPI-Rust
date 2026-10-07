@@ -18,7 +18,7 @@ use std::sync::Arc;
 
 pub fn router() -> Router<Arc<App>> {
     Router::new()
-        .route("/usage/summary", get(summary))
+        .route("/usage/summary", get(retired_summary))
         .route("/usage/dashboard", get(dashboard))
         .route("/usage/observations", get(observations))
         .route("/usage/status", get(status))
@@ -42,10 +42,21 @@ fn error(status: StatusCode, message: &str) -> Response {
 fn result(value: anyhow::Result<Value>) -> Response {
     match value {
         Ok(v) => Json(v).into_response(),
-        Err(_) => error(
-            StatusCode::BAD_REQUEST,
-            "Usage operation failed; check the range, settings, permissions and storage health",
-        ),
+        Err(cause) => match cause.downcast_ref::<super::store::ReadError>() {
+            Some(super::store::ReadError::QueueTimeout) => {
+                error(StatusCode::SERVICE_UNAVAILABLE, "Usage analytics is busy; retry shortly")
+            }
+            Some(super::store::ReadError::ExecutionTimeout) => {
+                error(StatusCode::GATEWAY_TIMEOUT, "Usage query timed out; narrow the date range or filters")
+            }
+            Some(super::store::ReadError::Cancelled) => {
+                error(StatusCode::from_u16(499).unwrap(), "Usage query cancelled")
+            }
+            None => error(
+                StatusCode::BAD_REQUEST,
+                "Usage operation failed; check the range, settings, permissions and storage health",
+            ),
+        },
     }
 }
 fn labels(app: &App, v: &mut Value) {
@@ -76,18 +87,18 @@ fn labels(app: &App, v: &mut Value) {
         }
     }
 }
-async fn summary(State(app): State<Arc<App>>, Query(q): Query<UsageQuery>) -> Response {
-    let s = match store(&app) {
-        Ok(s) => s,
-        Err(r) => return *r,
-    };
-    match s.query(q).await {
-        Ok(mut v) => {
-            labels(&app, &mut v);
-            Json(v).into_response()
-        }
-        Err(e) => result(Err(e)),
-    }
+async fn retired_summary() -> Response {
+    // Preserve management authentication, but never open the ledger or reserve a
+    // read slot for this retired endpoint. The replacement has a different shape.
+    (
+        StatusCode::GONE,
+        Json(json!({
+            "error":"Usage summary retired; use /api/usage/dashboard for combined accounting metrics",
+            "code":"usage_summary_retired",
+            "replacement":"/api/usage/dashboard"
+        })),
+    )
+        .into_response()
 }
 async fn dashboard(State(app): State<Arc<App>>, Query(q): Query<UsageQuery>) -> Response {
     let s = match store(&app) {
@@ -294,5 +305,19 @@ mod tests {
         assert_eq!(csv_cell(&json!("  =cmd()")), "\"'  =cmd()\"");
         assert_eq!(csv_cell(&json!("a\"b")), "\"a\"\"b\"");
         assert_eq!(csv_cell(&Value::Null), "\"\"");
+    }
+
+    #[tokio::test]
+    async fn bounded_read_errors_keep_status_and_hide_private_context() {
+        use super::super::store::ReadError;
+        for (cause, status) in
+            [(ReadError::QueueTimeout, 503), (ReadError::ExecutionTimeout, 504), (ReadError::Cancelled, 499)]
+        {
+            let response = result(Err(anyhow::Error::new(cause).context("PRIVATE database path and request details")));
+            assert_eq!(response.status().as_u16(), status);
+            let bytes = axum::body::to_bytes(response.into_body(), 4096).await.unwrap();
+            let body: Value = serde_json::from_slice(&bytes).unwrap();
+            assert!(body["error"].as_str().is_some_and(|message| !message.contains("PRIVATE")));
+        }
     }
 }

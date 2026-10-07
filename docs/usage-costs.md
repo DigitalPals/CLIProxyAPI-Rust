@@ -52,7 +52,7 @@ named-clients:
 
 Named clients add stable attribution to an inference credential. They are additive to `api-keys` and are not a machine identity mechanism: anyone who has the key can use that client identity. Keep them private and rotate them if shared. Client keys are compared as credentials and only their derived scope is used for attribution; old API-key behavior is unchanged.
 
-With a running server, use **Usage** in the dashboard to inspect totals, source coverage, health, imports, collectors, and the pricing assumptions. `/api/usage/summary`, `/api/usage/observations`, `/api/usage/status`, and `/api/usage/export` use the dashboard's management authentication. The Usage page's export button exports only the currently displayed page and filters. Use a local database backup for a complete archive.
+With a running server, use **Usage** in the dashboard to inspect totals, source coverage, health, imports, collectors, and the pricing assumptions. `/api/usage/dashboard`, `/api/usage/observations`, `/api/usage/status`, and `/api/usage/export` use the dashboard's management authentication. The Usage page's export button exports only the currently displayed page and filters. Use a local database backup for a complete archive. The former `/api/usage/summary` endpoint returns a management-authenticated `410 Gone`; migrate to the dashboard contract rather than expecting its former per-source or request/attempt aggregate fields.
 
 ## Import Claude Code and Codex history
 
@@ -182,7 +182,7 @@ If the database is damaged, stop the service, preserve the damaged file and its 
 
 ## HTTP API and export
 
-The read API is under `/api/usage` and uses the existing dashboard management authentication. The collector posts to `/api/usage-ingest` with its separate collector bearer token. Summary, observations, and export accept date range, IANA timezone, and provider/model/account/client/source filters; the displayed end date is inclusive while the API's end boundary is the next local calendar midnight. Pagination is bounded. JSON and CSV exports contain real identifiers and labels and should be handled like the database. CSV formula-like values are escaped.
+The read API is under `/api/usage` and uses the existing dashboard management authentication. The collector posts to `/api/usage-ingest` with its separate collector bearer token. Dashboard, observations, and export accept date range, IANA timezone, and provider/model/account/client/source filters; the displayed end date is inclusive while the API's end boundary is the next local calendar midnight. Pagination is bounded. JSON and CSV exports contain real identifiers and labels and should be handled like the database. CSV formula-like values are escaped.
 
 See [`usage-ui-contract.md`](usage-ui-contract.md) for the response and dashboard contract, and [`usage-provenance.md`](usage-provenance.md) for the native-format field references, pricing source links, and parser confidence boundaries.
 

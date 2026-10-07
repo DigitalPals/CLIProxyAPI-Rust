@@ -96,7 +96,7 @@ async fn persists_more_than_ring_after_restart() {
         assert_eq!(store.details(all()).await.unwrap()["total"], 601);
     }
     let store = Store::open(&p, 1024, 90, None).unwrap();
-    let value = store.query(all()).await.unwrap();
+    let value = store.reference_summary(all()).await.unwrap();
     assert_eq!(value["proxy"]["observations"], 601);
 }
 #[tokio::test]
@@ -114,7 +114,7 @@ async fn reconcile_priority_order_and_equal_tokens_distinct() {
         let distinct = event("proxy", "distinct");
         let v = if reverse { vec![untrusted, trusted, distinct] } else { vec![trusted, untrusted, distinct] };
         store.call(move |c| insert_batch(c, &v)).await.unwrap();
-        let summary = store.query(all()).await.unwrap();
+        let summary = store.reference_summary(all()).await.unwrap();
         assert_eq!(summary["proxy"]["observations"], 2);
         assert_eq!(summary["proxy"]["tokens"]["output"], 200);
         assert_eq!(summary["proxy"]["conflicts"], 1);
@@ -143,7 +143,7 @@ async fn copy_revision_purge_and_atomic_checkpoint() {
         })
         .await
         .unwrap();
-    let summary = store.query(all()).await.unwrap();
+    let summary = store.reference_summary(all()).await.unwrap();
     assert_eq!(summary["sources"][1]["observations"], 1);
     assert_eq!(summary["sources"][1]["source_record_count"], 3);
     assert_eq!(summary["sources"][1]["tokens"]["output"], 200);
@@ -188,7 +188,7 @@ async fn bounds_and_dst() {
     assert!(!store.enqueue(o));
     assert_eq!(store.health()["rejected"], 1);
     assert_eq!(store.health()["state"], "degraded");
-    assert!(store.query(Query { timezone: Some("Nope".into()), ..Default::default() }).await.is_err());
+    assert!(store.reference_summary(Query { timezone: Some("Nope".into()), ..Default::default() }).await.is_err());
     let q = Query {
         start: Some("2026-03-29".into()),
         end: Some("2026-03-30".into()),
@@ -276,7 +276,7 @@ async fn durable_transaction_rollback_and_request_id_namespace() {
     let mut local = event("codex", "l");
     local.provider_request_id = Some("same-text".into());
     store.call(move |c| insert_batch(c, &[proxy, local])).await.unwrap();
-    assert_eq!(store.query(all()).await.unwrap()["proxy"]["conflicts"], 0);
+    assert_eq!(store.reference_summary(all()).await.unwrap()["proxy"]["conflicts"], 0);
 }
 #[test]
 fn overflow_missing_unsupported_regions_tools_and_catalogue_validation() {
@@ -356,7 +356,7 @@ async fn generated_history_measurement() {
     let ingest = start.elapsed();
     store.flush().await.unwrap();
     let start = std::time::Instant::now();
-    let summary = store.query(Query::default()).await.unwrap();
+    let summary = store.reference_summary(Query::default()).await.unwrap();
     let query = start.elapsed();
     let start = std::time::Instant::now();
     let dashboard = store.dashboard(Query::default()).await.unwrap();
@@ -369,14 +369,18 @@ async fn generated_history_measurement() {
     );
     let start = std::time::Instant::now();
     let empty = store
-        .query(Query { start: Some("2026-01-01".into()), end: Some("2026-01-02".into()), ..Default::default() })
+        .reference_summary(Query {
+            start: Some("2026-01-01".into()),
+            end: Some("2026-01-02".into()),
+            ..Default::default()
+        })
         .await
         .unwrap();
     assert_eq!(empty["proxy"]["observations"], 0);
     let empty_query = start.elapsed();
     let start = std::time::Instant::now();
     let narrow = store
-        .query(Query {
+        .reference_summary(Query {
             start: Some(DateTime::from_timestamp_millis(base_ms - 1000).unwrap().to_rfc3339()),
             end: Some(DateTime::from_timestamp_millis(base_ms + 1).unwrap().to_rfc3339()),
             ..Default::default()
@@ -429,12 +433,12 @@ async fn admin_preserves_settings_and_suppression_is_origin_scoped() {
         })
         .await
         .unwrap();
-    assert_eq!(store.query(all()).await.unwrap()["sources"][2]["observations"], 1);
+    assert_eq!(store.reference_summary(all()).await.unwrap()["sources"][2]["observations"], 1);
     store
         .call(|c| suppress_source_event(c, "codex", "counter:stable", "all native fallback superseded"))
         .await
         .unwrap();
-    assert_eq!(store.query(all()).await.unwrap()["sources"][2]["observations"], 0);
+    assert_eq!(store.reference_summary(all()).await.unwrap()["sources"][2]["observations"], 0);
     assert_eq!(store.details(all()).await.unwrap()["total"], 2);
     let admin = Store::open_existing(&p, 8).unwrap();
     assert_eq!(
@@ -450,7 +454,7 @@ async fn admin_preserves_settings_and_suppression_is_origin_scoped() {
 #[tokio::test]
 async fn bad_queries_and_reads_never_corrupt_writer_health() {
     let store = Store::open(&path("health"), 8, 90, None).unwrap();
-    assert!(store.query(Query { timezone: Some("Invalid".into()), ..Default::default() }).await.is_err());
+    assert!(store.reference_summary(Query { timezone: Some("Invalid".into()), ..Default::default() }).await.is_err());
     assert!(
         store
             .call(|c| Ok(
@@ -465,7 +469,7 @@ async fn bad_queries_and_reads_never_corrupt_writer_health() {
     store.flush().await.unwrap();
     let before = store.health()["last_commit_at_ms"].clone();
     tokio::time::sleep(std::time::Duration::from_millis(3)).await;
-    store.query(Query::default()).await.unwrap();
+    store.reference_summary(Query::default()).await.unwrap();
     store.call(|_| Ok(())).await.unwrap();
     assert_eq!(store.health()["last_commit_at_ms"], before);
 }
@@ -479,7 +483,7 @@ async fn distinct_known_accounts_never_collapse_shared_response_claim() {
     b.source_event_id = "b".into();
     b.account_id = Some("account-b".into());
     store.call(move |c| insert_batch(c, &[a, b])).await.unwrap();
-    let value = store.query(all()).await.unwrap();
+    let value = store.reference_summary(all()).await.unwrap();
     assert_eq!(value["proxy"]["observations"], 2);
     assert_eq!(value["proxy"]["conflicts"], 2);
 }
@@ -496,7 +500,7 @@ async fn logical_requests_and_attempts_are_independent_of_replayed_charges() {
     b.logical_request_id = Some("logical-two".into());
     b.attempt_id = Some("attempt-two".into());
     store.call(move |c| insert_batch(c, &[a, b])).await.unwrap();
-    let value = store.query(all()).await.unwrap();
+    let value = store.reference_summary(all()).await.unwrap();
     assert_eq!(value["proxy"]["observations"], 1);
     assert_eq!(value["proxy"]["tokens"]["input"], 1000);
     assert_eq!(value["proxy"]["logical_requests"], 2);
@@ -513,7 +517,7 @@ async fn logical_requests_and_attempts_are_independent_of_replayed_charges() {
     b.response_id = Some("retry-response-two".into());
     b.attempt_id = Some("retry-attempt-two".into());
     store.call(move |c| insert_batch(c, &[a, b])).await.unwrap();
-    let value = store.query(all()).await.unwrap();
+    let value = store.reference_summary(all()).await.unwrap();
     assert_eq!(value["proxy"]["observations"], 3);
     assert_eq!(value["proxy"]["logical_requests"], 3);
     assert_eq!(value["proxy"]["attempts"], 4);
@@ -536,20 +540,20 @@ async fn replay_lifecycle_counts_respect_raw_date_and_client_filters() {
     b.client_id = Some("client-two".into());
     b.event_at_ms = boundary("2026-10-06T10:00:00Z", chrono_tz::UTC).unwrap();
     store.call(move |c| insert_batch(c, &[a, b])).await.unwrap();
-    let value = store.query(all()).await.unwrap();
+    let value = store.reference_summary(all()).await.unwrap();
     assert_eq!(value["trend"].as_array().unwrap().len(), 2);
     for day in value["trend"].as_array().unwrap() {
         assert_eq!(day["logical_requests"], 1);
         assert_eq!(day["attempts"], 1);
     }
-    let value = store.query(Query { client: Some("client-two".into()), ..all() }).await.unwrap();
+    let value = store.reference_summary(Query { client: Some("client-two".into()), ..all() }).await.unwrap();
     assert_eq!(value["proxy"]["logical_requests"], 1);
     assert_eq!(value["proxy"]["attempts"], 1);
     let mut unknown = event("proxy", "unknown");
     unknown.logical_request_id = None;
     unknown.attempt_id = None;
     store.call(move |c| insert_batch(c, &[unknown.clone(), unknown])).await.unwrap();
-    let value = store.query(all()).await.unwrap();
+    let value = store.reference_summary(all()).await.unwrap();
     assert_eq!(value["proxy"]["logical_requests_unknown"], 1);
     assert_eq!(value["proxy"]["attempts_unknown"], 1);
     assert_eq!(value["proxy"]["attempts"], 2);
@@ -613,7 +617,7 @@ async fn large_exact_integer_cost_overflow_returns_explicit_null() {
         })
         .collect::<Vec<_>>();
     store.call(move |c| insert_batch(c, &records)).await.unwrap();
-    let value = store.query(all()).await.unwrap();
+    let value = store.reference_summary(all()).await.unwrap();
     let source = &value["sources"][2];
     assert_eq!(source["observations"], 200);
     assert_eq!(source["unpriced"], 0);
@@ -647,7 +651,7 @@ fn dashboard_metrics(value: &mut Value) {
     }
 }
 async fn assert_dashboard_matches(store: &Store, q: Query) {
-    let mut full = store.query(q.clone()).await.unwrap();
+    let mut full = store.reference_summary(q.clone()).await.unwrap();
     let mut fast = store.dashboard(q).await.unwrap();
     dashboard_metrics(&mut full);
     dashboard_metrics(&mut fast);
@@ -850,7 +854,7 @@ async fn sqlite_full_rolls_back_records_and_exposes_proxy_loss() {
         .find_map(|cause| cause.downcast_ref::<rusqlite::Error>().and_then(rusqlite::Error::sqlite_error_code));
     assert_eq!(code, Some(rusqlite::ErrorCode::DiskFull));
     assert_eq!(store.details(all()).await.unwrap()["total"], 0);
-    assert_eq!(store.query(all()).await.unwrap()["proxy"]["observations"], 0);
+    assert_eq!(store.reference_summary(all()).await.unwrap()["proxy"]["observations"], 0);
     assert!(store.enqueue(oversized("failed-proxy")));
     // A custom call is a queue barrier even though the earlier full-disk gap makes
     // flush return an error. All three accounting tables must remain unchanged.
@@ -891,12 +895,12 @@ async fn collector_filter_retains_raw_evidence_when_local_copy_wins_accounting()
     let mut collector_y = local.clone();
     collector_y.origin_id = "collector:Y".into();
     store.call(move |conn| insert_batch(conn, &[collector_x, collector_y, local])).await.unwrap();
-    let complete = store.query(all()).await.unwrap();
+    let complete = store.reference_summary(all()).await.unwrap();
     let source = complete["sources"].as_array().unwrap().iter().find(|entry| entry["source"] == "claude_code").unwrap();
     assert_eq!(source["observations"], 1);
     assert_eq!(source["source_record_count"], 3);
     let query = Query { client: Some("collector:X".into()), ..all() };
-    let summary = store.query(query.clone()).await.unwrap();
+    let summary = store.reference_summary(query.clone()).await.unwrap();
     let source = summary["sources"].as_array().unwrap().iter().find(|entry| entry["source"] == "claude_code").unwrap();
     assert_eq!(source["observations"], 0);
     assert_eq!(source["source_record_count"], 1);
@@ -941,7 +945,7 @@ async fn combined_set_counts_shared_response_once_and_proxy_wins() {
         .unwrap();
     assert_eq!(copies, 2);
     let range = |start: &str, end: &str| query(json!({"start":start,"end":end,"timezone":"UTC"}));
-    let summary = store.query(range("2026-10-01", "2026-10-03")).await.unwrap();
+    let summary = store.reference_summary(range("2026-10-01", "2026-10-03")).await.unwrap();
     let combined = &summary["combined"];
     assert_eq!(combined["totals"]["observations"], 4, "{combined}");
     assert_eq!(combined["totals"]["history_only"], 2);
@@ -957,12 +961,12 @@ async fn combined_set_counts_shared_response_once_and_proxy_wins() {
     let first = combined["proxy_first_event_at_ms"].as_i64().unwrap();
     assert_eq!(first, boundary("2026-10-01T10:00:00Z", chrono_tz::UTC).unwrap());
     // The imported copy after midnight is still matched to the proxy row before it.
-    let late = store.query(range("2026-10-02", "2026-10-03")).await.unwrap();
+    let late = store.reference_summary(range("2026-10-02", "2026-10-03")).await.unwrap();
     assert_eq!(late["combined"]["totals"]["observations"], 1);
     assert_eq!(late["combined"]["totals"]["matched"], 1);
     assert_eq!(late["combined"]["totals"]["history_only"], 1);
     assert_eq!(late["combined"]["proxy_first_event_at_ms"], json!(first));
-    let early = store.query(range("2026-10-01", "2026-10-02")).await.unwrap();
+    let early = store.reference_summary(range("2026-10-01", "2026-10-02")).await.unwrap();
     assert_eq!(early["combined"]["totals"]["observations"], 3);
     assert_eq!(early["combined"]["totals"]["matched"], 1);
     // Existing per-source fields remain for older clients.
@@ -998,7 +1002,7 @@ async fn combined_trend_groups_by_provider_and_model_across_dst() {
             })
             .collect::<Vec<_>>()
     };
-    let summary = store.query(query(base.clone())).await.unwrap();
+    let summary = store.reference_summary(query(base.clone())).await.unwrap();
     let expected = |a: &str, o: &str| {
         vec![
             ("2026-03-28".to_owned(), a.to_owned(), 1),
@@ -1009,12 +1013,12 @@ async fn combined_trend_groups_by_provider_and_model_across_dst() {
     assert_eq!(rows(&summary), expected("anthropic", "openai"));
     let mut by_model = base.clone();
     by_model["stack"] = json!("model");
-    let summary = store.query(query(by_model)).await.unwrap();
+    let summary = store.reference_summary(query(by_model)).await.unwrap();
     assert_eq!(summary["combined"]["stack"], "model");
     assert_eq!(rows(&summary), expected("claude-sonnet-4-6", "gpt-6.1-sol"));
     let mut bad = base;
     bad["stack"] = json!("source");
-    assert!(store.query(query(bad)).await.is_err());
+    assert!(store.reference_summary(query(bad)).await.is_err());
     store.shutdown().await.unwrap();
 }
 #[tokio::test]
@@ -1108,7 +1112,7 @@ async fn startup_reprice_prices_old_unpriced_rows_once_and_keeps_priced_rows() {
     let (unpriced, current_before, unpriced_entries) = snapshot(store.clone()).await;
     assert_eq!((unpriced, unpriced_entries), (2102, 2102));
     let q = || query(json!({"start":"2026-03-01","end":"2026-03-02","timezone":"UTC"}));
-    assert_eq!(store.query(q()).await.unwrap()["combined"]["totals"]["unpriced"], 2101);
+    assert_eq!(store.reference_summary(q()).await.unwrap()["combined"]["totals"]["unpriced"], 2101);
     store.shutdown().await.unwrap();
     drop(store);
     // The CLI path opens through the same startup step and reports its count.
@@ -1123,7 +1127,7 @@ async fn startup_reprice_prices_old_unpriced_rows_once_and_keeps_priced_rows() {
     // Codex cumulative counters keep their own unpriced basis.
     assert_eq!((unpriced, unpriced_entries), (0, 1));
     assert_eq!(current_before, current_after);
-    let summary = store.query(q()).await.unwrap();
+    let summary = store.reference_summary(q()).await.unwrap();
     let totals = &summary["combined"]["totals"];
     assert_eq!((totals["observations"].as_i64(), totals["unpriced"].as_i64()), (Some(2101), Some(1)));
     assert_eq!(totals["matched"], 1);
@@ -1171,7 +1175,7 @@ async fn startup_repairs_unpriced_claude_regions_and_preserves_priced_snapshots(
     store.shutdown().await.unwrap();
     let store = Store::open(&p, 8, 3650, None).unwrap();
     assert_eq!(store.startup_repriced(), 1);
-    assert_eq!(store.query(all()).await.unwrap()["proxy"]["unpriced"], 1);
+    assert_eq!(store.reference_summary(all()).await.unwrap()["proxy"]["unpriced"], 1);
     store
         .call(move |c| {
             let (cost, raw): (i64, String) = c.query_row(
@@ -1235,8 +1239,10 @@ async fn migrations_chain_to_v3_and_keep_existing_rows() {
         drop(c);
         let store = Store::open(&p, 8, 90, None).unwrap();
         assert_eq!(store.call(move |c| Ok(indexed(c)?)).await.unwrap(), (3, true, true));
-        let summary =
-            store.query(query(json!({"start":"2026-10-01","end":"2026-10-02","timezone":"UTC"}))).await.unwrap();
+        let summary = store
+            .reference_summary(query(json!({"start":"2026-10-01","end":"2026-10-02","timezone":"UTC"})))
+            .await
+            .unwrap();
         assert_eq!(summary["combined"]["totals"]["observations"], 1);
         assert_eq!(summary["combined"]["totals"]["matched"], 1);
         assert_eq!(store.details(all()).await.unwrap()["total"], 2);

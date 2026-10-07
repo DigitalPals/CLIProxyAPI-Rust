@@ -9,7 +9,7 @@ const source = fs.readFileSync(path.join(__dirname, '../ui/usage.js'), 'utf8');
 
 function dashboard(extra = {}) {
   const context = {
-    Intl, Date, URLSearchParams, setTimeout() {},
+    Intl, Date, URLSearchParams, AbortController, setTimeout() {},
     S: { private: false, key: 'management-test-secret', route: 'none', accounts: [] },
     metered: () => false, quotaControlsHTML: () => '', statusHTML: () => '', planName: () => '', authName: () => 'OAuth',
     acctLogo: () => '', metersHTML: () => '', provName: (a) => ({ claude: 'Claude', codex: 'Codex' })[a.provider] || a.provider,
@@ -22,6 +22,14 @@ function dashboard(extra = {}) {
     run(code) { return vm.runInContext(code, context); }, context,
     seed(data) { context.seed = data; vm.runInContext('Object.assign(Usage, seed)', context); },
   };
+}
+
+function pendingApi(ignoreAbort = false) {
+  const calls = [];
+  return { calls, api: (endpoint, { signal }) => new Promise((resolve, reject) => {
+    calls.push({ endpoint, signal, resolve, reject });
+    if (!ignoreAbort) signal.addEventListener('abort', () => reject(Object.assign(new Error('Read cancelled'), { name: 'AbortError' })), { once: true });
+  }) };
 }
 
 test('presets use local calendar dates and inclusive today across a year boundary', () => {
@@ -284,6 +292,128 @@ test('late responses from a superseded filter do not replace current results', a
   await oldLoad;
   assert.equal(d.run('Usage.summary.marker'), 'new-result');
   assert.equal(d.run('Usage.loading'), false);
+});
+
+test('full refresh and filter changes abort superseded reads without exposing cancellation errors', async () => {
+  const pending = pendingApi();
+  const d = dashboard({ api: pending.api });
+  const first = d.run('usageLoad()');
+  assert.equal(pending.calls.length, 3);
+  const refresh = d.run('usageLoad()');
+  assert.ok(pending.calls.slice(0, 3).every((call) => call.signal.aborted));
+  assert.ok(pending.calls.slice(3).every((call) => !call.signal.aborted));
+  await first;
+  assert.equal(d.run('Usage.loading'), true);
+  assert.equal(d.run('Usage.recordsLoading'), true);
+  assert.equal(d.run('Usage.error'), '');
+  d.run('Usage.filters.model = "new-model"; Usage.offset = 100');
+  const filtered = d.run('usageReload()');
+  assert.ok(pending.calls.slice(0, 6).every((call) => call.signal.aborted));
+  await refresh;
+  assert.equal(d.run('Usage.loading'), true);
+  assert.equal(d.run('Usage.error'), '');
+  assert.equal(d.run('Usage.offset'), 0);
+  const active = pending.calls.slice(6);
+  assert.equal(active.length, 3);
+  assert.ok(active.slice(0, 2).every((call) => call.endpoint.includes('model=new-model')));
+  active.forEach((call) => call.resolve({ marker: 'filtered', items: [], total: 0 }));
+  await filtered;
+  for (const field of ['summary', 'observations', 'status']) assert.equal(d.run(`Usage.${field}.marker`), 'filtered');
+  assert.equal(d.run('Usage.loading'), false);
+  assert.equal(d.run('Usage.recordsLoading'), false);
+  assert.equal(d.run('Usage.error'), '');
+  assert.equal(d.run('usageReads.size'), 0);
+});
+
+test('paging aborts only the superseded records read while independent sections finish', async () => {
+  const pending = pendingApi();
+  const d = dashboard({ api: pending.api });
+  const full = d.run('usageLoad()');
+  d.run('Usage.offset = 50');
+  const firstPage = d.run('usageLoadRecords()');
+  assert.equal(pending.calls.length, 4);
+  assert.equal(pending.calls[0].signal.aborted, false);
+  assert.equal(pending.calls[1].signal.aborted, true);
+  assert.equal(pending.calls[2].signal.aborted, false);
+  pending.calls[0].resolve({ marker: 'counts' });
+  pending.calls[2].resolve({ marker: 'status' });
+  await full;
+  assert.equal(d.run('Usage.summary.marker'), 'counts');
+  assert.equal(d.run('Usage.status.marker'), 'status');
+  assert.equal(d.run('Usage.loading'), false);
+  assert.equal(d.run('Usage.recordsLoading'), true);
+  d.run('Usage.offset = 100');
+  const secondPage = d.run('usageLoadRecords()');
+  assert.equal(pending.calls.length, 5);
+  assert.equal(pending.calls[3].signal.aborted, true);
+  assert.match(pending.calls[4].endpoint, /offset=100/);
+  await firstPage;
+  assert.equal(d.run('Usage.recordsLoading'), true);
+  assert.equal(d.run('Usage.error'), '');
+  pending.calls[4].resolve({ marker: 'latest-page', items: [], total: 101 });
+  await secondPage;
+  assert.equal(d.run('Usage.observations.marker'), 'latest-page');
+  assert.equal(d.run('Usage.summary.marker'), 'counts');
+  assert.equal(d.run('Usage.status.marker'), 'status');
+  assert.equal(d.run('Usage.recordsLoading'), false);
+});
+
+test('same-section replacement ignores late transport completion even within one load sequence', async () => {
+  const pending = pendingApi(true);
+  const d = dashboard({ api: pending.api });
+  const first = d.run('usageRead("summary", "/usage/dashboard?old", Usage.sequence)');
+  const next = d.run('usageRead("summary", "/usage/dashboard?new", Usage.sequence)');
+  assert.equal(pending.calls[0].signal.aborted, true);
+  assert.equal(pending.calls[1].signal.aborted, false);
+  pending.calls[0].resolve({ marker: 'stale' });
+  await first;
+  assert.equal(d.run('Usage.summary'), null);
+  assert.equal(d.run('usageReads.size'), 1);
+  pending.calls[1].resolve({ marker: 'latest' });
+  await next;
+  assert.equal(d.run('Usage.summary.marker'), 'latest');
+  assert.equal(d.run('usageReads.size'), 0);
+});
+
+test('route exit and pagehide cancel reads, and re-entry and restored pages resume cleanly', async () => {
+  const pending = pendingApi(true), listeners = new Map();
+  const d = dashboard({ api: pending.api,
+    document: { addEventListener() {}, body: { style: {} } }, setInterval() {},
+    addEventListener: (name, listener) => listeners.set(name, listener), location: { hash: '#/usage' },
+  });
+  d.run('usageRender = () => {}; S.route = "usage"');
+  const first = d.run('usageLoad()');
+  listeners.get('hashchange')();
+  assert.ok(pending.calls.every((call) => !call.signal.aborted));
+  d.context.location.hash = '#/accounts';
+  listeners.get('hashchange')();
+  assert.ok(pending.calls.every((call) => call.signal.aborted));
+  assert.equal(d.run('Usage.loading'), false);
+  assert.equal(d.run('Usage.recordsLoading'), false);
+  assert.equal(d.run('Usage.loaded'), false);
+  d.context.location.hash = '#/usage';
+  d.run('bindUsage()');
+  assert.equal(pending.calls.length, 6);
+  pending.calls.slice(0, 3).forEach((call) => call.resolve({ marker: 'stale-route' }));
+  await first;
+  assert.equal(d.run('Usage.summary'), null);
+  assert.equal(d.run('Usage.loading'), true);
+  listeners.get('pagehide')();
+  assert.ok(pending.calls.every((call) => call.signal.aborted));
+  listeners.get('pageshow')({ persisted: true });
+  assert.equal(pending.calls.length, 9);
+  pending.calls.slice(3, 6).forEach((call) => call.reject(new Error('late failure')));
+  await new Promise(setImmediate);
+  assert.equal(d.run('Usage.error'), '');
+  assert.equal(d.run('Usage.loading'), true);
+  pending.calls.slice(6).forEach((call) => call.resolve({ marker: 'restored', items: [], total: 0 }));
+  await new Promise(setImmediate);
+  assert.equal(d.run('Usage.summary.marker'), 'restored');
+  assert.equal(d.run('Usage.observations.marker'), 'restored');
+  assert.equal(d.run('Usage.loading'), false);
+  assert.equal(d.run('Usage.recordsLoading'), false);
+  assert.equal(d.run('Usage.error'), '');
+  assert.equal(d.run('usageReads.size'), 0);
 });
 
 test('a status failure preserves successful summary and observation reads with visible error', async () => {

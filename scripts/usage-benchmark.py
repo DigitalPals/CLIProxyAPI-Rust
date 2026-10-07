@@ -45,13 +45,13 @@ def main():
                     call(base,'/api/usage/imports',{'source':'claude_code','root':str(history),'enabled':True});started=time.perf_counter();scans=0
                     while scans<args.records//1000+10:
                         call(base,'/api/usage/imports/scan',{'source':'claude_code'});scans+=1
-                        summary=call(base,'/api/usage/summary');source=next((s for s in summary['sources'] if s['source']=='claude_code'),{})
+                        source=call(base,'/api/usage/dashboard?source=claude_code')['combined']['totals']
                         if source.get('observations')==args.records:break
                     assert source.get('observations')==args.records,source
                     results['import']={'seconds':time.perf_counter()-started,'scan_calls':scans,'observations':source['observations']}
                     lat=[]
-                    for _ in range(10):t=time.perf_counter();call(base,'/api/usage/summary');lat.append(1000*(time.perf_counter()-t))
-                    results['summary_query']={'samples':10,'median_ms':statistics.median(lat),'max_ms':max(lat)}
+                    for _ in range(10):t=time.perf_counter();call(base,'/api/usage/dashboard');lat.append(1000*(time.perf_counter()-t))
+                    results['dashboard_query']={'endpoint':'/api/usage/dashboard','samples':10,'median_ms':statistics.median(lat),'max_ms':max(lat)}
                     status=call(base,'/api/usage/status');assert status['health']['dropped']==0,status;results['health']=status['health']
             finally:stop(p)
         upstream.shutdown();results['sqlite_bytes']=(root/'usage.sqlite3').stat().st_size

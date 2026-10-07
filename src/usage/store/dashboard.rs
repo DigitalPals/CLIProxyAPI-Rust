@@ -1,5 +1,5 @@
 //! One streaming pass for the metrics displayed by the Usage page. Request/attempt
-//! lifecycle diagnostics remain available through the full summary endpoint.
+//! identities and source evidence remain available in the ledger and raw records.
 use super::*;
 use std::collections::BTreeMap;
 
@@ -60,13 +60,25 @@ struct Group {
     provider: Option<String>,
 }
 
+// Repeated dimensions dominate large reads. Borrow their keys for lookups and
+// allocate an owned key only when a group is first encountered.
+fn update_group<T: Default>(groups: &mut BTreeMap<Option<String>, T>, key: &Option<String>, add: impl FnOnce(&mut T)) {
+    if let Some(group) = groups.get_mut(key) {
+        add(group);
+    } else {
+        let mut group = T::default();
+        add(&mut group);
+        groups.insert(key.clone(), group);
+    }
+}
+
 pub(super) fn summary(conn: &Connection, q: &Query) -> Result<Value> {
     let r = range(q)?;
     let (where_sql, values) = filter(q, &r, "o");
     let client = dimension("client_id", "o");
     let mut totals = Metrics::default();
     let (mut matched, mut history_only, mut weak_identity) = (0_i64, 0_i64, 0_i64);
-    let mut trends: [BTreeMap<(NaiveDate, Option<String>), Metrics>; 2] = Default::default();
+    let mut trends: [BTreeMap<NaiveDate, BTreeMap<Option<String>, Metrics>>; 2] = Default::default();
     let mut breakdowns: [BTreeMap<Option<String>, Group>; 4] = Default::default();
     // Match against the entire journal, including proxy evidence outside this range/filter.
     // Only scalar accounting columns are read; no payload or pricing JSON is parsed.
@@ -78,6 +90,7 @@ pub(super) fn summary(conn: &Connection, q: &Query) -> Result<Value> {
     ))?;
     let mut rows = statement.query(rusqlite::params_from_iter(&values))?;
     while let Some(row) = rows.next()? {
+        read::check()?;
         if row.get::<_, bool>(0)? {
             matched += 1;
             continue;
@@ -94,50 +107,58 @@ pub(super) fn summary(conn: &Connection, q: &Query) -> Result<Value> {
         for (i, amount) in amounts.iter_mut().enumerate() {
             *amount = row.get(8 + i)?;
         }
-        let completeness: String = row.get(16)?;
+        let completeness = row.get_ref(16)?.as_str()?;
         let pricing_partial = row.get::<_, Option<i64>>(17)? == Some(1);
-        totals.add(&amounts, &completeness, pricing_partial);
+        totals.add(&amounts, completeness, pricing_partial);
         for (i, trend) in trends.iter_mut().enumerate() {
-            trend.entry((date, dims[i].clone())).or_default().add(&amounts, &completeness, pricing_partial);
+            update_group(trend.entry(date).or_default(), &dims[i], |metrics| {
+                metrics.add(&amounts, completeness, pricing_partial)
+            });
         }
         for (i, breakdown) in breakdowns.iter_mut().enumerate() {
-            let group = breakdown.entry(dims[i].clone()).or_default();
-            group.metrics.add(&amounts, &completeness, pricing_partial);
-            if let Some(account) = &dims[2] {
-                group.accounts.insert(account.clone());
-            }
-            if group.provider.is_none() || dims[0] < group.provider {
-                group.provider.clone_from(&dims[0]);
-            }
+            update_group(breakdown, &dims[i], |group| {
+                group.metrics.add(&amounts, completeness, pricing_partial);
+                if let Some(account) = &dims[2]
+                    && !group.accounts.contains(account)
+                {
+                    group.accounts.insert(account.clone());
+                }
+                if group.provider.is_none() || dims[0] < group.provider {
+                    group.provider.clone_from(&dims[0]);
+                }
+            });
         }
     }
     let mut totals = totals.value();
     totals["matched"] = json!(matched);
     totals["history_only"] = json!(history_only);
     totals["weak_identity"] = json!(weak_identity);
-    let trends = trends.map(|groups| {
-        groups
-            .into_iter()
-            .map(|((date, group), metrics)| {
+    let mut trend_values: [Vec<Value>; 2] = Default::default();
+    for (output, groups) in trend_values.iter_mut().zip(trends) {
+        for (date, groups) in groups {
+            for (group, metrics) in groups {
+                read::check()?;
                 let mut value = metrics.value();
                 value["date"] = json!(date.to_string());
                 value["group"] = json!(group);
-                value
-            })
-            .collect::<Vec<_>>()
-    });
+                output.push(value);
+            }
+        }
+    }
+    let trends = trend_values;
     let mut out = serde_json::Map::new();
     for (name, groups) in DIMS.into_iter().zip(breakdowns) {
-        let mut groups: Vec<_> = groups
-            .into_iter()
-            .map(|(id, group)| {
-                let mut value = group.metrics.value();
-                value["id"] = json!(id);
-                value["accounts"] = json!(group.accounts.len());
-                value["provider"] = json!(group.provider);
-                value
-            })
-            .collect();
+        let mut group_values = Vec::with_capacity(groups.len());
+        for (id, group) in groups {
+            read::check()?;
+            let mut value = group.metrics.value();
+            value["id"] = json!(id);
+            value["accounts"] = json!(group.accounts.len());
+            value["provider"] = json!(group.provider);
+            group_values.push(value);
+        }
+        let mut groups = group_values;
+        read::check()?;
         groups.sort_by(|a, b| {
             b["estimated_cost_nanos"]
                 .as_i64()
@@ -145,6 +166,7 @@ pub(super) fn summary(conn: &Connection, q: &Query) -> Result<Value> {
                 .then(b["observations"].as_i64().cmp(&a["observations"].as_i64()))
                 .then(a["id"].as_str().cmp(&b["id"].as_str()))
         });
+        read::check()?;
         groups.truncate(500);
         out.insert(name.into(), json!(groups));
     }
@@ -154,11 +176,13 @@ pub(super) fn summary(conn: &Connection, q: &Query) -> Result<Value> {
     let raw: String = conn.query_row("SELECT value FROM usage_meta WHERE key='catalogue'", [], |row| row.get(0))?;
     let catalogue: Catalogue = serde_json::from_str(&raw)?;
     let stack = q.stack.as_deref().unwrap_or("provider");
+    let facets = facets(conn, &where_sql, &values)?;
+    read::check()?;
     Ok(json!({"range":{"start":r.start,"end":r.end,"timezone":r.tz.to_string()},
         "combined":{"basis":"One entry per provider response. Imported entries that share a response ID with a proxy entry are excluded.",
             "totals":totals,"proxy_first_event_at_ms":proxy_first,"stack":stack,
             "trend":trends[usize::from(stack=="model")],"trends":{"provider":trends[0],"model":trends[1]},"breakdowns":out},
-        "facets":facets(conn,&where_sql,&values)?,
+        "facets":facets,
         "pricing":{"version":catalogue.version,"verified_at":catalogue.verified_at,
             "basis":"API list-price equivalent estimate; usage older than the catalogue is priced at today's rates as a backdated current-rate equivalent, not what was paid at the time"}}))
 }
@@ -173,6 +197,7 @@ fn facets(conn: &Connection, where_sql: &str, values: &[SqlValue]) -> Result<Val
     ))?;
     let mut rows = statement.query(rusqlite::params_from_iter(values))?;
     while let Some(row) = rows.next()? {
+        read::check()?;
         for (i, facet) in facets.iter_mut().enumerate() {
             if let Some(value) = row.get::<_, Option<String>>(i)? {
                 facet.insert(value);
@@ -185,6 +210,7 @@ fn facets(conn: &Connection, where_sql: &str, values: &[SqlValue]) -> Result<Val
     {
         let mut items = Vec::new();
         for value in values.into_iter().take(500) {
+            read::check()?;
             items.push(if matches!(i, 2 | 3) {
                 let label = if i == 3 {
                     collector_label(conn, &value)?.unwrap_or_else(|| value.clone())
@@ -198,5 +224,6 @@ fn facets(conn: &Connection, where_sql: &str, values: &[SqlValue]) -> Result<Val
         }
         out.insert(name.into(), json!(items));
     }
+    read::check()?;
     Ok(json!(out))
 }

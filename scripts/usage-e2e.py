@@ -56,20 +56,23 @@ def main():
             state=root/f'collector-{i}';states.append(state)
             cli('collector','enroll','--state-dir',state,'--destination',base+'/api/usage-ingest','--credential-file',credential,'--claude-root',h)
         with concurrent.futures.ThreadPoolExecutor(max_workers=2) as pool:list(pool.map(lambda s:cli('collector','run','--once','--state-dir',s),states))
-        summary=request('/api/usage/summary');source=next(s for s in summary['sources'] if s['source']=='claude_code');assert source['observations']==2,summary
-        assert summary['proxy']['logical_requests']==0;checks.append('two isolated collector identities/processes durably synchronized')
-        filtered=request('/api/usage/summary?client=collector:'+ids[0]);assert next(s for s in filtered['sources'] if s['source']=='claude_code')['observations']==1,filtered
-        assert filtered['breakdowns']['client'][0]['id']=='collector:'+ids[0]
+        dashboard=request('/api/usage/dashboard?source=claude_code');assert dashboard['combined']['totals']['observations']==2,dashboard
+        assert request('/api/usage/observations?source=proxy')['total']==0;checks.append('two isolated collector identities/processes durably synchronized without inventing proxy requests')
+        filtered=request('/api/usage/dashboard?source=claude_code&client=collector:'+ids[0]);assert filtered['combined']['totals']['observations']==1,filtered
+        assert filtered['combined']['breakdowns']['client'][0]['id']=='collector:'+ids[0]
         assert filtered['facets']['clients'][0]['label']=='Test collector 0 <safe>'
         assert request('/api/usage/observations?client=collector:'+ids[0])['total']==1
         checks.append('collector identity filtering, breakdown and friendly label')
         for state in states:cli('collector','run','--once','--state-dir',state)
-        assert next(s for s in request('/api/usage/summary')['sources'] if s['source']=='claude_code')['observations']==2;checks.append('replay does not inflate source totals')
+        assert request('/api/usage/dashboard?source=claude_code')['combined']['totals']['observations']==2;checks.append('replay does not inflate combined imported totals')
         stop();claude(histories[0],'msg-offline');cli('collector','run','--once','--state-dir',states[0],expected=1)
-        offline=cli('collector','status','--state-dir',states[0]);assert offline['collector']['outbox']['pending']==1, offline;start();cli('collector','run','--once','--state-dir',states[0]);assert next(s for s in request('/api/usage/summary')['sources'] if s['source']=='claude_code')['observations']==3;checks.append('offline outbox survives separate process restart and reconnect')
+        offline=cli('collector','status','--state-dir',states[0]);assert offline['collector']['outbox']['pending']==1, offline;start();cli('collector','run','--once','--state-dir',states[0]);assert request('/api/usage/dashboard?source=claude_code')['combined']['totals']['observations']==3;checks.append('offline outbox survives separate process restart and reconnect')
         # Copied native event on another machine is source-idempotent, not a new request.
-        shutil.copyfile(histories[0],histories[1].parent/'copied.jsonl');cli('collector','run','--once','--state-dir',states[1]);assert next(s for s in request('/api/usage/summary')['sources'] if s['source']=='claude_code')['observations']==3;checks.append('copied histories across collectors deduplicate using message evidence')
-        request('/api/usage/summary',key='synthetic-inference',expected=401);request('/api/accounts',key=tokens[0],expected=401);request('/v1/models',key=tokens[0],expected=401)
+        shutil.copyfile(histories[0],histories[1].parent/'copied.jsonl');cli('collector','run','--once','--state-dir',states[1]);assert request('/api/usage/dashboard?source=claude_code')['combined']['totals']['observations']==3;checks.append('copied histories across collectors deduplicate using message evidence')
+        retired=request('/api/usage/summary?timezone=invalid',expected=410)
+        assert retired['code']=='usage_summary_retired' and retired['replacement']=='/api/usage/dashboard',retired
+        request('/api/usage/summary',key='synthetic-inference',expected=401);request('/api/usage/dashboard',key='synthetic-inference',expected=401);request('/api/accounts',key=tokens[0],expected=401);request('/v1/models',key=tokens[0],expected=401)
+        checks.append('retired summary returns 410 without query work and remains management authenticated')
         request('/api/usage-ingest',{'version':1,'observations':[]},key=KEY,expected=401)
         request('/api/usage-ingest',raw=b'x'*(600*1024),key=tokens[0],expected=413);checks.append('management/inference separation, wrong credential and oversized batch rejection')
         request('/api/usage/collectors/'+ids[0]+'/revoke',{});claude(histories[0],'msg-revoked');cli('collector','run','--once','--state-dir',states[0],expected=1);request('/api/usage-ingest',{'version':1,'observations':[]},key=tokens[0],expected=401);checks.append('revocation rejects upload and retains offline data')
@@ -80,7 +83,7 @@ def main():
         claude(history/'old.jsonl','msg-ten-days-ago',old.isoformat().replace('+00:00','Z'));day=old.astimezone(tz).date().isoformat()
         request('/api/usage/imports',{'source':'claude_code','root':str(history),'enabled':True});request('/api/usage/imports/scan',{'source':'claude_code'})
         today=datetime.datetime.now(tz).date();query=urllib.parse.urlencode({'start':(today-datetime.timedelta(days=29)).isoformat(),'end':(today+datetime.timedelta(days=1)).isoformat(),'timezone':'Europe/Amsterdam'})
-        combined=request('/api/usage/summary?'+query)['combined'];entries=[t for t in combined['trend'] if t['date']==day]
+        combined=request('/api/usage/dashboard?'+query)['combined'];entries=[t for t in combined['trend'] if t['date']==day]
         assert entries and all(t['unpriced']==0 and (t['estimated_cost_nanos'] or 0)>0 for t in entries) and sum(t['observations'] for t in entries)==1,(day,combined['trend'])
         assert combined['totals']['history_only']>=1 and combined['proxy_first_event_at_ms'] is None,combined['totals']
         records=request('/api/usage/observations?view=combined&limit=50&offset=0&'+query);assert records['total']==combined['totals']['observations'] and any(i['origin_label']=='This server' for i in records['items']),records['total']

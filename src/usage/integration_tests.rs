@@ -110,7 +110,42 @@ fn config(dir: &Directory, url: &str, native: bool) -> Config {
 }
 async fn summary(app: &App) -> Value {
     app.usage.as_ref().unwrap().flush().await.unwrap();
-    app.usage.as_ref().unwrap().query(store::Query::default()).await.unwrap()
+    app.usage.as_ref().unwrap().reference_summary(store::Query::default()).await.unwrap()
+}
+
+#[tokio::test]
+async fn retired_summary_needs_management_auth_but_not_an_analytics_store() {
+    let dir = Directory::new();
+    let mut cfg = config(&dir, "http://127.0.0.1:9", false);
+    cfg.usage.enabled = false;
+    let app = App::new(cfg, dir.0.join("config.yaml"));
+    assert!(app.usage.is_none());
+    let proxy = serve(crate::server::router(app)).await;
+    let client = reqwest::Client::new();
+    for suffix in ["", "?timezone=invalid&start=not-a-date"] {
+        let response = client
+            .get(format!("{}/api/usage/summary{suffix}", proxy.url))
+            .bearer_auth("synthetic-management")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::GONE);
+        let body: Value = response.json().await.unwrap();
+        assert_eq!(body["code"], "usage_summary_retired");
+        assert_eq!(body["replacement"], "/api/usage/dashboard");
+        assert!(body.get("combined").is_none());
+    }
+    let response =
+        client.get(format!("{}/api/usage/summary", proxy.url)).bearer_auth("synthetic-inference").send().await.unwrap();
+    assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    let response = client
+        .get(format!("{}/api/usage/dashboard", proxy.url))
+        .bearer_auth("synthetic-management")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+    assert!(!dir.0.join("usage.sqlite3").exists());
 }
 
 #[tokio::test]

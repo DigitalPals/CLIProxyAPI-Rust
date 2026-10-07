@@ -468,18 +468,39 @@ function usageSelectStack(summary) {
   }
   return summary;
 }
+const usageReads = new Map();
+function usageCancelRead(field) {
+  const controller = usageReads.get(field);
+  if (!controller) return;
+  usageReads.delete(field);
+  controller.abort();
+}
+function usageCancelReads() {
+  for (const field of usageReads.keys()) usageCancelRead(field);
+}
+function usageSuspendReads() {
+  ++Usage.sequence; ++Usage.recordSequence;
+  usageCancelReads();
+  Usage.loading = false; Usage.recordsLoading = false; Usage.loaded = false;
+}
 async function usageRead(field, path, sequence, recordSequence) {
-  const current = () => sequence === Usage.sequence && (field !== 'observations' || recordSequence === Usage.recordSequence);
+  usageCancelRead(field);
+  const controller = new AbortController();
+  usageReads.set(field, controller);
+  // Keep both guards: a transport may finish even after its signal is aborted.
+  const current = () => !controller.signal.aborted && usageReads.get(field) === controller && sequence === Usage.sequence && (field !== 'observations' || recordSequence === Usage.recordSequence);
   try {
-    const value = await api(path);
+    const value = await api(path, { signal: controller.signal });
     if (current()) Usage[field] = field === 'summary' ? usageSelectStack(value) : value;
   } catch (e) {
-    if (current()) {
+    if (current() && e.name !== 'AbortError') {
       if (field !== 'status') Usage[field] = null;
       Usage.error = e.message === 'locked' ? 'Management authentication required.' : e.message;
     }
   } finally {
-    if (current()) {
+    const active = current();
+    if (usageReads.get(field) === controller) usageReads.delete(field);
+    if (active) {
       if (field === 'observations') Usage.recordsLoading = false;
       usageRender();
     }
@@ -487,6 +508,7 @@ async function usageRead(field, path, sequence, recordSequence) {
 }
 async function usageLoad() {
   const u = Usage, sequence = ++u.sequence, recordSequence = ++u.recordSequence;
+  usageCancelReads();
   u.loading = true; u.recordsLoading = true; u.error = ''; u.loaded = true;
   usageRender();
   try {
@@ -506,6 +528,7 @@ function usageLoadStack() {
 }
 async function usageLoadRecords() {
   const u = Usage, sequence = u.sequence, recordSequence = ++u.recordSequence;
+  usageCancelRead('observations');
   u.recordsLoading = true; u.error = ''; u.observations = null; usageRender();
   try {
     await usageRead('observations', `/usage/observations?${usageQuery()}&view=combined&limit=${u.limit}&offset=${u.offset}`, sequence, recordSequence);
@@ -673,7 +696,13 @@ if (typeof document !== 'undefined') {
     else if (event.key === 'Tab' && typeof trapFocus === 'function') trapFocus(event, document.getElementById('usage-drawer'));
   });
   addEventListener('hashchange', () => {
-    if (Usage.drawerOpen && !/^#\/usage/.test(location.hash)) { Usage.drawerOpen = false; Usage.confirm = null; document.body.style.overflow = ''; }
+    if (/^#\/?usage(?:[/?]|$)/.test(location.hash)) return;
+    usageSuspendReads();
+    if (Usage.drawerOpen) { Usage.drawerOpen = false; Usage.confirm = null; document.body.style.overflow = ''; }
+  });
+  addEventListener('pagehide', usageSuspendReads);
+  addEventListener('pageshow', (event) => {
+    if (event.persisted && S.route === 'usage' && !S.locked) bindUsage();
   });
 }
 

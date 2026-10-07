@@ -588,7 +588,7 @@ async fn imported_claude_history_is_priced_on_its_original_local_date() {
         timezone: Some("Europe/Amsterdam".into()),
         ..Default::default()
     };
-    let summary = store.query(q).await.unwrap();
+    let summary = store.reference_summary(q).await.unwrap();
     let day = summary["trend"].as_array().unwrap().iter().find(|d| d["source"] == "claude_code").unwrap();
     assert_eq!(day["date"], "2026-03-30");
     assert_eq!(day["unpriced"], 0, "{day}");

@@ -8,7 +8,7 @@ null/missing values are unpriced, never implicitly zero.
 
 ## Range and filters
 
-Summary, observations and exports receive `start=YYYY-MM-DD`,
+Dashboard, observations and exports receive `start=YYYY-MM-DD`,
 `end=YYYY-MM-DD`, and `timezone=<browser IANA timezone>`.
 Start is inclusive local midnight; end is exclusive local midnight. Today, 7 days
 and 30 days include today. The custom UI accepts an inclusive “Through” date
@@ -18,16 +18,25 @@ stable server values. `source` is still accepted by the API but the UI no longer
 offers it. The `client` facet includes named client IDs and server-bound
 `collector:<id>` origins. Every read/action is authenticated.
 
-Summary also accepts `stack=provider|model` (default `provider`), which sets the
+Dashboard also accepts `stack=provider|model` (default `provider`), which sets the
 grouping of `combined.trend`. Observations and exports accept
 `view=combined|raw`; a missing `view` means `raw`. Any other value of `stack`
 or `view` is a 400.
 
+Analytics reads allow four concurrent independent WAL readers. Waiting for a
+reader slot is limited to two seconds; expiration returns `503` with a retryable
+busy message. An admitted read has a ten-second execution budget, including any
+wait for a blocking worker; expiration returns `504` and suggests a narrower
+range or filters. Client cancellation stops the read work; if a cancellation
+response can still be delivered, it uses `499`.
+These outcomes do not claim missing ingestion or corrupt data. Private query and
+database error details are not included in the response.
+
 ## GET /api/usage/dashboard
 
 The page uses this focused endpoint for a fast first load and refresh. Its
-`range`, `facets`, `pricing` and `combined` fields have the same displayed
-accounting meaning as the full summary below. It computes totals, both chart
+`range`, `facets`, `pricing` and `combined` fields describe the displayed
+accounting metrics. It computes totals, both chart
 groupings, and all four breakdowns in one streaming pass over accounting
 entries, plus one pass for raw-record facets. Each response reads one independent
 WAL snapshot; no TTL cache or eventual background estimate is involved.
@@ -35,9 +44,9 @@ WAL snapshot; no TTL cache or eventual background estimate is involved.
 `combined.trends.provider` and `combined.trends.model` contain both groupings,
 so switching the chart needs no request. `combined.stack` and `combined.trend`
 still reflect the requested stack. Aggregate metrics include costs, token sums,
-unknown counts, completeness and overflow evidence. Request/attempt lifecycle
-counts and the legacy per-source/reconciliation sections are supplied by the
-full summary endpoint, rather than computed for this page.
+unknown counts, completeness and overflow evidence. Historical request/attempt
+identities and source evidence remain in the native ledger and raw observation
+records. The legacy per-source/reconciliation aggregate response is retired.
 
 The browser renders dashboard, observations and collection status as each
 read finishes. Pagination reads only observations. Range/filter changes discard
@@ -55,59 +64,123 @@ lightly priced models remain discoverable. Other dimensions initially show
 eight rows; either limit can be expanded. Mixed coverage prioritizes the
 unpriced count, while its title preserves partial and missing-usage details.
 
-## GET /api/usage/summary
+Example response:
 
 ```json
 {
-  "range": {"start":"2026-10-01", "end":"2026-10-08", "timezone":"Europe/Amsterdam"},
-  "proxy": {
-    "logical_requests":3, "attempts":4, "observations":4,
-    "estimated_cost_nanos":12345000,
-    "tokens":{"input":1000,"output":200,"cache_read":100,"cache_write":null,"write_5m":null,"write_1h":null,"reasoning":20},
-    "unpriced":1, "partial":1, "missing_usage":0, "conflicts":0
+  "range": {
+    "start": "2026-10-01",
+    "end": "2026-10-08",
+    "timezone": "Europe/Amsterdam"
   },
-  "sources":[
-    {"source":"claude_code","observations":2,"estimated_cost_nanos":null,
-     "unpriced":2,"partial":0,"missing_usage":0,"conflicts":0,"possibly_overlapping":true}
-  ],
-  "trend":[
-    {"date":"2026-10-01","source":"proxy","observations":4,
-     "logical_requests":3,"attempts":4,"estimated_cost_nanos":12345000,"unpriced":1}
-  ],
   "facets": {
-    "providers":["anthropic","openai"], "models":["claude-sonnet-4-5"],
-    "accounts":[{"id":"stable-account-id","label":"Account label"}],
-    "clients":[{"id":"stable-client-or-collector-id","label":"Work laptop"}],
-    "sources":["proxy","claude_code","codex"]
+    "providers": [
+      "anthropic",
+      "openai"
+    ],
+    "models": [
+      "claude-sonnet-4-5"
+    ],
+    "accounts": [
+      {
+        "id": "stable-account-id",
+        "label": "Account label"
+      }
+    ],
+    "clients": [
+      {
+        "id": "stable-client-or-collector-id",
+        "label": "Work laptop"
+      }
+    ],
+    "sources": [
+      "proxy",
+      "claude_code",
+      "codex"
+    ]
   },
-  "pricing":{"version":"local-catalogue-v1","basis":"Published API rates"},
+  "pricing": {
+    "version": "local-catalogue-v1",
+    "basis": "Published API rates"
+  },
   "combined": {
-    "basis":"One entry per provider response. Imported entries that share a response ID with a proxy entry are excluded.",
-    "totals":{"observations":1286,"estimated_cost_nanos":98123000000,"unpriced":3,"partial":0,
-              "missing_usage":0,"tokens":{"input":1000,"output":200,"...":0},
-              "history_only":1234,"matched":870,"weak_identity":12},
-    "proxy_first_event_at_ms":1789344000000,
-    "stack":"provider",
-    "trend":[{"date":"2026-10-01","group":"anthropic","observations":412,
-              "estimated_cost_nanos":98123000000,"unpriced":3,"partial":0,"tokens":{}}],
-    "breakdowns":{
-      "provider":[{"id":"anthropic","provider":"anthropic","accounts":2,"observations":412,"estimated_cost_nanos":98123000000}],
-      "model":[], "account":[], "client":[]
+    "basis": "One entry per provider response. Imported entries that share a response ID with a proxy entry are excluded.",
+    "totals": {
+      "observations": 1286,
+      "estimated_cost_nanos": 98123000000,
+      "unpriced": 3,
+      "partial": 0,
+      "missing_usage": 0,
+      "tokens": {
+        "input": 1000,
+        "output": 200,
+        "...": 0
+      },
+      "history_only": 1234,
+      "matched": 870,
+      "weak_identity": 12
+    },
+    "proxy_first_event_at_ms": 1789344000000,
+    "stack": "provider",
+    "trend": [
+      {
+        "date": "2026-10-01",
+        "group": "anthropic",
+        "observations": 412,
+        "estimated_cost_nanos": 98123000000,
+        "unpriced": 3,
+        "partial": 0,
+        "tokens": {}
+      }
+    ],
+    "breakdowns": {
+      "provider": [
+        {
+          "id": "anthropic",
+          "provider": "anthropic",
+          "accounts": 2,
+          "observations": 412,
+          "estimated_cost_nanos": 98123000000
+        }
+      ],
+      "model": [],
+      "account": [],
+      "client": []
+    },
+    "trends": {
+      "provider": [
+        {
+          "date": "2026-10-01",
+          "group": "anthropic",
+          "observations": 412,
+          "estimated_cost_nanos": 98123000000,
+          "unpriced": 3,
+          "partial": 0,
+          "tokens": {}
+        }
+      ],
+      "model": [
+        {
+          "date": "2026-10-01",
+          "group": "claude-sonnet-4-5",
+          "observations": 412,
+          "estimated_cost_nanos": 98123000000,
+          "unpriced": 3,
+          "partial": 0,
+          "tokens": {}
+        }
+      ]
     }
   }
 }
 ```
-
-Proxy requests and attempts are separate. Source entries may also contain
-`tokens` with the same schema. The per-source `proxy`, `sources`, `trend` and
-`breakdowns` fields remain for older clients and may overlap.
 
 `combined` is the main number on the page. It counts the accounting entries in
 the range and filters, then drops every imported entry whose provider response
 ID also has a proxy entry. That check is not limited to the range, so a proxy
 call and its imported copy on opposite sides of midnight count once; the proxy
 entry wins. `totals`, each `trend` row and each breakdown row share the
-aggregate shape of the source totals (`observations`, `estimated_cost_nanos`,
+aggregate shape (`observations`, `estimated_cost_nanos`,
 `known_cost_nanos`, `unpriced`, `partial`, `missing_usage`, `pricing_partial`,
 `tokens`, `missing_token_counts`, `aggregation_overflow`, ...).
 
@@ -137,10 +210,37 @@ renders Unpriced; a literal zero renders $0.00. All server strings are escaped.
 Facets should represent the complete selectable filter domain for the range,
 not only the current observation page.
 
+## GET /api/usage/summary — retired
+
+This management-authenticated route returns **410 Gone**, including when analytics
+is disabled. It performs no query validation, opens no database connection, and
+reserves no analytics read slot:
+
+```json
+{
+  "error": "Usage summary retired; use /api/usage/dashboard for combined accounting metrics",
+  "code": "usage_summary_retired",
+  "replacement": "/api/usage/dashboard"
+}
+```
+
+Migrate consumers to the documented dashboard shape. This is not a redirect or a
+shape-compatible alias: top-level `proxy`, `sources`, source-specific `trend` and
+`breakdowns`, `reconciliation`, and aggregate logical-request/attempt counters are
+not returned. `source` filtering on the dashboard still uses the combined-set
+overlap rules; it does not recreate the former potentially overlapping per-source
+totals. Raw records and their lifecycle identities remain available through
+`/api/usage/observations?view=raw` and exports. Request counts are not interchangeable
+with accounting-entry counts.
+
+Production builds exclude the former summary computation. Its independent SQL
+reference and lifecycle/conflict checks exist only in test builds. Retirement
+changes neither saved observations, deduplication, pricing, nor native ingestion.
+
 ## GET /api/usage/observations
 
 Adds `limit=50&offset=<nonnegative offset>` to the same range and filter query.
-The server must use stable ordering and apply filters identically to summary.
+The server must use stable ordering and apply filters identically to the dashboard.
 
 ```json
 {
