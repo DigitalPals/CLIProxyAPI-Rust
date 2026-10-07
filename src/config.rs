@@ -49,6 +49,9 @@ pub struct Config {
     /// Serve HTTPS with this certificate.
     #[serde(skip_serializing_if = "Tls::is_off")]
     pub tls: Tls,
+    /// Which faults send a push notification to the devices that turned them on.
+    #[serde(skip_serializing_if = "Notifications::is_default")]
+    pub notifications: Notifications,
     /// Only route unprefixed model names to accounts without a `prefix`.
     #[serde(skip_serializing_if = "std::ops::Not::not")]
     pub force_model_prefix: bool,
@@ -139,6 +142,31 @@ pub struct Tls {
 impl Tls {
     fn is_off(&self) -> bool {
         !self.enable && self.cert.is_empty() && self.key.is_empty()
+    }
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "kebab-case", default, deny_unknown_fields)]
+pub struct Notifications {
+    /// A signed-in account needs signing in again.
+    pub sign_in_expired: bool,
+    /// Every account of a provider is used up or unavailable, and when one is back.
+    pub provider_exhausted: bool,
+    /// One account used up its 5-hour or weekly limit.
+    pub account_used_up: bool,
+    /// An account error, or three or more failed requests in an hour.
+    pub account_errors: bool,
+}
+
+impl Default for Notifications {
+    fn default() -> Self {
+        Self { sign_in_expired: true, provider_exhausted: true, account_used_up: false, account_errors: false }
+    }
+}
+
+impl Notifications {
+    fn is_default(&self) -> bool {
+        *self == Self::default()
     }
 }
 
@@ -234,6 +262,7 @@ impl Default for Config {
             banked_resets: false,
             debug: false,
             tls: Tls::default(),
+            notifications: Notifications::default(),
             force_model_prefix: false,
             oauth_model_alias: BTreeMap::new(),
             oauth_excluded_models: BTreeMap::new(),
@@ -285,6 +314,13 @@ usage:
   queue-capacity: 1024
   # database: /path/to/usage.sqlite3  # default: beside config.yaml
   # pricing-overrides: /path/to/rates.json
+
+# Push notifications for devices that turn them on in the dashboard (needs HTTPS).
+# notifications:
+#   sign-in-expired: true      # an account needs signing in again
+#   provider-exhausted: true   # every account of a provider is out, and when one is back
+#   account-used-up: false     # one account used up its 5-hour or weekly limit
+#   account-errors: false      # account errors and runs of failed requests
 
 # Optional named inference credentials; existing api-keys continue to work.
 named-clients: []

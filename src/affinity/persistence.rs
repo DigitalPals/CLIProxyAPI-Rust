@@ -121,33 +121,7 @@ impl Persistence {
 }
 
 fn write_assignments(path: &Path, bindings: &HashMap<String, Binding>) -> anyhow::Result<()> {
-    use std::io::Write;
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)?;
-    }
-    let temporary = path.with_extension(format!("{}.tmp", uuid::Uuid::new_v4()));
-    let mut options = std::fs::OpenOptions::new();
-    options.write(true).create_new(true);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt;
-        options.mode(0o600);
-    }
-    let result = (|| -> anyhow::Result<()> {
-        let mut file = options.open(&temporary)?;
-        file.write_all(&serde_json::to_vec(bindings)?)?;
-        file.sync_all()?;
-        std::fs::rename(&temporary, path)?;
-        #[cfg(unix)]
-        if let Some(parent) = path.parent() {
-            std::fs::File::open(parent)?.sync_all()?;
-        }
-        Ok(())
-    })();
-    if result.is_err() {
-        let _ = std::fs::remove_file(&temporary);
-    }
-    result
+    crate::files::write_private(path, &serde_json::to_vec(bindings)?)
 }
 
 #[cfg(test)]

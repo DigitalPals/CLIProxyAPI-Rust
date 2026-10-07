@@ -2,7 +2,7 @@
 
 const CONFIG_SECTIONS = [
   ['server', 'Server'], ['access', 'Access'], ['routing', 'Routing'], ['connections', 'Connections'],
-  ['providers', 'Providers'], ['models', 'Model rules'], ['diagnostics', 'Diagnostics'], ['yaml', 'YAML file'],
+  ['providers', 'Providers'], ['models', 'Model rules'], ['notifications', 'Notifications'], ['diagnostics', 'Diagnostics'], ['yaml', 'YAML file'],
 ];
 const CONFIG_DESCRIPTIONS = {
   server: 'Where Fusebox listens and where it keeps sign-in files.',
@@ -11,6 +11,7 @@ const CONFIG_DESCRIPTIONS = {
   connections: 'How Fusebox reaches the providers.',
   providers: 'API keys used alongside your signed-in accounts.',
   models: 'Rules for signed-in accounts. API key model rules are set under Providers.',
+  notifications: 'Push notifications on your phone or computer when something trips. The events apply to every device.',
   diagnostics: 'Logging, and settings in the file that Fusebox ignores.',
   yaml: 'The whole config.yaml, including settings the other sections don\u2019t cover. Changes are checked before they are applied.',
 };
@@ -21,7 +22,7 @@ const CONFIG_KEY_SECTION = {
   routing: 'routing', 'five-hour-reserve-percent': 'routing', 'request-retry': 'routing', 'session-affinity': 'routing',
   'session-affinity-idle-seconds': 'routing', 'force-model-prefix': 'routing',
   'proxy-url': 'connections', 'codex-websockets': 'connections', 'claude-cloak': 'connections', 'banked-resets': 'connections',
-  'oauth-model-alias': 'models', 'oauth-excluded-models': 'models', debug: 'diagnostics',
+  'oauth-model-alias': 'models', 'oauth-excluded-models': 'models', notifications: 'notifications', debug: 'diagnostics',
 };
 const CONFIG_OAUTH = [['claude', 'Claude'], ['codex', 'Codex'], ['antigravity', 'Antigravity'], ['kimi', 'Kimi'], ['xai', 'Grok'], ['meta', 'Meta'], ['devin', 'Devin'], ['vertex', 'Vertex AI']];
 const CONFIG_PROVIDERS = [
@@ -197,6 +198,16 @@ function configConnectionsHTML() {
     ${configSwitch(['banked-resets'], 'Banked resets', 'Show saved Claude and ChatGPT limit resets beside each subscription and let you spend them. Checks every 30 minutes through unofficial provider endpoints.')}</div>`;
 }
 
+// This device's subscription (app.js) acts at once; the events are saved to the file.
+function configNotificationsHTML() {
+  return `<div class="cfg-grid">${pushDeviceHTML()}
+    <div class="cfg-divider wide"></div>
+    ${configSwitch(['notifications', 'sign-in-expired'], 'Sign-in expired', 'A signed-in account needs signing in again before it can take requests.')}
+    ${configSwitch(['notifications', 'provider-exhausted'], 'Provider out of capacity', 'Every account of a provider is used up or unavailable, and again when one is back.')}
+    ${configSwitch(['notifications', 'account-used-up'], 'Account limit used up', 'One account used up its 5-hour or weekly limit while others carry on.')}
+    ${configSwitch(['notifications', 'account-errors'], 'Account errors', 'An account reports an error, or three or more of its requests fail within an hour.')}</div>`;
+}
+
 // Provider ids here are config groups; the logo sprite knows them as account providers.
 const configLogo = (provider, name, size = 16) => logo(provider === 'compat' ? 'openai-compat' : provider, name, 'api-key', size);
 // "sk-ant-…f3e2", or dots while emails and keys are hidden.
@@ -350,7 +361,8 @@ function configHTML() {
     return skeletonHTML();
   }
   const sections = { server: configServerHTML, access: configAccessHTML, routing: configRoutingHTML,
-    connections: configConnectionsHTML, providers: configProvidersHTML, models: configModelsHTML, diagnostics: configDiagnosticsHTML, yaml: configYamlHTML };
+    connections: configConnectionsHTML, providers: configProvidersHTML, models: configModelsHTML, notifications: configNotificationsHTML,
+    diagnostics: configDiagnosticsHTML, yaml: configYamlHTML };
   const dirty = configDirtySections();
   const name = CONFIG_SECTIONS.find(([id]) => id === c.section)[1];
   const restart = { host: 'bind address', port: 'port', tls: 'HTTPS', debug: 'debug logging' };

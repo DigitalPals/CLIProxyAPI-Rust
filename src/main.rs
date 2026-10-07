@@ -8,12 +8,14 @@ mod config_editor;
 mod device;
 mod devin;
 mod diagnostics;
+mod files;
 mod formats;
 mod ir;
 mod media;
 mod mgmt;
 mod oauth;
 mod proxy;
+mod push;
 mod quota;
 #[cfg(test)]
 mod routing_tests;
@@ -185,6 +187,7 @@ async fn serve(app: Arc<App>) -> Result<()> {
         tokio::spawn(oauth::refresher(app.clone())),
         tokio::spawn(antigravity::version_updater(app.clone())),
         tokio::spawn(quota::poller(app.clone())),
+        tokio::spawn(push::watcher(app.clone())),
         tokio::spawn(watch(app.clone())),
     ];
 

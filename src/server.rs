@@ -50,6 +50,9 @@ pub fn router(app: Arc<App>) -> Router {
         .route("/ui/{file}", get(ui_asset))
         .route("/ui/fonts/{file}", get(ui_font))
         .route("/favicon.ico", get(favicon))
+        .route("/manifest.webmanifest", get(manifest))
+        .route("/sw.js", get(service_worker))
+        .route("/ui/icons/{file}", get(ui_icon))
         .route("/healthz", get(|| async { "ok" }))
         .with_state(app)
 }
@@ -518,7 +521,77 @@ async fn ui_font(Path(file): Path<String>) -> Response {
     }
 }
 
+// Installing the dashboard as an app: the manifest, its icons, and the service worker,
+// served from the root so its scope covers the dashboard at `/`.
+const MANIFEST: &str = include_str!("../ui/manifest.webmanifest");
+const SERVICE_WORKER: &str = include_str!("../ui/sw.js");
+const ICONS: &[(&str, &[u8])] = &[
+    ("icon-192.png", include_bytes!("../ui/icons/icon-192.png")),
+    ("icon-512.png", include_bytes!("../ui/icons/icon-512.png")),
+    ("maskable-512.png", include_bytes!("../ui/icons/maskable-512.png")),
+    ("apple-touch-icon.png", include_bytes!("../ui/icons/apple-touch-icon.png")),
+];
+
+async fn manifest() -> Response {
+    ([(header::CONTENT_TYPE, "application/manifest+json"), (header::CACHE_CONTROL, "no-cache")], MANIFEST)
+        .into_response()
+}
+
+async fn service_worker() -> Response {
+    ([(header::CONTENT_TYPE, "text/javascript; charset=utf-8"), (header::CACHE_CONTROL, "no-cache")], SERVICE_WORKER)
+        .into_response()
+}
+
+async fn ui_icon(Path(file): Path<String>) -> Response {
+    match ICONS.iter().find(|(name, _)| *name == file) {
+        Some((_, body)) => {
+            ([(header::CONTENT_TYPE, "image/png"), (header::CACHE_CONTROL, "public, max-age=86400")], *body)
+                .into_response()
+        }
+        None => StatusCode::NOT_FOUND.into_response(),
+    }
+}
+
 async fn favicon() -> Response {
     ([(header::CONTENT_TYPE, "image/x-icon"), (header::CACHE_CONTROL, "public, max-age=86400")], FAVICON)
         .into_response()
+}
+
+#[cfg(test)]
+mod tests {
+    use axum::body::{Body, to_bytes};
+    use axum::http::Request;
+    use tower::ServiceExt;
+
+    use super::*;
+
+    #[tokio::test]
+    async fn serves_the_installable_app() {
+        let cfg = crate::config::Config { auth_dir: "/nonexistent".into(), ..Default::default() };
+        let app = App::new(cfg, "/nonexistent/config.yaml".into());
+        for (path, ctype) in [
+            ("/manifest.webmanifest", "application/manifest+json"),
+            ("/sw.js", "text/javascript; charset=utf-8"),
+            ("/ui/icons/icon-192.png", "image/png"),
+            ("/ui/icons/maskable-512.png", "image/png"),
+            ("/ui/icons/apple-touch-icon.png", "image/png"),
+        ] {
+            let resp = router(app.clone()).oneshot(Request::get(path).body(Body::empty()).unwrap()).await.unwrap();
+            assert_eq!(resp.status(), StatusCode::OK, "{path}");
+            assert_eq!(resp.headers()[header::CONTENT_TYPE], ctype, "{path}");
+        }
+        let missing = router(app.clone()).oneshot(Request::get("/ui/icons/nope.png").body(Body::empty()).unwrap());
+        assert_eq!(missing.await.unwrap().status(), StatusCode::NOT_FOUND);
+
+        // Every icon the manifest names is served.
+        let resp = router(app.clone()).oneshot(Request::get("/manifest.webmanifest").body(Body::empty()).unwrap());
+        let manifest: Value =
+            serde_json::from_slice(&to_bytes(resp.await.unwrap().into_body(), 1 << 16).await.unwrap()).unwrap();
+        assert_eq!(manifest["scope"], "/");
+        for icon in manifest["icons"].as_array().unwrap() {
+            let src = icon["src"].as_str().unwrap();
+            let resp = router(app.clone()).oneshot(Request::get(src).body(Body::empty()).unwrap()).await.unwrap();
+            assert_eq!(resp.status(), StatusCode::OK, "{src}");
+        }
+    }
 }

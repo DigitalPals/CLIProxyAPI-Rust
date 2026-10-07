@@ -29,6 +29,7 @@ pub struct App {
     pub usage_error: Option<String>,
     pub logins: Mutex<HashMap<String, crate::mgmt::Login>>,
     pub reset_quotes: Mutex<HashMap<String, crate::banked_resets::Quote>>,
+    pub push: crate::push::Push,
     #[cfg(test)]
     pub reset_test_origin: Mutex<Option<String>>,
     pub started: DateTime<Utc>,
@@ -43,6 +44,7 @@ impl App {
         pool.reload(&cfg);
         let (live, _) = broadcast::channel(512);
         let sessions = Arc::new(crate::affinity::Sessions::load(&cfg.auth_dir(), cfg.session_affinity_idle_seconds));
+        let push = crate::push::Push::load(&cfg.auth_dir());
         // Tests opt in with an explicit isolated database; never touch a user's default DB.
         let usage_enabled = cfg.usage.enabled && (!cfg!(test) || cfg.usage.database.is_some());
         let (usage, usage_error) = if usage_enabled {
@@ -80,6 +82,7 @@ impl App {
             stats: Stats::default(),
             logins: Mutex::new(HashMap::new()),
             reset_quotes: Mutex::new(HashMap::new()),
+            push,
             #[cfg(test)]
             reset_test_origin: Mutex::new(None),
             started: Utc::now(),

@@ -68,6 +68,7 @@ const S = {
   confirm: null,
   resets: {}, // account-specific confirmations and errors
   resetModal: null,
+  push: { loaded: false, loading: false, status: null, endpoint: null, busy: false, msg: null }, // Config, Notifications
   config: { values: null, saved: null, defaults: {}, revision: '', path: '', ignored: [], restart_fields: [],
     msg: null, busy: false, loading: false, section: 'server', provider: 'claude', oauthProvider: 'claude',
     errors: {}, opens: {}, secrets: {}, reloadConfirm: false, reveal: false, raw: { text: null, saved: null, loading: false } },
@@ -298,21 +299,43 @@ function loadActivity(id, force = false) {
 
 let ws = null;
 let wsDelay = 1000;
+let wsRetry = 0;
 
 function connectLive() {
+  clearTimeout(wsRetry);
   const proto = location.protocol === 'https:' ? 'wss' : 'ws';
   const q = S.key ? `?key=${encodeURIComponent(S.key)}` : '';
-  ws = new WebSocket(`${proto}://${location.host}/api/live${q}`);
-  ws.onopen = () => { wsDelay = 1000; setLive('live'); };
-  ws.onclose = () => {
+  const sock = new WebSocket(`${proto}://${location.host}/api/live${q}`);
+  ws = sock;
+  sock.onopen = () => { wsDelay = 1000; setLive('live'); };
+  sock.onclose = () => {
+    if (sock !== ws) return; // replaced after the app came back from the background
     onLoad(null);
     setLive('offline');
-    if (!S.locked) setTimeout(connectLive, wsDelay);
+    if (!S.locked) wsRetry = setTimeout(connectLive, wsDelay);
     wsDelay = Math.min(wsDelay * 2, 15000);
   };
-  ws.onmessage = (e) => {
+  sock.onmessage = (e) => {
+    if (sock !== ws) return;
     try { onLive(JSON.parse(e.data)); } catch {}
   };
+}
+
+// Phones suspend a backgrounded app, and its socket can come back dead while still
+// looking open. After a while away, reconnect and catch up straight away.
+let hiddenAt = 0;
+function resume() {
+  if (document.visibilityState === 'hidden') { hiddenAt = Date.now(); return; }
+  const away = hiddenAt ? Date.now() - hiddenAt : 0;
+  hiddenAt = 0;
+  if (S.locked || !S.overview) return;
+  if (ws && ws.readyState <= 1 && away < 30000) return;
+  const old = ws;
+  wsDelay = 1000;
+  connectLive();
+  old?.close();
+  refreshAccounts();
+  api('/requests').then((requests) => { S.requests = requests; refreshViews(); }).catch(() => {});
 }
 
 function setLive(state) {
@@ -512,9 +535,16 @@ function faultsButtonHTML(phone) {
   return `<button class="faults" type="button" data-act="faults" aria-haspopup="true" aria-expanded="${S.faults}" aria-controls="faults-menu"${phone ? ` aria-label="${label}" title="Faults"` : ''}><span class="dot s7 ${lvl}"></span><span>${phone ? n : label}</span></button>`;
 }
 
+let badge = -1;
 function renderFaults() {
   for (const slot of $$('[data-faults-slot]')) slot.innerHTML = S.overview && !S.locked ? faultsButtonHTML(slot.closest('.mbar')) : '';
   if (S.faults) renderFaultsMenu();
+  // An installed app shows the fault count on its icon.
+  const n = S.overview && !S.locked ? alertsList().length : 0;
+  if (n !== badge && 'setAppBadge' in navigator) {
+    badge = n;
+    (n ? navigator.setAppBadge(n) : navigator.clearAppBadge()).catch(() => {});
+  }
 }
 
 const TITLES = { overview: 'Overview', accounts: 'Accounts', requests: 'Requests', usage: 'Usage', models: 'Models', config: 'Config' };
@@ -2236,12 +2266,139 @@ function modelsBodyHTML() {
     </div>`).join('')}</div>`;
 }
 
+// ---------------------------------------------------------------- notifications
+
+// Push notifications for this device (Config, Notifications). The server decides what
+// to send; the dashboard only subscribes the browser and lists the devices.
+const IOS = /iPhone|iPad|iPod/.test(navigator.userAgent) || (/Macintosh/.test(navigator.userAgent) && navigator.maxTouchPoints > 1);
+const STANDALONE = matchMedia('(display-mode: standalone)').matches || navigator.standalone === true;
+const pushReady = () => window.isSecureContext && 'serviceWorker' in navigator && 'PushManager' in window && 'Notification' in window;
+
+// "Chrome on Android", "Fusebox app on iPhone": how the device is listed.
+function deviceLabel() {
+  const ua = navigator.userAgent;
+  const os = /iPhone|iPod/.test(ua) ? 'iPhone' : IOS ? 'iPad' : /Android/.test(ua) ? 'Android' : /CrOS/.test(ua) ? 'ChromeOS'
+    : /Mac OS X/.test(ua) ? 'Mac' : /Windows/.test(ua) ? 'Windows' : /Linux/.test(ua) ? 'Linux' : '';
+  const browser = /Edg(A|iOS)?\//.test(ua) ? 'Edge' : /Firefox\/|FxiOS/.test(ua) ? 'Firefox' : /Chrome\/|CriOS/.test(ua) ? 'Chrome'
+    : IOS || /Safari\//.test(ua) ? 'Safari' : 'Browser';
+  const name = STANDALONE ? 'Fusebox app' : browser;
+  return os ? `${name} on ${os}` : name;
+}
+
+function pushKey(text) {
+  const b64 = text.replace(/-/g, '+').replace(/_/g, '/');
+  return Uint8Array.from(atob(b64 + '='.repeat((4 - (b64.length % 4)) % 4)), (c) => c.charCodeAt(0));
+}
+
+const sameBytes = (a, b) => !!a && a.byteLength === b.byteLength && new Uint8Array(a).every((x, i) => x === b[i]);
+const pushMine = () => (S.push.status?.subscriptions || []).find((d) => d.endpoint === S.push.endpoint);
+
+async function loadPush() {
+  const p = S.push;
+  p.loading = true;
+  try {
+    p.status = await api('/push');
+    if (pushReady()) {
+      const reg = await navigator.serviceWorker.getRegistration('/');
+      p.endpoint = (await reg?.pushManager.getSubscription())?.endpoint || null;
+    }
+  } catch (e) {
+    p.msg = e.message;
+  }
+  p.loading = false;
+  p.loaded = true;
+  patch('push-device', pushDeviceInner);
+}
+
+function pushDeviceHTML() {
+  if (!S.push.loaded && !S.push.loading) loadPush();
+  return `<div class="cfg-list wide" id="push-device">${pushDeviceInner()}</div>`;
+}
+
+function pushDeviceInner() {
+  const p = S.push;
+  const mine = pushMine();
+  const button = (act, label) => `<button type="button" class="btn" data-act="${act}" ${p.busy ? 'disabled' : ''}>${label}</button>`;
+  let text;
+  let actions = '';
+  if (!window.isSecureContext) {
+    text = 'Notifications need HTTPS. Open the dashboard over HTTPS, for example through tailscale serve, or on this machine at localhost.';
+  } else if (!pushReady()) {
+    text = IOS && !STANDALONE
+      ? 'On iPhone and iPad, add Fusebox to your Home Screen first: tap Share, then Add to Home Screen, and open it from there.'
+      : 'This browser can\u2019t receive push notifications.';
+  } else if (Notification.permission === 'denied') {
+    text = 'Notifications are blocked for this site. Allow them in the browser\u2019s site settings, then reload.';
+  } else if (!p.loaded) {
+    text = 'Checking\u2026';
+  } else if (mine) {
+    text = `On. ${mine.label} gets the events below, even when Fusebox isn\u2019t open.`;
+    actions = button('push-test', 'Send test') + button('push-off', 'Turn off');
+  } else {
+    text = 'Off. Turn it on to get the events below on this device, even when Fusebox isn\u2019t open.';
+    actions = button('push-on', 'Turn on');
+  }
+  const day = (iso) => new Date(iso).toLocaleDateString('en-GB', { day: 'numeric', month: 'short', year: 'numeric' });
+  const others = (p.status?.subscriptions || []).filter((d) => d !== mine);
+  return `<div class="cfg-list-head"><div class="cell2"><h3>This device</h3><p class="cfg-description">${esc(text)}</p></div>${actions ? `<div class="push-actions">${actions}</div>` : ''}</div>
+    ${p.msg ? `<p class="msg err" role="alert">${esc(p.msg)}</p>` : ''}
+    ${others.length ? `<div class="push-devices"><span class="label">Other devices</span>${others.map((d) => `<div class="push-device">
+      <span class="dot s6 ok" aria-hidden="true"></span><span class="grow"><span>${esc(d.label)}</span><span class="meta">${esc(d.origin.replace(/^https?:\/\//, ''))} \u00b7 added ${esc(day(d.created_at))}</span></span>
+      <button type="button" class="btn sm" data-act="push-remove" data-id="${esc(d.id)}" ${p.busy ? 'disabled' : ''} aria-label="Remove ${esc(d.label)}">Remove</button></div>`).join('')}</div>` : ''}`;
+}
+
+async function pushOn() {
+  // Ask first, while the click still counts as the user's gesture.
+  const permission = await Notification.requestPermission();
+  if (permission !== 'granted') throw new Error(permission === 'denied' ? 'Notifications are blocked for this site.' : 'Notifications were not allowed.');
+  await navigator.serviceWorker.register('/sw.js');
+  const reg = await navigator.serviceWorker.ready;
+  const key = pushKey(S.push.status.public_key);
+  let sub = await reg.pushManager.getSubscription();
+  // A subscription made for another server key can't be reused.
+  if (sub && !sameBytes(sub.options.applicationServerKey, key)) { await sub.unsubscribe(); sub = null; }
+  sub ||= await reg.pushManager.subscribe({ userVisibleOnly: true, applicationServerKey: key });
+  const { endpoint, keys } = sub.toJSON();
+  await api('/push/subscriptions', { method: 'POST', body: JSON.stringify({ endpoint, keys, origin: location.origin, label: deviceLabel() }) });
+  S.push.endpoint = endpoint;
+  toast('Notifications are on');
+}
+
+async function pushOff() {
+  const mine = pushMine();
+  if (mine) await api(`/push/subscriptions/${encodeURIComponent(mine.id)}`, { method: 'DELETE' });
+  const reg = await navigator.serviceWorker.getRegistration('/');
+  await (await reg?.pushManager.getSubscription())?.unsubscribe();
+  S.push.endpoint = null;
+  toast('Notifications are off');
+}
+
+async function pushAction(act, id) {
+  const p = S.push;
+  if (p.busy) return;
+  p.busy = true;
+  p.msg = null;
+  patch('push-device', pushDeviceInner);
+  try {
+    if (act === 'push-on') await pushOn();
+    else if (act === 'push-off') await pushOff();
+    else if (act === 'push-test') {
+      await api('/push/test', { method: 'POST', body: JSON.stringify({ id: pushMine()?.id }) });
+      toast('Test notification sent');
+    } else if (act === 'push-remove') await api(`/push/subscriptions/${encodeURIComponent(id)}`, { method: 'DELETE' });
+  } catch (e) {
+    p.msg = e.message;
+  }
+  p.busy = false;
+  await loadPush();
+}
+
 // ---------------------------------------------------------------- lock
 
 function lockHTML() {
   if (S.locked === 'remote') {
     return `<div class="lock"><h1>Dashboard is local-only</h1>
-      <p>Without a management key the dashboard only answers on localhost. Set <span class="mono">management-key</span> in config.yaml on the server, then reload this page.</p></div>`;
+      <p>Without a management key the dashboard only answers on localhost, and not through a proxy such as tailscale serve, nginx or Caddy. Set <span class="mono">management-key</span> in config.yaml on the server, then reload this page.</p></div>`;
   }
   return `<div class="lock"><h1>Dashboard locked</h1>
     <p>Enter the <span class="mono">management-key</span> from config.yaml.</p>
@@ -2443,6 +2600,7 @@ document.addEventListener('click', (e) => {
     case 'copy': return copy(el);
     case 'copy-model': return copyText(id).then(() => toast(`Copied ${id}`));
     case 'privacy': return togglePrivacy();
+    case 'push-on': case 'push-off': case 'push-test': case 'push-remove': return pushAction(act, id);
     case 'palette': return openPalette();
     case 'close-palette': return closePalette();
     case 'faults': return toggleFaults(el);
@@ -2737,6 +2895,18 @@ async function boot() {
 
 $('#layer').innerHTML = '<div id="lay-faults"></div><div id="lay-drawer"></div><div id="lay-pal"></div>';
 window.addEventListener('hashchange', onRoute);
+document.addEventListener('visibilitychange', resume);
+addEventListener('pageshow', (e) => { if (e.persisted) resume(); });
+// The service worker makes the dashboard installable and shows push notifications;
+// a clicked notification asks an open dashboard to go to its page.
+if (window.isSecureContext && 'serviceWorker' in navigator) {
+  navigator.serviceWorker.register('/sw.js').catch(() => {});
+  navigator.serviceWorker.addEventListener('message', (e) => {
+    if (e.data?.type !== 'open') return;
+    const url = new URL(e.data.url, location.href);
+    if (url.origin === location.origin && url.hash) location.hash = url.hash;
+  });
+}
 {
   const { route, sub, query } = parseHash();
   S.route = route;

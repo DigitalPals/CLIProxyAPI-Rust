@@ -241,6 +241,8 @@ Choose **Used** or **Remaining** beside the quota meters (or press <kbd>U</kbd>)
 
 <kbd>⌘K</kbd> / <kbd>Ctrl K</kbd> or <kbd>/</kbd> opens a command palette for accounts, models and actions such as connecting an account or clearing cooldowns. The faults button in the top bar lists what has tripped: expired sign-ins, used-up limits, rate limits and runs of failed requests.
 
+**Install it as an app, with notifications.** Over HTTPS (or on `localhost`) the dashboard installs like an app: from Chrome or Edge's install button, Safari's **Add to Dock**, or **Add to Home Screen** on a phone. It opens in its own window, shows the number of faults on its icon, and can send push notifications when a sign-in expires or every account of a provider is used up (and when one is back). Turn them on per device under **Config, Notifications** and choose the events there. See [notifications](docs/notifications.md).
+
 **Banked resets** (off by default). Claude and ChatGPT sometimes give subscribers saved resets that clear a usage limit early. Turn on `banked-resets` (Config, Connections) and subscriptions that have some show “↻ 2 resets banked” under their status; click it to see expiry dates and spend one, always with a confirmation. It relies on unofficial provider endpoints, checks every 30 minutes, and keeps a crash-safe journal so a reset is never spent twice. See [banked resets](docs/banked-resets.md).
 
 <sub>Screenshots use sample data.</sub>
@@ -271,6 +273,15 @@ session-affinity-idle-seconds: 86400 # forget assignments after a day without re
 codex-websockets: true        # native WebSocket relay to ChatGPT
 claude-cloak: true            # present non-Claude-Code clients as Claude Code on OAuth accounts
 banked-resets: false          # show and spend banked Claude/ChatGPT limit resets (unofficial endpoints)
+tls:                          # serve HTTPS directly (or put a proxy in front, see below)
+  enable: false
+  cert: "/etc/fusebox/cert.pem"
+  key: "/etc/fusebox/key.pem"
+notifications:                # push notifications, for devices that turn them on
+  sign-in-expired: true
+  provider-exhausted: true    # every account of a provider is out, and when one is back
+  account-used-up: false
+  account-errors: false
 
 claude-api-key:
   - api-key: "sk-ant-..."
@@ -357,6 +368,56 @@ WantedBy=multi-user.target
 
 To sign in accounts on a server, open the dashboard, click **Connect account**, approve in your browser, then paste the `localhost` URL the browser lands on (it won't load, which is expected). Grok, Kimi and Meta use device codes, so they work from anywhere with nothing to paste. `fusebox login <provider>` on the server works the same way.
 
+### HTTPS with Tailscale, nginx or Caddy
+
+Installing the dashboard as an app and push notifications need HTTPS. Either give Fusebox a certificate (`tls` in the config above) or keep it on `127.0.0.1` and put an HTTPS proxy in front. **Behind any proxy, set a `management-key`:** a proxy on the same machine connects from `127.0.0.1`, which Fusebox would otherwise trust as local. Fusebox recognises Tailscale, nginx and Caddy by the `X-Forwarded-For` header they add and asks them for the key, but a proxy that forwards raw TCP adds nothing. Set `api-keys` too, unless everyone who can reach the proxy may use your accounts.
+
+**Tailscale.** With [HTTPS certificates](https://tailscale.com/kb/1153/enabling-https) enabled for your tailnet, this serves Fusebox at `https://<machine>.<tailnet>.ts.net` to your tailnet only:
+
+```sh
+tailscale serve --bg 8317
+```
+
+If Fusebox itself serves HTTPS with its own certificate, point Tailscale at it with `tailscale serve --bg https+insecure://127.0.0.1:8317`. `tailscale funnel` would put the dashboard on the public internet; don't, unless you mean to.
+
+**nginx.** Pass websocket upgrades (the dashboard's live view, Codex), don't buffer streamed responses, and allow long streams and large requests:
+
+```nginx
+server {
+    listen 443 ssl;
+    server_name fusebox.example.com;
+    ssl_certificate     /etc/letsencrypt/live/fusebox.example.com/fullchain.pem;
+    ssl_certificate_key /etc/letsencrypt/live/fusebox.example.com/privkey.pem;
+
+    location / {
+        proxy_pass http://127.0.0.1:8317;
+        proxy_http_version 1.1;
+        proxy_set_header Upgrade $http_upgrade;
+        proxy_set_header Connection $connection_upgrade;
+        proxy_set_header Host $host;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto $scheme;
+        proxy_buffering off;
+        proxy_read_timeout 600s;
+        proxy_send_timeout 600s;
+        client_max_body_size 256m;
+    }
+}
+
+# in the http block:
+map $http_upgrade $connection_upgrade { default upgrade; '' close; }
+```
+
+**Caddy** gets a certificate and handles all of that by itself:
+
+```caddy
+fusebox.example.com {
+    reverse_proxy 127.0.0.1:8317
+}
+```
+
+The dashboard sends its key in the live view's URL (browsers can't set headers on a websocket), so it can appear in the proxy's access log; keep that log private or turn it off for this site.
+
 ## How it works
 
 ```text
@@ -405,7 +466,7 @@ Plugins are Go shared libraries loaded into CLIProxyAPI's process, and the Redis
 
 **Where are my credentials stored?** In `auth-dir`, one JSON file per account, written with `0600` permissions. It defaults to `~/.fusebox`; if that doesn't exist but `~/.cli-proxy-api` (CLIProxyAPI's directory, and this project's before it was renamed) does, that one is used and the server says so at startup. Setting `auth-dir` always wins. Nothing leaves your machine except requests to the providers you use.
 
-**Does it phone home?** No. There is no telemetry and the dashboard loads no external assets.
+**Does it phone home?** No. There is no telemetry and the dashboard loads no external assets. If you turn on notifications, Fusebox sends end-to-end encrypted messages to your browser's push service (Google, Mozilla or Apple), which delivers them to your device; nothing else.
 
 **Claude sign-in fails or gets blocked.** Some Anthropic endpoints sit behind bot protection that CLIProxyAPI works around with a browser TLS fingerprint. Fusebox uses standard rustls. If token exchange fails for you, please open an issue with the error from the dashboard.
 

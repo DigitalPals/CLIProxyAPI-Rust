@@ -98,6 +98,7 @@ pub fn values(text: &str) -> Result<Value> {
     let mut values = serde_json::to_value(&cfg)?;
     let obj = values.as_object_mut().unwrap();
     obj.insert("tls".into(), serde_json::to_value(&cfg.tls)?);
+    obj.insert("notifications".into(), serde_json::to_value(cfg.notifications)?);
     obj.insert("management-allow-remote".into(), json!(cfg.management_allow_remote));
     obj.insert("force-model-prefix".into(), json!(cfg.force_model_prefix));
     obj.insert("oauth-model-alias".into(), json!(cfg.oauth_model_alias));
@@ -478,6 +479,10 @@ fn validate(values: &Value, changes: &Map<String, Value>) -> Result<()> {
             | "debug" => {
                 ensure!(value.is_boolean(), "{field}: use a boolean")
             }
+            "notifications" => ensure!(
+                value.as_object().is_some_and(|o| o.values().all(Value::is_boolean)),
+                "Notifications: use on or off for each event"
+            ),
             _ => {}
         }
     }

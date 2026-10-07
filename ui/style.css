@@ -220,7 +220,8 @@ h1, h2, h3, p { margin: 0; }
 
 .bar {
   position: sticky; top: 0; z-index: 20; display: flex; align-items: center; gap: clamp(10px, 1.2vw, 16px);
-  height: 56px; padding: 0 var(--pad-x); background: var(--bg); border-bottom: 1px solid var(--line); white-space: nowrap;
+  height: calc(56px + env(safe-area-inset-top)); padding: env(safe-area-inset-top) var(--pad-x) 0;
+  background: var(--bg); border-bottom: 1px solid var(--line); white-space: nowrap;
 }
 .brand { display: flex; align-items: center; flex: none; color: var(--fg); }
 .brand:hover { color: var(--fg); }
@@ -249,7 +250,7 @@ h1, h2, h3, p { margin: 0; }
 .mbar, .mtabs { display: none; }
 @media (max-width: 759px) {
   .bar { display: none; }
-  .mbar { position: sticky; top: 0; z-index: 20; display: flex; align-items: center; gap: 10px; height: 52px; padding: 0 12px 0 16px; background: var(--bg); border-bottom: 1px solid var(--line); }
+  .mbar { position: sticky; top: 0; z-index: 20; display: flex; align-items: center; gap: 10px; height: calc(52px + env(safe-area-inset-top)); padding: env(safe-area-inset-top) 12px 0 16px; background: var(--bg); border-bottom: 1px solid var(--line); }
   .mbar .wordmark { display: block; height: 16px; width: auto; aspect-ratio: 4327 / 914; color: var(--fg); }
   .mbar .mark { display: block; width: 18px; height: 21px; flex: none; color: var(--fg); }
   .mbar .title { font: 600 15px/1 var(--cond); letter-spacing: .1em; text-transform: uppercase; }
@@ -568,7 +569,7 @@ h1, h2, h3, p { margin: 0; }
 .pal-none { padding: 20px 10px; color: var(--fg-3); font-size: 13px; }
 .pal-foot { display: flex; gap: 16px; padding: 9px 16px; border-top: 1px solid var(--line); font-size: 11.5px; color: var(--fg-3); }
 @media (max-width: 759px) {
-  .palette { top: 12px; left: 12px; width: calc(100% - 24px); }
+  .palette { top: calc(12px + env(safe-area-inset-top)); left: 12px; width: calc(100% - 24px); }
   .pal-list { max-height: calc(100dvh - 160px); }
   .pal-item { min-height: 44px; }
 }
@@ -585,8 +586,8 @@ h1, h2, h3, p { margin: 0; }
 .fault-item .mono { font-size: 12px; color: var(--fg-3); }
 .fault-item .chev { display: none; color: var(--fg-3); }
 @media (max-width: 759px) {
-  .scrim.menu { top: 52px; background: rgba(0, 0, 0, .5); }
-  .faults-menu { top: 58px; left: 8px; right: 8px; width: auto; max-width: none; }
+  .scrim.menu { top: calc(52px + env(safe-area-inset-top)); background: rgba(0, 0, 0, .5); }
+  .faults-menu { top: calc(58px + env(safe-area-inset-top)); left: 8px; right: 8px; width: auto; max-width: none; }
   .fault-item { align-items: center; min-height: 56px; padding: 8px 10px; }
   .fault-item > .dot { margin-top: 0; }
   .fault-item b { font-size: 14px; }
@@ -895,6 +896,12 @@ h1, h2, h3, p { margin: 0; }
 .cfg-row .fork { display: flex; align-items: center; gap: 8px; height: 34px; padding: 0; background: none; border: 0; font-size: 12.5px; color: var(--fg-2); white-space: nowrap; }
 .cfg-row.labelled .arrow, .cfg-row.labelled .btn, .cfg-row.labelled .fork { margin-top: 25px; }
 .cfg-empty { font-size: 13px; color: var(--fg-3); }
+.push-actions { display: flex; flex-wrap: wrap; justify-content: flex-end; gap: 8px; }
+.push-devices { display: flex; flex-direction: column; gap: 2px; margin-top: 4px; }
+.push-devices .label { margin-bottom: 4px; }
+.push-device { display: flex; align-items: center; gap: 10px; min-height: 40px; padding: 4px 0; border-top: 1px solid var(--line-soft); }
+.push-device .grow { display: flex; flex-wrap: wrap; align-items: baseline; gap: 2px 8px; min-width: 0; font-size: 13px; }
+.push-device .meta { font-size: 12px; }
 .cfg-empty-state { display: flex; flex-direction: column; align-items: center; gap: 4px; padding: 28px 20px; text-align: center; border: 1px dashed var(--line-strong); border-radius: 8px; }
 .cfg-empty-state h3 { font-size: 14px; font-weight: 500; }
 .cfg-empty-state p { font-size: 13px; color: var(--fg-3); }
@@ -1254,4 +1261,11 @@ details[open] > summary .cfg-chevron { transform: rotate(90deg); }
   .u-figs { grid-template-columns: repeat(2, minmax(0, 1fr)); }
   .u-drawer .btn, .u-inline input { min-height: 44px; }
   .u-drawer .close-btn { min-height: 44px; }
+}
+
+/* iOS zooms into a focused field set below 16px, and in an installed app the zoom can
+   stick, so touch screens get 16px fields. */
+@media (pointer: coarse) {
+  .input, .field input, .field select, .field textarea, .lock input, .searchbox input, .pal-input input, .editor,
+  .reset-selection select, .u-field input, .u-inline input, .u-inline input[name="label"], .u-custom input { font-size: 16px; }
 }

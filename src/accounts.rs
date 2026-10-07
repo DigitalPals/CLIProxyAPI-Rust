@@ -339,6 +339,30 @@ pub struct AccountState {
     pub quota: crate::quota::Quota,
 }
 
+impl AccountState {
+    /// What pauses the account, per model ("*" = every model): until when, and why
+    /// (`rate_limit`, spent subscription `quota`, or a quota check, `checking`).
+    pub fn pauses(&self, now: DateTime<Utc>) -> BTreeMap<String, (DateTime<Utc>, &'static str)> {
+        let mut pauses: BTreeMap<String, (DateTime<Utc>, &'static str)> =
+            self.cooldowns.iter().filter(|(_, t)| **t > now).map(|(k, t)| (k.clone(), (*t, "rate_limit"))).collect();
+        for (model, deadline) in &self.quota_cooldowns {
+            if *deadline > now && pauses.get(model).is_none_or(|(t, _)| deadline > t) {
+                pauses.insert(model.clone(), (*deadline, "quota"));
+            }
+        }
+        if self.quota_refreshing {
+            pauses.insert("*".into(), (now + chrono::Duration::seconds(30), "checking"));
+        }
+        // A used-up usage window blocks every model until it resets.
+        if let Some(t) = self.quota.exhausted_until("")
+            && !pauses.contains_key("*")
+        {
+            pauses.insert("*".into(), (t, "quota"));
+        }
+        pauses
+    }
+}
+
 /// Counts an actual request attempt, including streaming, until completion or cancellation.
 pub struct RequestLoad(Arc<AtomicUsize>);
 
@@ -583,32 +607,9 @@ impl Account {
 
     pub fn snapshot(&self) -> Value {
         let st = self.state.lock();
-        let now = Utc::now();
-        let mut cooldowns: BTreeMap<&str, String> =
-            st.cooldowns.iter().filter(|(_, t)| **t > now).map(|(k, t)| (k.as_str(), t.to_rfc3339())).collect();
-        // Why each model is paused: a rate limit, spent subscription quota, or a quota check.
-        let mut kinds: BTreeMap<&str, &str> = cooldowns.keys().map(|k| (*k, "rate_limit")).collect();
-        for (model, deadline) in &st.quota_cooldowns {
-            if *deadline > now {
-                let value = deadline.to_rfc3339();
-                let later = cooldowns.get(model.as_str()).is_none_or(|v| value > *v);
-                if later {
-                    cooldowns.insert(model.as_str(), value);
-                    kinds.insert(model.as_str(), "quota");
-                }
-            }
-        }
-        if st.quota_refreshing {
-            cooldowns.insert("*", (now + chrono::Duration::seconds(30)).to_rfc3339());
-            kinds.insert("*", "checking");
-        }
-        // A used-up usage window blocks every model until it resets.
-        if let Some(t) = st.quota.exhausted_until("")
-            && !cooldowns.contains_key("*")
-        {
-            cooldowns.insert("*", t.to_rfc3339());
-            kinds.insert("*", "quota");
-        }
+        let pauses = st.pauses(Utc::now());
+        let cooldowns: BTreeMap<&str, String> = pauses.iter().map(|(k, (t, _))| (k.as_str(), t.to_rfc3339())).collect();
+        let kinds: BTreeMap<&str, &str> = pauses.iter().map(|(k, (_, kind))| (k.as_str(), *kind)).collect();
         let (kind, expires, email) = match &*self.cred.read() {
             Credential::OAuth(o) if o.raw.contains_key("service_account") => ("service-account", None, o.email.clone()),
             Credential::OAuth(o) => ("oauth", o.expires_at.map(|t| t.to_rfc3339()), o.email.clone()),

@@ -291,6 +291,7 @@ pub fn parse_pasted(input: &str) -> (String, Option<String>) {
 pub fn router(app: Arc<App>) -> Router<Arc<App>> {
     Router::new()
         .merge(crate::usage::api::router())
+        .merge(crate::push::router())
         .route("/overview", get(overview))
         .route("/accounts", get(accounts))
         .route("/accounts/{id}", delete(delete_account))
@@ -329,16 +330,22 @@ async fn auth(
         return err(StatusCode::UNAUTHORIZED, "collector credentials are ingestion-only");
     }
     let key = cfg.management_key.clone();
+    let loopback = addr.ip().to_canonical().is_loopback();
+    let local = loopback && !proxied(req.headers());
     if key.is_empty() {
-        if addr.ip().is_loopback() {
+        if local {
             return next.run(req).await;
         }
         return err(
             StatusCode::FORBIDDEN,
-            "the dashboard is only reachable from localhost until you set management-key",
+            if loopback {
+                "requests through a proxy (tailscale serve, nginx, Caddy) need management-key"
+            } else {
+                "the dashboard is only reachable from localhost until you set management-key"
+            },
         );
     }
-    if cfg.management_allow_remote == Some(false) && !addr.ip().is_loopback() {
+    if cfg.management_allow_remote == Some(false) && !local {
         return err(StatusCode::FORBIDDEN, "remote management is off (allow-remote: false)");
     }
     let bearer = req
@@ -355,6 +362,13 @@ async fn auth(
         return next.run(req).await;
     }
     err(StatusCode::UNAUTHORIZED, "management key required")
+}
+
+/// A reverse proxy on the same host (tailscale serve, nginx, Caddy) connects from
+/// loopback, but its forwarding headers show the request came from somewhere else.
+/// Proxies that forward raw TCP add nothing, so behind those only a key protects.
+fn proxied(headers: &axum::http::HeaderMap) -> bool {
+    ["forwarded", "x-forwarded-for", "x-real-ip", "tailscale-user-login"].iter().any(|h| headers.contains_key(*h))
 }
 
 /// Plain keys compare in constant time; bcrypt hashes (CLIProxyAPI hashes
@@ -947,6 +961,47 @@ async fn live(State(app): State<Arc<App>>, ws: WebSocketUpgrade) -> Response {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn requests_through_a_local_proxy_need_the_management_key() {
+        let app = App::new(
+            Config { auth_dir: "/nonexistent".into(), ..Default::default() },
+            "/nonexistent/config.yaml".into(),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let origin = format!("http://{}", listener.local_addr().unwrap());
+        let service = router(app.clone()).with_state(app.clone()).into_make_service_with_connect_info::<SocketAddr>();
+        let server = tokio::spawn(async move { axum::serve(listener, service).await.unwrap() });
+        let client = reqwest::Client::new();
+        let status = |header: Option<(&'static str, &'static str)>, key: Option<&'static str>| {
+            let mut req = client.get(format!("{origin}/requests"));
+            if let Some((name, value)) = header {
+                req = req.header(name, value);
+            }
+            if let Some(key) = key {
+                req = req.bearer_auth(key);
+            }
+            async move { req.send().await.unwrap().status().as_u16() }
+        };
+        let tailscale = Some(("tailscale-user-login", "someone@example.com"));
+        let nginx = Some(("x-forwarded-for", "100.64.0.7"));
+
+        assert_eq!(status(None, None).await, 200, "localhost needs no key");
+        assert_eq!(status(tailscale, None).await, 403);
+        assert_eq!(status(nginx, None).await, 403);
+        assert_eq!(status(Some(("forwarded", "for=192.0.2.60")), None).await, 403);
+
+        let mut cfg = (*app.cfg()).clone();
+        cfg.management_key = "secret".into();
+        app.set_config(cfg.clone());
+        assert_eq!(status(nginx, None).await, 401);
+        assert_eq!(status(nginx, Some("secret")).await, 200);
+        cfg.management_allow_remote = Some(false);
+        app.set_config(cfg);
+        assert_eq!(status(nginx, Some("secret")).await, 403, "a proxied request is remote");
+        assert_eq!(status(None, Some("secret")).await, 200);
+        server.abort();
+    }
 
     #[tokio::test]
     async fn pinned_session_activity_preserves_missing_and_partial_usage() {

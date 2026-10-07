@@ -157,7 +157,7 @@ Self-hosted from `ui/fonts/` (latin subset, SIL OFL 1.1), served at `/ui/fonts/*
 
 ## Layout
 
-Fluid and full width (no max-width container). Desktop: a 56px header with the wordmark (the mark below 900px), five tabs (Overview, Accounts, Requests, Models, Config), the search button (⌘K), the faults button, the privacy toggle and Live / Reconnecting. Phones (below 760px): a 52px header (the wordmark on Overview, otherwise the mark and the page title) and a 64px bottom tab bar with an amber 16×2px indicator.
+Fluid and full width (no max-width container). Desktop: a 56px header with the wordmark (the mark below 900px), five tabs (Overview, Accounts, Requests, Models, Config), the search button (⌘K), the faults button, the privacy toggle and Live / Reconnecting. Phones (below 760px): a 52px header (the wordmark on Overview, otherwise the mark and the page title) and a 64px bottom tab bar with an amber 16×2px indicator. Both headers grow by the top safe area and the tab bar by the bottom one, so an installed iPhone app (black-translucent status bar) draws under neither.
 
 Overview, top to bottom: the main line (endpoint, key, model count and "Set up a client", open until the first request), then Load · last 60 min across the full width, Subscriptions, Other circuits, Latest requests. Tripped accounts are listed by the faults button in the top bar, not on the page. On phones the order is main line, subscriptions, load, other circuits, latest requests, and the faults button sits in the header on every page.
 
@@ -183,6 +183,8 @@ Flat. Panels are `surface` with a 1px `line` hairline. The only shadow is on flo
 - **Faults.** Derived from account state and the request log: expired sign-ins, used-up limits, rate limits, account errors and three or more failed requests in an hour.
 - **Toast.** Bottom centre, `fg` on `bg`, for 1.6s.
 - **Fresh rows.** A new request row shows `row-fresh` for 1.5s, then fades (no transition with reduced motion).
+- **Notifications.** Config, Notifications: "This device" (status line, Turn on / Send test / Turn off), the other subscribed devices with Remove, then a switch per event. The device controls act at once; the events save with the page.
+- **App badge.** An installed app shows the fault count on its icon.
 - **Privacy.** Emails read `••••••@••••••`, key ends `••••…••••`, the client key `fbx_••••••••`; copy buttons still copy the real value.
 
 ## Do's and Don'ts
@@ -191,5 +193,6 @@ Flat. Panels are `surface` with a 1px `line` hairline. The only shadow is on flo
 - Do show the time until an account comes back.
 - Do keep one primary (off-white) button per view at most.
 - Do give every control a visible 2px focus ring (`line-hover`) and 44px touch targets on phones.
+- Do set text fields to 16px on touch screens (`pointer: coarse`); iOS zooms into smaller ones, and in an installed app the zoom can stick.
 - Don't use colour for anything but state and provider logos.
 - Don't use monospace for prose or labels, or the condensed face for reading text.
