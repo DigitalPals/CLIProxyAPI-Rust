@@ -170,7 +170,7 @@ impl Tracker {
         }
     }
 
-    fn observe_stream_event(&mut self, event: &Event) {
+    pub(crate) fn observe_stream_event(&mut self, event: &Event) {
         match event {
             Event::Usage(usage) => self.stream_usage.merge(usage),
             Event::Error { status, message } => self.stream_error = Some((*status, message.clone())),
@@ -183,6 +183,9 @@ impl Tracker {
     }
 
     fn finish_stream(&mut self) {
+        if !self.stream_finished && self.stream_error.is_none() {
+            self.observe_stream_event(&premature_end());
+        }
         let usage = self.stream_usage.clone();
         match self.stream_error.take() {
             Some((status, message)) => self.finish(status, &usage, Some(message)),
@@ -454,26 +457,14 @@ fn apply_native_reasoning(format: Format, body: &mut Value, r: &Reasoning, model
             } else if formats::claude::uses_budget_thinking(model) {
                 if let Some(b) = r.budget_tokens() {
                     let max = body["max_tokens"].as_u64().unwrap_or(formats::claude::default_max_tokens(model));
-                    body["thinking"] =
-                        json!({ "type": "enabled", "budget_tokens": b.min(max.saturating_sub(1024)).max(1024) });
+                    body["thinking"] = json!({ "type": "enabled", "budget_tokens": formats::claude::thinking_budget(max, b).unwrap_or(1024) });
                 }
             } else if let Some(e) = r.effort_level() {
                 body["thinking"] = json!({ "type": "adaptive" });
                 body["output_config"]["effort"] = e.into();
             }
         }
-        Format::Gemini => {
-            let tc = &mut body["generationConfig"]["thinkingConfig"];
-            if model.starts_with("gemini-3") {
-                if let Some(e) = r.effort_level() {
-                    tc["thinkingLevel"] = (if e == "low" || e == "minimal" { "low" } else { "high" }).into();
-                }
-            } else if r.disabled {
-                tc["thinkingBudget"] = 0.into();
-            } else if let Some(b) = r.budget_tokens() {
-                tc["thinkingBudget"] = b.into();
-            }
-        }
+        Format::Gemini => formats::gemini::apply_native_reasoning(body, r, model),
     }
 }
 
@@ -568,7 +559,10 @@ pub async fn execute(app: Arc<App>, mut call: Call) -> Reply {
                     }
                     yield frame;
                 }
-                if end_session && let Some(session) = &session { app.sessions.end(session); }
+                if end_session && let Some(session) = &session {
+                    app.sessions.end(session);
+                    app.sessions.save_async().await;
+                }
             });
             Reply::Stream { frames, account }
         }
@@ -578,6 +572,7 @@ pub async fn execute(app: Arc<App>, mut call: Call) -> Reply {
             }
             if end_session && let Some(session) = &session {
                 app.sessions.end(session);
+                app.sessions.save_async().await;
             }
             Reply::Json(v)
         }
@@ -611,36 +606,51 @@ async fn execute_inner(app: Arc<App>, call: Call) -> Reply {
 
     while tried.len() < attempts {
         let pin = retry_same.take();
+        // A retry on a temporary detour must stay on that account without
+        // replacing the session's long-lived assignment to its original account.
+        let retry = pin.as_deref().and_then(|id| app.pool.get(id)).and_then(|account| {
+            if tried.contains(&account.id) || account.state.lock().disabled || account.cooling_until(&model).is_some() {
+                return None;
+            }
+            app.pool.resolve_account(&account, &model, only.as_ref()).map(|model| crate::affinity::Selected {
+                account,
+                model,
+                strategy: cfg.routing,
+                reason: "retry_same",
+                previous_account: None,
+            })
+        });
         // A generated id only threads previous_response_id continuations; it must not
         // create an assignment for every request that arrives without a session.
-        let picked =
-            if cfg.session_affinity && call.session.is_some() && call.session_source != Some("generated_response") {
-                app.sessions.pick_with_reason(&app.pool, &cfg, &model, call.session.as_deref(), &tried, only.as_ref())
-            } else {
-                match app.sessions.pick_unbound(&app.pool, &cfg, &model, &tried, pin.as_deref(), only.as_ref()) {
-                    Pick::Ok(a, m) => Ok(crate::affinity::Selected {
-                        reason: if pin.as_deref() == Some(a.id.as_str()) {
-                            "retry_same"
-                        } else if !cfg.session_affinity {
-                            "affinity_disabled"
-                        } else {
-                            "missing_session"
-                        },
-                        account: a,
-                        model: m,
-                        strategy: cfg.routing,
-                        previous_account: None,
-                    }),
-                    Pick::Cooling(until) => Err((
-                        429,
-                        format!(
-                            "all accounts for {model} are rate limited; next available in {}s",
-                            (until - Utc::now()).num_seconds().max(1)
-                        ),
-                    )),
-                    Pick::None => Err((404, format!("no available account serves model `{model}`"))),
-                }
-            };
+        let picked = if let Some(retry) = retry {
+            Ok(retry)
+        } else if cfg.session_affinity && call.session.is_some() && call.session_source != Some("generated_response") {
+            app.sessions.pick_with_reason(&app.pool, &cfg, &model, call.session.as_deref(), &tried, only.as_ref())
+        } else {
+            match app.sessions.pick_unbound(&app.pool, &cfg, &model, &tried, pin.as_deref(), only.as_ref()) {
+                Pick::Ok(a, m) => Ok(crate::affinity::Selected {
+                    reason: if pin.as_deref() == Some(a.id.as_str()) {
+                        "retry_same"
+                    } else if !cfg.session_affinity {
+                        "affinity_disabled"
+                    } else {
+                        "missing_session"
+                    },
+                    account: a,
+                    model: m,
+                    strategy: cfg.routing,
+                    previous_account: None,
+                }),
+                Pick::Cooling(until) => Err((
+                    429,
+                    format!(
+                        "all accounts for {model} are rate limited; next available in {}s",
+                        (until - Utc::now()).num_seconds().max(1)
+                    ),
+                )),
+                Pick::None => Err((404, format!("no available account serves model `{model}`"))),
+            }
+        };
         let mut selected = match picked {
             Ok(pair) => pair,
             Err((status, msg)) => {
@@ -664,6 +674,7 @@ async fn execute_inner(app: Arc<App>, call: Call) -> Reply {
             selected.previous_account = pending.previous_account;
         }
         tracker.selected(&selected);
+        app.sessions.persist_selection(&selected).await;
         let (acct, upstream_model) = (selected.account, selected.model);
 
         if let Err(e) = crate::oauth::ensure_ready(&app, &acct).await {
@@ -723,6 +734,13 @@ async fn execute_inner(app: Arc<App>, call: Call) -> Reply {
             if native != Format::Claude {
                 names = shorten_tool_names(&mut req);
             }
+            if native == Format::Claude
+                && !devin
+                && let Err(message) = formats::claude::validate_thinking_budget(&req, &upstream_model)
+            {
+                tracker.finish(400, &Usage::default(), Some(message.clone()));
+                return error_reply(call.format, 400, &message);
+            }
             match native {
                 _ if devin => crate::devin::build_request(&req, &upstream_model),
                 Format::Claude => formats::claude::build_request(&req, &upstream_model),
@@ -743,6 +761,16 @@ async fn execute_inner(app: Arc<App>, call: Call) -> Reply {
         {
             tracker.finish(400, &Usage::default(), Some(message.clone()));
             return error_reply(call.format, 400, &message);
+        }
+        if native == Format::Claude
+            && !devin
+            && let Err(message) = formats::claude::validate_native_thinking_budget(&body, &upstream_model)
+        {
+            tracker.finish(400, &Usage::default(), Some(message.clone()));
+            return error_reply(call.format, 400, &message);
+        }
+        if !passthrough && provider == Provider::Claude {
+            formats::claude::apply_translated_cache_policy(&call.body, &mut body);
         }
 
         // Upstream streaming: always when translating (we re-render), and for Codex OAuth.
@@ -881,7 +909,14 @@ async fn execute_inner(app: Arc<App>, call: Call) -> Reply {
                 // Codex only streams: rebuild the final response object.
                 return collect_passthrough(Box::pin(resp.bytes_stream()), native, tracker, call.format).await;
             }
-            let text = resp.text().await.unwrap_or_default();
+            let text = match resp.text().await {
+                Ok(text) => text,
+                Err(e) => {
+                    let message = format!("upstream response read failed: {e}");
+                    tracker.finish(502, &Usage::default(), Some(message.clone()));
+                    return error_reply(call.format, 502, &message);
+                }
+            };
             let mut v: Value = match serde_json::from_str(&text) {
                 Ok(v) => v,
                 // An unlabelled stream after all: rebuild the final object from it.
@@ -889,13 +924,21 @@ async fn execute_inner(app: Arc<App>, call: Call) -> Reply {
                     let body = futures::stream::once(async move { Ok(bytes::Bytes::from(text)) });
                     return collect_passthrough(Box::pin(body), native, tracker, call.format).await;
                 }
-                Err(_) => Value::String(text),
+                Err(_) => {
+                    let message = "upstream returned an invalid JSON response";
+                    tracker.finish(502, &Usage::default(), Some(message.into()));
+                    return error_reply(call.format, 502, message);
+                }
             };
             if unwrap {
                 v = crate::antigravity::unwrap(v);
             }
             let mut agg = Aggregate::default();
-            formats::full_to_events(native, &v).iter().for_each(|e| agg.push(e));
+            checked_full_events(native, &v).iter().for_each(|e| agg.push(e));
+            if let Some((status, message)) = &agg.error {
+                tracker.finish(*status, &agg.usage, Some(message.clone()));
+                return error_reply(call.format, *status, message);
+            }
             tracker.finish(status, &agg.usage, None);
             return Reply::Json(v);
         }
@@ -924,6 +967,68 @@ async fn execute_inner(app: Arc<App>, call: Call) -> Reply {
 
 type EventStream = Pin<Box<dyn Stream<Item = Event> + Send>>;
 
+const PREMATURE_END: &str = "upstream ended before completing the response";
+
+fn premature_end() -> Event {
+    Event::Error { status: 502, message: PREMATURE_END.into() }
+}
+
+/// A clean transport EOF is not evidence that the model completed its turn.
+fn require_completion(mut events: EventStream) -> EventStream {
+    Box::pin(async_stream::stream! {
+        let mut finished = false;
+        while let Some(event) = events.next().await {
+            let failed = matches!(event, Event::Error { .. });
+            finished |= matches!(event, Event::Finish(_));
+            yield event;
+            if failed { return; }
+        }
+        if !finished { yield premature_end(); }
+    })
+}
+
+fn stream_error_frame(format: Format, status: u16, message: &str) -> Frame {
+    let mut body = formats::error_body(format, status, message);
+    if format == Format::Responses {
+        body["type"] = "error".into();
+        body["status"] = status.into();
+    }
+    Frame::named("error", body.to_string())
+}
+
+/// Full-body parsers assume a valid completed object; validate that assumption
+/// before allowing their default finish reasons to turn partial JSON into success.
+fn checked_full_events(format: Format, body: &Value) -> Vec<Event> {
+    let mut events = formats::full_to_events(format, body);
+    let response = if format == Format::Responses && body["response"].is_object() { &body["response"] } else { body };
+    if response["error"].is_object() || (format == Format::Responses && response["status"] == "failed") {
+        events.retain(|e| !matches!(e, Event::Finish(_) | Event::Error { .. }));
+        events.push(Event::Error {
+            status: response["error"]["code"].as_u64().filter(|s| (400..=599).contains(s)).unwrap_or(502) as u16,
+            message: if response["error"].is_object() {
+                error_message(&response.to_string())
+            } else {
+                "upstream response failed".into()
+            },
+        });
+        return events;
+    }
+    let valid = match format {
+        Format::Chat => body["choices"][0]["finish_reason"].is_string(),
+        Format::Claude => body["stop_reason"].is_string(),
+        Format::Responses => {
+            matches!(response["status"].as_str(), Some("completed" | "incomplete"))
+        }
+        // Gemini's parser already requires an explicit finishReason.
+        Format::Gemini => true,
+    };
+    if !valid || !events.iter().any(|e| matches!(e, Event::Finish(_) | Event::Error { .. })) {
+        events.retain(|e| !matches!(e, Event::Finish(_)));
+        events.push(premature_end());
+    }
+    events
+}
+
 /// Decodes the upstream body into IR events.
 fn event_stream(
     resp: reqwest::Response,
@@ -942,10 +1047,16 @@ fn event_stream(
     };
     if !is_sse {
         return Box::pin(async_stream::stream! {
-            let text = resp.text().await.unwrap_or_default();
+            let text = match resp.text().await {
+                Ok(text) => text,
+                Err(e) => {
+                    yield Event::Error { status: 502, message: format!("upstream response read failed: {e}") };
+                    return;
+                }
+            };
             observe_quota_event(&acct, &model, &text);
             let evs = match serde_json::from_str::<Value>(&text) {
-                Ok(v) => formats::full_to_events(native, &v),
+                Ok(v) => checked_full_events(native, &v),
                 // Mislabelled stream: decode it as SSE after all.
                 Err(_) => {
                     let mut dec = SseDecoder::default();
@@ -968,6 +1079,7 @@ fn event_stream(
         let mut dec = SseDecoder::default();
         let mut parser = formats::parser(native);
         let mut out = Vec::new();
+        let mut finished = false;
         loop {
             match body.next().await {
                 Some(Ok(chunk)) => {
@@ -977,6 +1089,7 @@ fn event_stream(
                     }
                 }
                 Some(Err(e)) => {
+                    if finished { return; }
                     out.push(Event::Error { status: 502, message: format!("upstream stream error: {e}") });
                     for ev in out.drain(..) { yield rename(ev); }
                     return;
@@ -990,7 +1103,10 @@ fn event_stream(
                     return;
                 }
             }
-            for ev in out.drain(..) { yield rename(ev); }
+            for ev in out.drain(..) {
+                finished |= matches!(ev, Event::Finish(_));
+                yield rename(ev);
+            }
         }
     })
 }
@@ -1000,13 +1116,14 @@ fn is_content(ev: &Event) -> bool {
 }
 
 fn render_stream(
-    mut events: EventStream,
+    events: EventStream,
     format: Format,
     model: String,
     req: Arc<Request>,
     mut tracker: Tracker,
 ) -> FrameStream {
     Box::pin(async_stream::stream! {
+        let mut events = require_completion(events);
         let mut renderer = formats::renderer(format, &model, &req);
         let mut frames = Vec::new();
         while let Some(ev) = events.next().await {
@@ -1021,7 +1138,8 @@ fn render_stream(
     })
 }
 
-async fn collect(mut events: EventStream, format: Format, model: &str, req: &Request, mut tracker: Tracker) -> Reply {
+async fn collect(events: EventStream, format: Format, model: &str, req: &Request, mut tracker: Tracker) -> Reply {
+    let mut events = require_completion(events);
     let mut agg = Aggregate::default();
     while let Some(ev) = events.next().await {
         if is_content(&ev) {
@@ -1044,20 +1162,40 @@ fn passthrough_stream(resp: reqwest::Response, native: Format, mut tracker: Trac
         let mut dec = SseDecoder::default();
         let mut parser = formats::parser(native);
         let mut evs = Vec::new();
+        let mut transport_error = None;
         loop {
             let (batch, end) = match body.next().await {
                 Some(Ok(chunk)) => (dec.push(&chunk), false),
                 Some(Err(e)) => {
-                    tracker.observe_stream_event(&Event::Error { status: 502, message: format!("upstream stream error: {e}") });
+                    transport_error = Some(format!("upstream stream error: {e}"));
                     (dec.finish(), true)
                 }
                 None => (dec.finish(), true),
             };
             for sse in batch {
+                if native == Format::Chat && sse.data.trim() == "[DONE]" {
+                    if !tracker.stream_finished && tracker.stream_error.is_none() {
+                        tracker.observe_stream_event(&premature_end());
+                        tracker.finish_stream();
+                        yield stream_error_frame(native, 502, PREMATURE_END);
+                    }
+                    tracker.finish_stream();
+                    yield Frame::data("[DONE]");
+                    return;
+                }
                 tracker.observe_quota_event(&sse.data);
                 parser.feed(&sse, &mut evs);
                 for ev in evs.drain(..) {
                     tracker.observe_stream_event(&ev);
+                }
+                let claude_stop = native == Format::Claude
+                    && (sse.event.as_deref() == Some("message_stop")
+                        || serde_json::from_str::<Value>(&sse.data).is_ok_and(|v| v["type"] == "message_stop"));
+                if claude_stop && !tracker.stream_finished && tracker.stream_error.is_none() {
+                    tracker.observe_stream_event(&premature_end());
+                    tracker.finish_stream();
+                    yield stream_error_frame(native, 502, PREMATURE_END);
+                    return;
                 }
                 let data = if unwrap {
                     serde_json::from_str::<Value>(&sse.data)
@@ -1071,6 +1209,12 @@ fn passthrough_stream(resp: reqwest::Response, native: Format, mut tracker: Trac
             if end {
                 break;
             }
+        }
+        if !tracker.stream_finished && tracker.stream_error.is_none() {
+            let message = transport_error.unwrap_or_else(|| PREMATURE_END.into());
+            tracker.observe_stream_event(&Event::Error { status: 502, message: message.clone() });
+            tracker.finish_stream();
+            yield stream_error_frame(native, 502, &message);
         }
         tracker.finish_stream();
     })
@@ -1090,7 +1234,7 @@ async fn collect_passthrough(mut body: ByteStream, native: Format, mut tracker: 
         parser.feed(&sse, &mut evs);
         evs.drain(..).for_each(|e| agg.push(&e));
         if let Ok(v) = serde_json::from_str::<Value>(&sse.data)
-            && matches!(v["type"].as_str(), Some("response.completed") | Some("response.incomplete"))
+            && matches!(v["type"].as_str(), Some("response.completed" | "response.incomplete" | "response.done"))
         {
             *final_obj = Some(v["response"].clone());
         }
@@ -1099,7 +1243,9 @@ async fn collect_passthrough(mut body: ByteStream, native: Format, mut tracker: 
         match chunk {
             Ok(c) => dec.push(&c).into_iter().for_each(|s| handle(s, &mut agg, &mut final_obj)),
             Err(e) => {
-                agg.error = Some((502, format!("upstream stream error: {e}")));
+                if agg.finish.is_none() {
+                    agg.error = Some((502, format!("upstream stream error: {e}")));
+                }
                 break;
             }
         }
@@ -1108,6 +1254,10 @@ async fn collect_passthrough(mut body: ByteStream, native: Format, mut tracker: 
     if let Some((status, msg)) = agg.error.clone() {
         tracker.finish(status, &agg.usage, Some(msg.clone()));
         return error_reply(format, status, &msg);
+    }
+    if agg.finish.is_none() {
+        tracker.finish(502, &agg.usage, Some(PREMATURE_END.into()));
+        return error_reply(format, 502, PREMATURE_END);
     }
     tracker.finish(200, &agg.usage, None);
     match final_obj {
@@ -1120,24 +1270,31 @@ async fn collect_passthrough(mut body: ByteStream, native: Format, mut tracker: 
             }
             Reply::Json(obj)
         }
-        None => error_reply(format, 502, "upstream ended without a response"),
+        None => Reply::Json(formats::render_full(
+            format,
+            &agg,
+            agg.model.as_deref().unwrap_or_default(),
+            &Request::default(),
+        )),
     }
 }
 
 // ------------------------------------------------------------------ utilities
 
 /// `/v1/messages/count_tokens`: ask Claude when possible, otherwise estimate.
-pub async fn count_tokens(app: Arc<App>, headers: HeaderMap, body: Value) -> Value {
+pub async fn count_tokens(app: Arc<App>, headers: HeaderMap, body: Value) -> (Value, bool) {
     let cfg = app.cfg();
     let (model, _) = ir::split_model_suffix(body["model"].as_str().unwrap_or_default());
     let (only, model) = app.pool.route(&model);
     let model = app.pool.canonical(&model, only.as_ref());
     let session = crate::affinity::session_key(&headers, &body);
-    if let Ok((acct, upstream_model)) =
-        app.sessions.pick(&app.pool, &cfg, &model, session.as_deref(), &[], only.as_ref())
-        && acct.provider == Provider::Claude
-        && crate::oauth::ensure_fresh(&app, &acct, Duration::minutes(5), false).await.is_ok()
+    if let Ok(selected) = app.sessions.pick_with_reason(&app.pool, &cfg, &model, session.as_deref(), &[], only.as_ref())
+        && selected.account.provider == Provider::Claude
+        && crate::oauth::ensure_fresh(&app, &selected.account, Duration::minutes(5), false).await.is_ok()
     {
+        app.sessions.persist_selection(&selected).await;
+        let acct = selected.account;
+        let upstream_model = selected.model;
         let p = upstream::prepare(
             &Target {
                 acct: &acct,
@@ -1151,28 +1308,23 @@ pub async fn count_tokens(app: Arc<App>, headers: HeaderMap, body: Value) -> Val
             },
             body.clone(),
         );
-        let mut rb = app.http.client(acct.proxy_url.as_deref()).post(&p.url);
+        let mut rb = app.http.control(acct.proxy_url.as_deref()).post(&p.url);
         for (k, v) in &p.headers {
             rb = rb.header(k.as_str(), v.as_str());
         }
         if let Ok(resp) = rb.json(&p.body).send().await
             && resp.status().is_success()
             && let Ok(v) = resp.json::<Value>().await
+            && v["input_tokens"].is_u64()
         {
-            return v;
+            return (v, false);
         }
     }
-    json!({ "input_tokens": estimate_tokens(&body) })
+    (json!({ "input_tokens": estimate_tokens(&body) }), true)
 }
 
 pub fn estimate_tokens(body: &Value) -> u64 {
-    let mut chars = 0usize;
-    for k in ["system", "messages", "tools", "contents", "input", "instructions"] {
-        if !body[k].is_null() {
-            chars += body[k].to_string().len();
-        }
-    }
-    (chars as u64 / 4).max(1)
+    crate::token_count::estimate_tokens(body)
 }
 
 #[cfg(test)]

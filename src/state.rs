@@ -22,6 +22,7 @@ pub struct App {
     pub startup_config: Config,
     pub pool: Pool,
     pub sessions: Arc<crate::affinity::Sessions>,
+    pub refresh_tasks: crate::oauth::RefreshTasks,
     pub http: Http,
     pub stats: Stats,
     pub logins: Mutex<HashMap<String, crate::mgmt::Login>>,
@@ -48,6 +49,7 @@ impl App {
             config_write: Mutex::new(()),
             pool,
             sessions,
+            refresh_tasks: Default::default(),
             stats: Stats::default(),
             logins: Mutex::new(HashMap::new()),
             reset_quotes: Mutex::new(HashMap::new()),
@@ -109,24 +111,36 @@ impl Http {
 
     /// Client for the given proxy (falls back to the configured default).
     pub fn client(&self, proxy: Option<&str>) -> reqwest::Client {
-        self.build(proxy, None, false)
+        self.build(proxy, None, false, false)
+    }
+
+    /// Short, bounded requests for credentials, discovery and usage data.
+    pub fn control(&self, proxy: Option<&str>) -> reqwest::Client {
+        self.build(proxy, None, false, true)
+    }
+
+    pub fn control_for_account(&self, acct: &crate::accounts::Account) -> reqwest::Client {
+        let h1_pool = (acct.provider == crate::accounts::Provider::Antigravity).then_some(acct.id.as_str());
+        self.build(acct.proxy_url.as_deref(), h1_pool, false, true)
     }
 
     /// Spending requests must never follow redirects or retry in the HTTP layer.
     pub fn for_reset(&self, proxy: Option<&str>) -> reqwest::Client {
-        self.build(proxy, None, true)
+        self.build(proxy, None, true, false)
     }
 
     /// Antigravity accounts each get their own HTTP/1.1 pool, as the IDE does;
     /// Google's backend treats shared HTTP/2 connections less kindly.
     pub fn for_account(&self, acct: &crate::accounts::Account) -> reqwest::Client {
         match acct.provider {
-            crate::accounts::Provider::Antigravity => self.build(acct.proxy_url.as_deref(), Some(&acct.id), false),
-            _ => self.build(acct.proxy_url.as_deref(), None, false),
+            crate::accounts::Provider::Antigravity => {
+                self.build(acct.proxy_url.as_deref(), Some(&acct.id), false, false)
+            }
+            _ => self.build(acct.proxy_url.as_deref(), None, false, false),
         }
     }
 
-    fn build(&self, proxy: Option<&str>, h1_pool: Option<&str>, reset: bool) -> reqwest::Client {
+    fn build(&self, proxy: Option<&str>, h1_pool: Option<&str>, reset: bool, control: bool) -> reqwest::Client {
         let proxy =
             proxy.filter(|p| !p.is_empty()).map(String::from).unwrap_or_else(|| self.default_proxy.lock().clone());
         let mut key = match h1_pool {
@@ -135,6 +149,9 @@ impl Http {
         };
         if reset {
             key.push_str("\0reset");
+        }
+        if control {
+            key.push_str("\0control");
         }
         let mut clients = self.clients.lock();
         if let Some(c) = clients.get(&key) {
@@ -145,6 +162,12 @@ impl Http {
             .read_timeout(Duration::from_secs(600))
             .pool_idle_timeout(Duration::from_secs(90))
             .tcp_keepalive(Duration::from_secs(30));
+        if control {
+            b = b
+                .connect_timeout(Duration::from_secs(10))
+                .read_timeout(Duration::from_secs(30))
+                .timeout(Duration::from_secs(30));
+        }
         if reset {
             b = b.redirect(reqwest::redirect::Policy::none()).retry(reqwest::retry::never());
         }
@@ -244,13 +267,16 @@ impl Bucket {
 /// Adds a request to the minute it belongs to, keeping the last hour.
 fn add_to_minute(series: &mut VecDeque<Bucket>, log: &RequestLog) {
     let minute = log.ts.timestamp() / 60;
-    if series.back().map(|b| b.minute) != Some(minute) {
-        series.push_back(Bucket { minute, ..Default::default() });
-        while series.len() > MINUTES {
-            series.pop_front();
-        }
+    let cutoff = Utc::now().timestamp() / 60 - MINUTES as i64 + 1;
+    series.retain(|b| b.minute >= cutoff);
+    if minute < cutoff {
+        return;
     }
-    series.back_mut().unwrap().add(log);
+    let index = series.partition_point(|b| b.minute < minute);
+    if series.get(index).is_none_or(|b| b.minute != minute) {
+        series.insert(index, Bucket { minute, ..Default::default() });
+    }
+    series[index].add(log);
 }
 
 /// The last 60 minutes, oldest first, with empty minutes filled in.
@@ -302,7 +328,7 @@ impl Stats {
         if !log.account_id.is_empty() {
             let mut accounts = self.accounts.lock();
             // Forget accounts that have been quiet for an hour (or were removed).
-            let cutoff = log.ts.timestamp() / 60 - MINUTES as i64;
+            let cutoff = Utc::now().timestamp() / 60 - MINUTES as i64;
             accounts.retain(|_, s| s.back().is_some_and(|b| b.minute > cutoff));
             add_to_minute(accounts.entry(log.account_id.clone()).or_default(), log);
         }
@@ -325,4 +351,70 @@ impl Stats {
 
 pub fn usage_tokens(u: &Usage) -> (u64, u64, u64) {
     (u.input + u.cache_write, u.output, u.cache_read)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn log(minute: i64, tokens: u64) -> RequestLog {
+        RequestLog {
+            id: 0,
+            ts: DateTime::from_timestamp(minute * 60, 0).unwrap(),
+            client: "responses",
+            client_app: None,
+            provider: "codex".into(),
+            model: "test".into(),
+            account: "test".into(),
+            account_id: "account".into(),
+            session_id: None,
+            session_source: None,
+            routing_strategy: crate::config::Routing::RoundRobin,
+            routing_reason: None,
+            routing_warning: None,
+            routing_attempts: vec![],
+            status: 200,
+            latency_ms: 0,
+            ttft_ms: None,
+            input_tokens: tokens,
+            output_tokens: 2,
+            cache_tokens: 3,
+            stream: true,
+            transport: "http",
+            attempts: 1,
+            error: None,
+        }
+    }
+
+    #[test]
+    fn concurrent_streams_finishing_out_of_order_share_their_start_minute() {
+        let now = Utc::now().timestamp() / 60;
+        let stats = Stats::default();
+        for (minute, tokens) in [(now - 2, 100), (now, 200), (now - 2, 300), (now - 1, 400), (now - 2, 500)] {
+            stats.record(&log(minute, tokens));
+        }
+        let series = stats.series();
+        assert_eq!(series.iter().map(|b| b.requests).sum::<u64>(), 5);
+        assert_eq!(series.iter().map(|b| b.input_tokens).sum::<u64>(), 1500);
+        let first = series.iter().find(|b| b.minute == now - 2).unwrap();
+        assert_eq!((first.requests, first.input_tokens, first.tokens), (3, 900, 915));
+        assert_eq!(stats.series.lock().len(), 3);
+        assert!(series.windows(2).all(|b| b[0].minute < b[1].minute));
+        assert_eq!(stats.account_series("account").iter().map(|b| b.input_tokens).sum::<u64>(), 1500);
+    }
+
+    #[test]
+    fn a_late_completion_does_not_evict_the_current_hour() {
+        let now = Utc::now().timestamp() / 60;
+        let stats = Stats::default();
+        for ago in (0..MINUTES as i64).rev() {
+            stats.record(&log(now - ago, 10));
+        }
+        stats.record(&log(now - 65, 1000));
+        let series = stats.series();
+        assert_eq!(series.iter().map(|b| b.requests).sum::<u64>(), 60);
+        assert_eq!(series.iter().map(|b| b.input_tokens).sum::<u64>(), 600);
+        assert_eq!(stats.account_series("account").iter().map(|b| b.requests).sum::<u64>(), 60);
+        assert_eq!(stats.totals.lock().input_tokens, 1600);
+    }
 }

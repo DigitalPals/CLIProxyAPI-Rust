@@ -409,6 +409,7 @@ where
             }
         };
         tracker.selected(&selected);
+        app.sessions.persist_selection(&selected).await;
         let (acct, upstream_model) = (selected.account, selected.model);
         tried.push(acct.id.clone());
         if let Err(e) = crate::oauth::ensure_ready(app, &acct).await {

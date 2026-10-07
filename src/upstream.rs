@@ -780,6 +780,23 @@ mod tests {
     }
 
     #[test]
+    fn translated_automatic_cache_covers_instructions_after_cloaking() {
+        let acct = claude_account();
+        let original = json!({"instructions":"stable instructions","input":"question"});
+        let req = crate::formats::responses::parse_request(&original).unwrap();
+        let mut body = crate::formats::claude::build_request(&req, "claude-sonnet-5-5");
+        crate::formats::claude::apply_translated_cache_policy(&original, &mut body);
+        cloak_body(&mut body, &acct, None, false);
+        assert_eq!(body["cache_control"], json!({"type":"ephemeral"}));
+        assert!(body["system"][1]["cache_control"].is_null());
+        assert_eq!(
+            body["messages"][0]["content"][0]["text"],
+            "<system-reminder>\nstable instructions\n</system-reminder>"
+        );
+        assert_eq!(body["messages"][0]["content"][1]["text"], "question");
+    }
+
+    #[test]
     fn claude_cloak_does_not_move_long_ttl_after_short_cached_tool_result() {
         let acct = claude_account();
         let mut body = json!({

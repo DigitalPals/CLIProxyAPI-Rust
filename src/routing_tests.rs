@@ -128,6 +128,10 @@ async fn mock_http(State(mock): State<Arc<Mock>>, headers: HeaderMap, Json(body)
     let account = account(&headers);
     mock.calls.lock().push((account.clone(), body.clone(), "http"));
     let mode = mock.mode.load(Ordering::Relaxed);
+    if mode == 7 && account != "a" && mock.calls.lock().iter().filter(|(a, _, _)| a == &account).count() == 1 {
+        return (StatusCode::SERVICE_UNAVAILABLE, Json(json!({"error":{"message":"temporary detour overload"}})))
+            .into_response();
+    }
     if account == "a" && ((1..=3).contains(&mode) || mode == 6) {
         let (status, code) = match mode {
             1 => (429, "usage_limit_reached"),
@@ -1347,4 +1351,105 @@ async fn translated_responses_preserve_cache_controls_and_reject_unsupported_pre
     assert_eq!(status, 400, "{response}");
     assert!(response["error"]["message"].as_str().unwrap().contains("prewarming"));
     assert_eq!(fixture.mock.calls.lock().len(), 1, "unsupported cache controls reached the upstream");
+}
+
+#[tokio::test]
+async fn soft_retries_preserve_the_temporary_detour_account() {
+    let fixture = Fixture::new(Routing::RoundRobin, false).await;
+    let mut cfg = fixture.cfg.clone();
+    cfg.codex_api_key.push(KeyEntry {
+        api_key: "c".into(),
+        label: Some("c".into()),
+        base_url: Some(format!("{}/v1", fixture.provider.url)),
+        ..Default::default()
+    });
+    fixture.app.set_config(cfg);
+    assert_eq!(answer(&fixture.request(Some("detour-task"), prompt()).await.1), "a");
+    let assigned = fixture.app.pool.all().into_iter().find(|a| a.label == "a").unwrap();
+    assigned.cool(Some("gpt-6.1-sol"), chrono::Utc::now() + chrono::Duration::minutes(5), "busy");
+    fixture.mock.mode.store(7, Ordering::Relaxed);
+    assert_eq!(answer(&fixture.request(Some("detour-task"), prompt()).await.1), "c");
+    assert_eq!(fixture.mock.calls.lock().iter().map(|(a, _, _)| a.as_str()).collect::<Vec<_>>(), vec!["a", "c", "c"]);
+    let logs = fixture.logs(2).await;
+    assert_eq!(logs[1].routing_attempts[0].reason, "temporary_detour");
+    assert_eq!(logs[1].routing_attempts[1].reason, "retry_same");
+    fixture.recover();
+    assert_eq!(answer(&fixture.request(Some("detour-task"), prompt()).await.1), "a");
+}
+
+#[tokio::test]
+async fn claude_budget_errors_are_400_and_small_valid_caps_reach_upstream_unchanged() {
+    let fixture = Fixture::new(Routing::RoundRobin, false).await;
+    let mut cfg = fixture.cfg.clone();
+    cfg.claude_api_key = vec![KeyEntry {
+        api_key: "claude-test".into(),
+        base_url: Some(fixture.provider.url.clone()),
+        ..Default::default()
+    }];
+    fixture.app.set_config(cfg);
+    for native in [false, true] {
+        for cap in [64, 1024, 1025, 1500, 2047, 2048] {
+            let response = if native {
+                reqwest::Client::new()
+                    .post(format!("{}/v1/messages", fixture.proxy.url))
+                    .bearer_auth("client-one")
+                    .json(&json!({"model":"claude-sonnet-4-5(low)","max_tokens":cap,
+                        "messages":[{"role":"user","content":"hello"}]}))
+                    .send()
+                    .await
+                    .unwrap()
+            } else {
+                reqwest::Client::new()
+                    .post(format!("{}/v1/responses", fixture.proxy.url))
+                    .bearer_auth("client-one")
+                    .json(&json!({"model":"claude-sonnet-4-5","reasoning":{"effort":"low"},
+                        "max_output_tokens":cap,"input":"hello"}))
+                    .send()
+                    .await
+                    .unwrap()
+            };
+            let status = response.status().as_u16();
+            let body: Value = response.json().await.unwrap();
+            assert_eq!(status, if cap <= 1024 { 400 } else { 200 }, "native={native} cap={cap}: {body}");
+            if cap > 1024 {
+                let calls = fixture.mock.calls.lock();
+                let sent = &calls.last().unwrap().1;
+                assert_eq!(sent["max_tokens"], cap);
+                assert!(sent["thinking"]["budget_tokens"].as_u64().unwrap() < cap);
+                if !native {
+                    assert_eq!(sent["cache_control"], json!({"type":"ephemeral"}));
+                }
+            }
+        }
+    }
+    assert_eq!(fixture.mock.calls.lock().len(), 8, "invalid budgets must not reach the provider");
+}
+
+#[tokio::test]
+async fn token_count_fallback_marks_estimates_and_ignores_base64_size() {
+    let fixture = Fixture::new(Routing::RoundRobin, false).await;
+    let response = reqwest::Client::new()
+        .post(format!("{}/v1/messages/count_tokens", fixture.proxy.url))
+        .bearer_auth("client-one")
+        .json(&json!({"model":"gpt-6.1-sol","messages":[{"role":"user","content":[
+            {"type":"image","source":{"type":"base64","media_type":"image/png","data":"A".repeat(100_000)}}
+        ]}]}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 200);
+    assert_eq!(response.headers()["x-fusebox-token-count-estimated"], "true");
+    let count: Value = response.json().await.unwrap();
+    assert!(count["input_tokens"].as_u64().unwrap() < 10_000);
+    assert!(fixture.mock.calls.lock().is_empty());
+    let response = reqwest::Client::new()
+        .post(format!("{}/v1beta/models/gemini-3.8-flash:countTokens", fixture.proxy.url))
+        .bearer_auth("client-one")
+        .json(&json!({"contents":[{"parts":[{"text":"hello"}]}]}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 200);
+    assert_eq!(response.headers()["x-fusebox-token-count-estimated"], "true");
+    assert!(response.json::<Value>().await.unwrap()["totalTokens"].as_u64().unwrap() > 0);
 }

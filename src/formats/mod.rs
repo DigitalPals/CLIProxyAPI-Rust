@@ -9,6 +9,9 @@ pub mod claude;
 pub mod gemini;
 pub mod responses;
 
+#[cfg(test)]
+mod efficiency_tests;
+
 use std::borrow::Cow;
 
 use serde_json::Value;

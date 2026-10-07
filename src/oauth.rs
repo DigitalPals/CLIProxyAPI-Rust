@@ -8,13 +8,75 @@ use anyhow::{Context, Result, anyhow, bail};
 use base64::Engine;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use chrono::Utc;
+use futures::{StreamExt, stream};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 
-use crate::accounts::{Account, Credential, OAuth, Provider, write_oauth_file};
+use crate::accounts::{Account, Credential, OAuth, PendingOAuthSave, Provider, write_oauth_file};
 use crate::antigravity;
 use crate::device;
 use crate::state::App;
+
+/// Refreshes must outlive cancelled client requests, but must finish before the
+/// runtime exits. Registration and shutdown use one lock so none can slip past
+/// the final drain.
+#[derive(Clone, Default)]
+pub struct RefreshTasks {
+    inner: Arc<RefreshTaskState>,
+}
+
+#[derive(Default)]
+struct RefreshTaskState {
+    lifecycle: parking_lot::Mutex<RefreshLifecycle>,
+    idle: tokio::sync::Notify,
+}
+
+#[derive(Default)]
+struct RefreshLifecycle {
+    closing: bool,
+    active: usize,
+}
+
+struct RefreshRegistration(Arc<RefreshTaskState>);
+
+impl RefreshTasks {
+    fn register(&self) -> Result<RefreshRegistration> {
+        let mut lifecycle = self.inner.lifecycle.lock();
+        if lifecycle.closing {
+            bail!("token refresh is unavailable while the server is shutting down");
+        }
+        lifecycle.active += 1;
+        Ok(RefreshRegistration(self.inner.clone()))
+    }
+
+    pub async fn shutdown(&self) {
+        loop {
+            let idle = self.inner.idle.notified();
+            tokio::pin!(idle);
+            // Register the waiter before checking the count, avoiding a missed
+            // notification when the last worker exits concurrently.
+            idle.as_mut().enable();
+            {
+                let mut lifecycle = self.inner.lifecycle.lock();
+                lifecycle.closing = true;
+                if lifecycle.active == 0 {
+                    return;
+                }
+            }
+            idle.await;
+        }
+    }
+}
+
+impl Drop for RefreshRegistration {
+    fn drop(&mut self) {
+        let mut lifecycle = self.0.lifecycle.lock();
+        lifecycle.active -= 1;
+        if lifecycle.active == 0 {
+            self.0.idle.notify_waiters();
+        }
+    }
+}
 
 pub mod claude {
     pub const AUTH_URL: &str = "https://claude.ai/oauth/authorize";
@@ -135,7 +197,7 @@ pub async fn exchange(
     state: &str,
     verifier: &str,
 ) -> Result<(OAuth, String, Vec<(&'static str, Value)>)> {
-    let http = app.http.client(None);
+    let http = app.http.control(None);
     match provider {
         Provider::Claude => {
             // The hosted callback page shows `code#state`.
@@ -241,7 +303,7 @@ pub async fn exchange(
 }
 
 async fn claude_profile(app: &App, token: &str) -> Result<Value> {
-    let resp = claude_headers(app.http.client(None).get(claude::PROFILE_URL)).bearer_auth(token).send().await?;
+    let resp = claude_headers(app.http.control(None).get(claude::PROFILE_URL)).bearer_auth(token).send().await?;
     read_json(resp).await
 }
 
@@ -251,6 +313,7 @@ pub fn file_safe(s: &str) -> String {
 
 /// Refreshes an account's access token if it expires within `margin`.
 pub async fn ensure_fresh(app: &App, acct: &Arc<Account>, margin: chrono::Duration, force: bool) -> Result<()> {
+    retry_pending_save(acct, false);
     let needs = |acct: &Account| match &*acct.cred.read() {
         Credential::OAuth(o) => {
             force || o.access_token.is_empty() || o.expires_at.is_some_and(|t| t - Utc::now() < margin)
@@ -264,20 +327,40 @@ pub async fn ensure_fresh(app: &App, acct: &Arc<Account>, margin: chrono::Durati
         Credential::OAuth(o) => o.access_token.clone(),
         _ => return Ok(()),
     };
-    let _guard = acct.refresh_lock.lock().await;
+    let guard = acct.refresh_lock.clone().lock_owned().await;
     let old = match &*acct.cred.read() {
         Credential::OAuth(o) => o.clone(),
         _ => return Ok(()),
     };
     // Another task refreshed while we waited for the lock.
-    if old.access_token != token_before {
+    if old.access_token != token_before || !needs(acct) {
         return Ok(());
     }
     let self_minted = matches!(acct.provider, Provider::Vertex | Provider::Meta);
     if old.refresh_token.is_empty() && !self_minted {
         bail!("no refresh token");
     }
-    let http = app.http.client(acct.proxy_url.as_deref().or(Some(&app.cfg().proxy_url)));
+    let http = app.http.control(acct.proxy_url.as_deref());
+    let acct = acct.clone();
+    let registration = app.refresh_tasks.register()?;
+    // Once submitted, a refresh may rotate the provider's token even if the
+    // waiting request is cancelled. Keep the bounded refresh + publication alive
+    // independently; the account lock still coalesces concurrent callers.
+    tokio::spawn(async move {
+        let _registration = registration;
+        let _guard = guard;
+        let result = refresh_locked(&acct, http, old).await;
+        if let Err(error) = &result {
+            tracing::warn!(account = %acct.label, "token refresh failed: {error:#}");
+            acct.state.lock().last_error = Some(format!("refresh failed: {error}"));
+        }
+        result
+    })
+    .await
+    .context("token refresh task failed")?
+}
+
+async fn refresh_locked(acct: &Arc<Account>, http: reqwest::Client, old: OAuth) -> Result<()> {
     let mut extra: Vec<(&str, Value)> = vec![];
     let keep = |access: String, v: &Value| OAuth {
         access_token: access,
@@ -389,13 +472,57 @@ pub async fn ensure_fresh(app: &App, acct: &Arc<Account>, margin: chrono::Durati
         }
         _ => return Ok(()),
     };
-    if let Some(path) = &acct.path {
-        app.suppress_reload();
-        write_oauth_file(path, acct.provider, &new, &extra).context("saving refreshed token")?;
-    }
+    publish_refreshed(acct, new, extra);
     tracing::info!(account = %acct.label, "refreshed {} token", acct.provider.as_str());
-    *acct.cred.write() = Credential::OAuth(new);
     Ok(())
+}
+
+/// Token rotation is already committed by the provider. Keep its result usable
+/// even if the local filesystem is temporarily unable to save it.
+pub(crate) fn publish_refreshed(acct: &Account, mut credential: OAuth, extra: Vec<(&str, Value)>) {
+    for (key, value) in &extra {
+        credential.raw.insert((*key).into(), value.clone());
+    }
+    {
+        let mut pending = acct.pending_oauth_save.lock();
+        let mut fields = pending.as_ref().map(|saved| saved.extra.clone()).unwrap_or_default();
+        for (key, value) in extra {
+            fields.retain(|(existing, _)| existing != key);
+            fields.push((key.into(), value));
+        }
+        *acct.cred.write() = Credential::OAuth(credential.clone());
+        if acct.path.is_some() {
+            *pending = Some(PendingOAuthSave { credential, extra: fields, retry_at: std::time::Instant::now() });
+        }
+    }
+    retry_pending_save(acct, true);
+}
+
+fn retry_pending_save(acct: &Account, force: bool) {
+    let mut pending = acct.pending_oauth_save.lock();
+    let (Some(saved), Some(path)) = (pending.as_ref(), acct.path.as_ref()) else { return };
+    if !force && saved.retry_at > std::time::Instant::now() {
+        return;
+    }
+    let extra: Vec<_> = saved.extra.iter().map(|(key, value)| (key.as_str(), value.clone())).collect();
+    match write_oauth_file(path, acct.provider, &saved.credential, &extra) {
+        Ok(()) => {
+            *pending = None;
+            let mut state = acct.state.lock();
+            if state
+                .last_error
+                .as_deref()
+                .is_some_and(|message| message.starts_with("saving refreshed credentials failed:"))
+            {
+                state.last_error = None;
+            }
+        }
+        Err(error) => {
+            tracing::warn!(account = %acct.label, "refreshed credentials remain in memory; saving will be retried: {error}");
+            acct.state.lock().last_error = Some(format!("saving refreshed credentials failed: {error}"));
+            pending.as_mut().unwrap().retry_at = std::time::Instant::now() + Duration::from_secs(30);
+        }
+    }
 }
 
 fn access_of(v: &Value) -> Result<String> {
@@ -415,14 +542,213 @@ pub async fn ensure_ready(app: &App, acct: &Arc<Account>) -> Result<()> {
 pub async fn refresher(app: Arc<App>) {
     loop {
         tokio::time::sleep(Duration::from_secs(60)).await;
-        for acct in app.pool.all() {
-            if !acct.is_oauth() || acct.state.lock().disabled {
-                continue;
-            }
-            if let Err(e) = ensure_fresh(&app, &acct, chrono::Duration::minutes(10), false).await {
-                tracing::warn!(account = %acct.label, "token refresh failed: {e:#}");
-                acct.state.lock().last_error = Some(format!("refresh failed: {e}"));
-            }
+        stream::iter(app.pool.all())
+            .for_each_concurrent(4, |acct| {
+                let app = &app;
+                async move {
+                    retry_pending_save(&acct, true);
+                    if !acct.is_oauth() || acct.state.lock().disabled {
+                        return;
+                    }
+                    if let Err(e) = ensure_fresh(app, &acct, chrono::Duration::minutes(10), false).await {
+                        tracing::warn!(account = %acct.label, "token refresh failed: {e:#}");
+                        acct.state.lock().last_error = Some(format!("refresh failed: {e}"));
+                    }
+                }
+            })
+            .await;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::Config;
+
+    struct Directory(std::path::PathBuf);
+
+    impl Directory {
+        fn new() -> Self {
+            let path = std::env::temp_dir().join(format!("fusebox-oauth-{}", uuid::Uuid::new_v4()));
+            std::fs::create_dir_all(&path).unwrap();
+            Self(path)
         }
+    }
+
+    impl Drop for Directory {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    #[tokio::test]
+    async fn rotated_credentials_survive_failed_save_reload_and_retry_without_refresh() {
+        let directory = Directory::new();
+        let path = directory.0.join("account.json");
+        std::fs::write(
+            &path,
+            json!({
+                "type":"codex", "access_token":"old-access", "refresh_token":"old-refresh",
+                "expired": (Utc::now() + chrono::Duration::hours(1)).to_rfc3339(),
+                "custom_field":"keep-me", "id_token":"old-id"
+            })
+            .to_string(),
+        )
+        .unwrap();
+        let mut cfg = Config {
+            auth_dir: directory.0.to_string_lossy().into(),
+            proxy_url: "http://127.0.0.1:1".into(),
+            ..Default::default()
+        };
+        let app = App::new(cfg.clone(), directory.0.join("config.yaml"));
+        let original = app.pool.all().pop().unwrap();
+        let Credential::OAuth(old) = original.cred.read().clone() else { panic!("OAuth account") };
+        // Deterministic save failure, even when tests run as root.
+        let obstacle = path.with_extension("json.tmp");
+        std::fs::create_dir(&obstacle).unwrap();
+        publish_refreshed(
+            &original,
+            OAuth { access_token: "new-access".into(), refresh_token: "new-refresh".into(), ..old },
+            vec![("id_token", json!("new-id"))],
+        );
+        assert!(original.pending_oauth_save.lock().is_some());
+        // Provider setup can update metadata while a rotated token still needs
+        // saving; neither update may discard the other's pending fields.
+        let Credential::OAuth(mut updated) = original.cred.read().clone() else { panic!("OAuth account") };
+        updated.project_id = Some("discovered-project".into());
+        publish_refreshed(&original, updated, vec![]);
+        app.pool.reload(&cfg);
+        assert!(Arc::ptr_eq(&original, &app.pool.all()[0]));
+        // A metadata change replaces the Account allocation, but must preserve
+        // both rotated credentials and the lock shared with in-flight work.
+        cfg.oauth_excluded_models.insert("codex".into(), vec!["unused-model".into()]);
+        app.pool.reload(&cfg);
+        let reloaded = app.pool.all().pop().unwrap();
+        assert!(!Arc::ptr_eq(&original, &reloaded));
+        assert!(Arc::ptr_eq(&original.cred, &reloaded.cred));
+        assert!(Arc::ptr_eq(&original.refresh_lock, &reloaded.refresh_lock));
+        let Credential::OAuth(current) = reloaded.cred.read().clone() else { panic!("OAuth account") };
+        assert_eq!(current.refresh_token, "new-refresh");
+        std::fs::remove_dir(&obstacle).unwrap();
+        // Retry the save as the periodic refresher does after a disk failure.
+        retry_pending_save(&reloaded, true);
+        // The access token remains fresh: this only retries persistence. A
+        // refresh attempt would contact a real provider and fail this test.
+        ensure_fresh(&app, &reloaded, chrono::Duration::minutes(5), false).await.unwrap();
+        assert!(reloaded.pending_oauth_save.lock().is_none());
+        let saved: Value = serde_json::from_slice(&std::fs::read(path).unwrap()).unwrap();
+        assert_eq!(saved["access_token"], "new-access");
+        assert_eq!(saved["refresh_token"], "new-refresh");
+        assert_eq!(saved["id_token"], "new-id");
+        assert_eq!(saved["project_id"], "discovered-project");
+        assert_eq!(saved["custom_field"], "keep-me");
+    }
+
+    #[tokio::test]
+    async fn reload_during_refresh_preserves_the_shared_token_and_refresh_lock() {
+        let directory = Directory::new();
+        let path = directory.0.join("account.json");
+        std::fs::write(&path, r#"{"type":"codex","access_token":"disk-old"}"#).unwrap();
+        let mut cfg = Config { auth_dir: directory.0.to_string_lossy().into(), ..Default::default() };
+        let app = App::new(cfg.clone(), directory.0.join("config.yaml"));
+        let original = app.pool.all().pop().unwrap();
+        let guard = original.refresh_lock.lock().await;
+        *original.cred.write() = Credential::OAuth(OAuth { access_token: "memory-new".into(), ..Default::default() });
+        cfg.oauth_excluded_models.insert("codex".into(), vec!["unused-model".into()]);
+        app.pool.reload(&cfg);
+        let reloaded = app.pool.all().pop().unwrap();
+        assert!(reloaded.refresh_lock.try_lock().is_err());
+        let Credential::OAuth(current) = reloaded.cred.read().clone() else { panic!("OAuth account") };
+        assert_eq!(current.access_token, "memory-new");
+        drop(guard);
+        assert!(reloaded.refresh_lock.try_lock().is_ok());
+    }
+
+    #[tokio::test]
+    async fn cancelling_the_request_does_not_discard_a_provider_token_rotation() {
+        let directory = Directory::new();
+        let accepted = Arc::new(tokio::sync::Notify::new());
+        let release = Arc::new(tokio::sync::Notify::new());
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let endpoint = format!("http://{}/token", listener.local_addr().unwrap());
+        let router = axum::Router::new().route("/token", axum::routing::post({
+            let accepted = accepted.clone();
+            let release = release.clone();
+            move || {
+                let (accepted, release) = (accepted.clone(), release.clone());
+                async move {
+                    accepted.notify_one();
+                    release.notified().await;
+                    axum::Json(json!({"access_token":"rotated-access","refresh_token":"rotated-refresh","expires_in":3600}))
+                }
+            }
+        }));
+        let server = tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
+        let path = directory.0.join("account.json");
+        std::fs::write(
+            &path,
+            json!({
+                "type":"xai", "access_token":"old-access", "refresh_token":"old-refresh",
+                "expired": (Utc::now() - chrono::Duration::minutes(1)).to_rfc3339(), "token_endpoint":endpoint,
+            })
+            .to_string(),
+        )
+        .unwrap();
+        let cfg =
+            Config { auth_dir: directory.0.to_string_lossy().into(), proxy_url: "direct".into(), ..Default::default() };
+        let app = App::new(cfg, directory.0.join("config.yaml"));
+        let account = app.pool.all().pop().unwrap();
+        let request = tokio::spawn({
+            let (app, account) = (app.clone(), account.clone());
+            async move { ensure_fresh(&app, &account, chrono::Duration::minutes(5), false).await }
+        });
+        tokio::time::timeout(Duration::from_secs(2), accepted.notified()).await.unwrap();
+        request.abort();
+        assert!(request.await.unwrap_err().is_cancelled());
+        let mut shutdown = tokio::spawn({
+            let refresh_tasks = app.refresh_tasks.clone();
+            async move { refresh_tasks.shutdown().await }
+        });
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while !app.refresh_tasks.inner.lifecycle.lock().closing {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        assert!(app.refresh_tasks.register().is_err());
+        assert!(
+            tokio::time::timeout(Duration::from_millis(30), &mut shutdown).await.is_err(),
+            "shutdown must wait for the accepted token rotation"
+        );
+        release.notify_one();
+        tokio::time::timeout(Duration::from_secs(2), shutdown).await.unwrap().unwrap();
+        let Credential::OAuth(current) = account.cred.read().clone() else { panic!("OAuth account") };
+        assert_eq!(current.refresh_token, "rotated-refresh");
+        let saved: Value = serde_json::from_slice(&std::fs::read(path).unwrap()).unwrap();
+        assert_eq!(saved["access_token"], "rotated-access");
+        assert_eq!(saved["refresh_token"], "rotated-refresh");
+        let error = ensure_fresh(&app, &account, chrono::Duration::minutes(5), true).await.unwrap_err();
+        assert!(error.to_string().contains("shutting down"));
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn shutdown_waits_for_every_registered_refresh_and_is_idempotent() {
+        let tasks = RefreshTasks::default();
+        let first = tasks.register().unwrap();
+        let last = tasks.register().unwrap();
+        let mut shutdown = tokio::spawn({
+            let tasks = tasks.clone();
+            async move { tasks.shutdown().await }
+        });
+        assert!(tokio::time::timeout(Duration::from_millis(30), &mut shutdown).await.is_err());
+        assert!(tasks.register().is_err());
+        drop(first);
+        assert!(tokio::time::timeout(Duration::from_millis(30), &mut shutdown).await.is_err());
+        drop(last);
+        tokio::time::timeout(Duration::from_secs(1), shutdown).await.unwrap().unwrap();
+        tasks.shutdown().await;
+        assert!(tasks.register().is_err());
     }
 }

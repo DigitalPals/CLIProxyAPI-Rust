@@ -220,3 +220,142 @@ async fn draining_a_completed_stream_records_usage_once() {
     drop(stream);
     assert!(recorded(&app, 200, 20, 4, 80).error.is_none());
 }
+
+fn partial_messages(format: Format) -> Vec<Value> {
+    match format {
+        Format::Chat => vec![json!({"choices":[{"index":0,"delta":{"content":"PARTIAL"},"finish_reason":null}]})],
+        Format::Responses => vec![json!({"type":"response.output_text.delta","delta":"PARTIAL"})],
+        Format::Claude => {
+            vec![json!({"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"PARTIAL"}})]
+        }
+        Format::Gemini => vec![json!({"candidates":[{"content":{"parts":[{"text":"PARTIAL"}]}}]})],
+    }
+}
+
+fn failed_frame(frame: &Frame) -> bool {
+    serde_json::from_str::<Value>(&frame.data)
+        .is_ok_and(|body| body["error"].is_object() || body["type"] == "response.failed")
+}
+
+#[tokio::test]
+async fn premature_eof_and_done_are_errors_in_every_passthrough_format() {
+    for format in [Format::Chat, Format::Responses, Format::Claude, Format::Gemini] {
+        for done in [false, true] {
+            if done && format != Format::Chat {
+                continue;
+            }
+            let (app, tracker) = tracker(format);
+            let (response, _server) = response(partial_messages(format), done, false).await;
+            let frames: Vec<_> = passthrough_stream(response, format, tracker, false).collect().await;
+            let failure = frames.iter().position(failed_frame).expect("missing downstream error");
+            if done {
+                let end = frames.iter().position(|f| f.data == "[DONE]").unwrap();
+                assert!(failure < end, "clients must see the error before [DONE]");
+            }
+            assert_eq!(recorded(&app, 502, 0, 0, 0).error.as_deref(), Some(PREMATURE_END));
+        }
+    }
+}
+
+#[tokio::test]
+async fn claude_message_stop_without_stop_reason_cannot_hide_a_truncated_turn() {
+    let (app, tracker) = tracker(Format::Claude);
+    let mut messages = partial_messages(Format::Claude);
+    messages.push(json!({"type":"message_stop"}));
+    let (response, _server) = response(messages, false, true).await;
+    let mut stream = passthrough_stream(response, Format::Claude, tracker, false);
+    loop {
+        let frame = tokio::time::timeout(std::time::Duration::from_secs(2), stream.next()).await.unwrap().unwrap();
+        assert!(!terminal(Format::Claude, &frame), "a client would stop before seeing the error");
+        if failed_frame(&frame) {
+            break;
+        }
+    }
+    drop(stream);
+    recorded(&app, 502, 0, 0, 0);
+}
+
+#[tokio::test]
+async fn incomplete_translated_streams_keep_usage_and_never_report_success() {
+    for format in [Format::Chat, Format::Responses, Format::Claude, Format::Gemini] {
+        let (app, tracker) = tracker(format);
+        let events = futures::stream::iter([
+            Event::Usage(Usage { input: 20, output: 4, cache_read: 80, ..Default::default() }),
+            Event::Text("PARTIAL".into()),
+            Event::ToolStart { key: 0, id: "call_partial".into(), name: "lookup".into() },
+            Event::ToolArgs { key: 0, delta: "{\"incomplete\":".into() },
+        ]);
+        let frames: Vec<_> =
+            render_stream(Box::pin(events), format, "test-model".into(), Arc::default(), tracker).collect().await;
+        assert!(frames.iter().any(failed_frame));
+        assert!(!frames.iter().any(|f| f.data != "[DONE]" && terminal(format, f)));
+        assert_eq!(recorded(&app, 502, 20, 4, 80).error.as_deref(), Some(PREMATURE_END));
+    }
+}
+
+#[tokio::test]
+async fn incomplete_nonstreaming_collection_is_an_error() {
+    for format in [Format::Chat, Format::Responses, Format::Claude, Format::Gemini] {
+        let (app, tracker) = tracker(format);
+        let events = futures::stream::iter([Event::Text("PARTIAL".into())]);
+        let reply = collect(Box::pin(events), format, "test-model", &Request::default(), tracker).await;
+        assert!(matches!(reply, Reply::Error(502, _)));
+        recorded(&app, 502, 0, 0, 0);
+    }
+    let (app, tracker) = tracker(Format::Responses);
+    let bytes = bytes::Bytes::from(format!("data: {}\n\n", partial_messages(Format::Responses)[0]));
+    let body = futures::stream::once(async move { Ok(bytes) });
+    let reply = collect_passthrough(Box::pin(body), Format::Responses, tracker, Format::Responses).await;
+    assert!(matches!(reply, Reply::Error(502, _)));
+    recorded(&app, 502, 0, 0, 0);
+}
+
+#[test]
+fn incomplete_json_cannot_gain_a_default_successful_finish_reason() {
+    for (format, body) in [
+        (Format::Chat, json!({"choices":[{"message":{"content":"PARTIAL"}}]})),
+        (Format::Claude, json!({"content":[{"type":"text","text":"PARTIAL"}]})),
+        (Format::Responses, json!({"status":"in_progress","output":[]})),
+        (Format::Gemini, json!({"candidates":[{"content":{"parts":[{"text":"PARTIAL"}]}}]})),
+    ] {
+        let events = checked_full_events(format, &body);
+        assert!(events.iter().any(|e| matches!(e, Event::Error { status: 502, .. })));
+        assert!(!events.iter().any(|e| matches!(e, Event::Finish(_))));
+    }
+}
+
+#[tokio::test]
+async fn failed_complete_json_keeps_billable_usage() {
+    let (app, tracker) = tracker(Format::Responses);
+    let body = json!({"id":"failed","status":"failed","output":[],
+        "error":{"code":"server_error","message":"generation failed"},
+        "usage":{"input_tokens":100,"input_tokens_details":{"cached_tokens":80},"output_tokens":4}});
+    let events = futures::stream::iter(checked_full_events(Format::Responses, &body));
+    assert!(matches!(
+        collect(Box::pin(events), Format::Responses, "test", &Request::default(), tracker).await,
+        Reply::Error(502, _)
+    ));
+    recorded(&app, 502, 20, 4, 80);
+}
+
+#[tokio::test]
+async fn passthrough_body_read_failure_emits_a_downstream_error() {
+    let router = axum::Router::new().route("/", get(|| async {
+        let body = Body::from_stream(async_stream::stream! {
+            yield Ok::<_, std::io::Error>(Bytes::from(format!("data: {}\n\n", partial_messages(Format::Responses)[0])));
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            yield Err(std::io::Error::new(std::io::ErrorKind::ConnectionReset, "mock disconnect"));
+        });
+        ([(header::CONTENT_TYPE, "text/event-stream")], body)
+    }));
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let url = format!("http://{}", listener.local_addr().unwrap());
+    let _server = Upstream(tokio::spawn(async move {
+        axum::serve(listener, router).await.unwrap();
+    }));
+    let response = reqwest::get(url).await.unwrap();
+    let (app, tracker) = tracker(Format::Responses);
+    let frames: Vec<_> = passthrough_stream(response, Format::Responses, tracker, false).collect().await;
+    assert!(frames.iter().any(failed_frame));
+    assert!(recorded(&app, 502, 0, 0, 0).error.unwrap().contains("upstream stream error"));
+}

@@ -419,6 +419,14 @@ fn finish_of(resp: &Value) -> Finish {
     }
 }
 
+fn failure_of(response: &Value) -> Event {
+    let error = &response["error"];
+    Event::Error {
+        status: status_of_code(error["code"].as_str().unwrap_or_default()),
+        message: error["message"].as_str().unwrap_or("response failed").to_string(),
+    }
+}
+
 impl StreamParser for Parser {
     fn feed(&mut self, ev: &SseEvent, out: &mut Vec<Event>) {
         let Ok(v) = serde_json::from_str::<Value>(&ev.data) else { return };
@@ -510,14 +518,18 @@ impl StreamParser for Parser {
                 if let Some(u) = usage_of(&r["usage"]) {
                     out.push(Event::Usage(u));
                 }
-                out.push(Event::Finish(finish_of(r)));
+                if r["status"] == "failed" {
+                    out.push(failure_of(r));
+                } else {
+                    out.push(Event::Finish(finish_of(r)));
+                }
             }
             "response.failed" => {
-                let e = &v["response"]["error"];
-                out.push(Event::Error {
-                    status: status_of_code(e["code"].as_str().unwrap_or_default()),
-                    message: e["message"].as_str().unwrap_or("response failed").to_string(),
-                });
+                let r = &v["response"];
+                if let Some(usage) = usage_of(&r["usage"]) {
+                    out.push(Event::Usage(usage));
+                }
+                out.push(failure_of(r));
             }
             "error" => {
                 let e = if v["error"].is_object() { &v["error"] } else { &v };
@@ -902,9 +914,12 @@ impl StreamRenderer for Renderer {
                 self.output.push(item);
             }
             Event::Error { status, message } => {
-                self.close(out);
+                // A failed partial item must not acquire a *.done event or a
+                // completed tool call that a client might execute.
+                self.item = Item::None;
                 self.done = true;
                 let mut r = self.response("failed");
+                r["usage"] = usage_json(&self.usage);
                 r["error"] = json!({ "code": error_code(*status), "message": message });
                 self.emit("response.failed", json!({ "response": r }), out);
             }

@@ -292,9 +292,16 @@ async fn completions(State(app): State<Arc<App>>, headers: HeaderMap, body: Byte
 
 async fn count_tokens(State(app): State<Arc<App>>, headers: HeaderMap, body: Bytes) -> Response {
     match parse_body(Format::Claude, &body) {
-        Ok(v) => axum::Json(proxy::count_tokens(app, headers, v).await).into_response(),
+        Ok(v) => {
+            let (count, estimated) = proxy::count_tokens(app, headers, v).await;
+            token_count_response(count, estimated)
+        }
         Err(r) => *r,
     }
+}
+
+fn token_count_response(body: Value, estimated: bool) -> Response {
+    ([("x-fusebox-token-count-estimated", if estimated { "true" } else { "false" })], axum::Json(body)).into_response()
 }
 
 async fn gemini(
@@ -318,7 +325,7 @@ async fn gemini(
     let stream = match action {
         "generateContent" => false,
         "streamGenerateContent" => true,
-        "countTokens" => return axum::Json(json!({ "totalTokens": proxy::estimate_tokens(&body) })).into_response(),
+        "countTokens" => return token_count_response(json!({ "totalTokens": proxy::estimate_tokens(&body) }), true),
         _ => {
             return reply(
                 Format::Gemini,

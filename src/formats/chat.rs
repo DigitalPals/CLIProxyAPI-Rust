@@ -302,6 +302,8 @@ fn cached_text_parts(parts: &[Part]) -> Vec<Value> {
 #[derive(Default)]
 pub struct Parser {
     started: bool,
+    finished: bool,
+    errored: bool,
     tools: HashMap<u64, usize>,
     next_key: usize,
 }
@@ -333,10 +335,15 @@ fn usage_of(u: &Value) -> Option<Usage> {
 impl StreamParser for Parser {
     fn feed(&mut self, ev: &SseEvent, out: &mut Vec<Event>) {
         if ev.data.trim() == "[DONE]" {
+            if !self.finished && !self.errored {
+                self.errored = true;
+                out.push(Event::Error { status: 502, message: "Upstream ended without a finish reason".into() });
+            }
             return;
         }
         let Ok(v) = serde_json::from_str::<Value>(&ev.data) else { return };
         if let Some(err) = v.get("error") {
+            self.errored = true;
             out.push(Event::Error {
                 status: err["code"].as_u64().unwrap_or(500) as u16,
                 message: err["message"].as_str().map(String::from).unwrap_or_else(|| err.to_string()),
@@ -382,6 +389,7 @@ impl StreamParser for Parser {
                 }
             }
             if let Some(f) = choice["finish_reason"].as_str() {
+                self.finished = true;
                 out.push(Event::Finish(finish_of(f)));
             }
         }

@@ -7,6 +7,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use chrono::{DateTime, Utc};
+use futures::StreamExt;
 use serde::Serialize;
 use serde_json::Value;
 
@@ -23,6 +24,7 @@ const POLL_EVERY: i64 = 5 * 60;
 const BUSY_POLL_EVERY: i64 = 30 * 60;
 /// Banked resets change rarely; opening the dashboard panel checks on demand.
 const RESET_POLL_EVERY: i64 = 30 * 60;
+const POLL_CONCURRENCY: usize = 4;
 
 #[derive(Debug, Clone, Serialize, PartialEq)]
 pub struct Window {
@@ -273,7 +275,7 @@ pub async fn poll(app: &App, acct: &Arc<Account>) -> anyhow::Result<()> {
         Credential::OAuth(o) if o.base_url.is_none() => (o.access_token.clone(), o.account_id.clone()),
         _ => return Ok(()),
     };
-    let http = app.http.client(acct.proxy_url.as_deref());
+    let http = app.http.control(acct.proxy_url.as_deref());
     let (windows, plan) = match acct.provider {
         Provider::Claude => {
             let v: Value = http
@@ -350,64 +352,112 @@ pub fn usage(st: &mut crate::accounts::AccountState, provider: Provider, value: 
 pub async fn poller(app: Arc<App>) {
     tokio::time::sleep(Duration::from_secs(2)).await;
     loop {
-        let mut changed = false;
-        for acct in app.pool.all() {
-            // Learn an Antigravity account's real model list without waiting for a request.
-            if acct.provider == Provider::Antigravity
-                && acct.is_oauth()
-                && acct.discovered.read().is_empty()
-                && !acct.state.lock().disabled
-            {
-                match crate::oauth::ensure_ready(&app, &acct).await {
-                    Ok(()) => changed |= !acct.discovered.read().is_empty(),
-                    Err(e) => tracing::debug!(account = %acct.label, "antigravity setup failed: {e:#}"),
-                }
-            }
-            if !matches!(acct.provider, Provider::Claude | Provider::Codex) || !acct.is_oauth() {
-                continue;
-            }
-            let reset_stale = app.cfg().banked_resets && {
-                let st = acct.state.lock();
-                !st.disabled
-                    && st
-                        .banked_resets
-                        .as_ref()
-                        .is_none_or(|v| (Utc::now() - v.checked_at).num_seconds() >= RESET_POLL_EVERY)
-            };
-            if reset_stale {
-                let _ = crate::banked_resets::refresh(&app, &acct).await;
-                changed = true;
-            }
-            let stale = {
-                let st = acct.state.lock();
-                !st.disabled && st.quota.needs_refresh(Utc::now())
-            };
-            if !stale || crate::oauth::ensure_fresh(&app, &acct, chrono::Duration::minutes(5), false).await.is_err() {
-                continue;
-            }
-            let before = acct.state.lock().quota.refreshed_at;
-            let result = poll(&app, &acct).await;
-            {
-                let mut st = acct.state.lock();
-                let refreshed = st.quota.refreshed_at.is_some() && st.quota.refreshed_at != before;
-                st.quota.checked(Utc::now(), refreshed);
-            }
-            match result {
-                Ok(()) => changed = true,
-                Err(e) => tracing::debug!(account = %acct.label, "quota check failed: {e:#}"),
-            }
-        }
-        if changed {
+        let checks = app.pool.all().into_iter().map(|acct| poll_account(&app, acct));
+        if poll_batch(checks).await {
             app.broadcast("accounts", Value::Null);
         }
         tokio::time::sleep(Duration::from_secs(60)).await;
     }
 }
 
+async fn poll_batch<F: std::future::Future<Output = bool>>(checks: impl IntoIterator<Item = F>) -> bool {
+    futures::stream::iter(checks)
+        .buffer_unordered(POLL_CONCURRENCY)
+        .fold(false, |changed, refreshed| async move { changed || refreshed })
+        .await
+}
+
+async fn poll_account(app: &Arc<App>, acct: Arc<Account>) -> bool {
+    let mut changed = false;
+    // Learn an Antigravity account's real model list without waiting for a request.
+    if acct.provider == Provider::Antigravity
+        && acct.is_oauth()
+        && acct.discovered.read().is_empty()
+        && !acct.state.lock().disabled
+    {
+        match crate::oauth::ensure_ready(app, &acct).await {
+            Ok(()) => changed |= !acct.discovered.read().is_empty(),
+            Err(e) => tracing::debug!(account = %acct.label, "antigravity setup failed: {e:#}"),
+        }
+    }
+    if !matches!(acct.provider, Provider::Claude | Provider::Codex) || !acct.is_oauth() {
+        return changed;
+    }
+    let reset_stale = app.cfg().banked_resets && {
+        let st = acct.state.lock();
+        !st.disabled
+            && st.banked_resets.as_ref().is_none_or(|v| (Utc::now() - v.checked_at).num_seconds() >= RESET_POLL_EVERY)
+    };
+    if reset_stale {
+        let _ = crate::banked_resets::refresh(app, &acct).await;
+        changed = true;
+    }
+    let stale = {
+        let st = acct.state.lock();
+        !st.disabled && st.quota.needs_refresh(Utc::now())
+    };
+    if !stale || crate::oauth::ensure_fresh(app, &acct, chrono::Duration::minutes(5), false).await.is_err() {
+        return changed;
+    }
+    let before = acct.state.lock().quota.refreshed_at;
+    let result = poll(app, &acct).await;
+    {
+        let mut st = acct.state.lock();
+        let refreshed = st.quota.refreshed_at.is_some() && st.quota.refreshed_at != before;
+        st.quota.checked(Utc::now(), refreshed);
+    }
+    match result {
+        Ok(()) => changed = true,
+        Err(e) => tracing::debug!(account = %acct.label, "quota check failed: {e:#}"),
+    }
+    changed
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[tokio::test]
+    async fn quota_refreshes_are_bounded_and_a_stalled_account_does_not_stop_others() {
+        let gate = Arc::new(tokio::sync::Semaphore::new(0));
+        let release_first = Arc::new(tokio::sync::Notify::new());
+        let (entered, mut started) = tokio::sync::mpsc::unbounded_channel();
+        let (completed, mut finished) = tokio::sync::mpsc::unbounded_channel();
+        let count = POLL_CONCURRENCY + 5;
+        let checks = (0..count)
+            .map(|index| {
+                let gate = gate.clone();
+                let release_first = release_first.clone();
+                let entered = entered.clone();
+                let completed = completed.clone();
+                async move {
+                    entered.send(index).unwrap();
+                    let _permit = gate.acquire().await.unwrap();
+                    // Keep the first account stalled while other accounts reuse slots.
+                    if index == 0 {
+                        release_first.notified().await;
+                    }
+                    completed.send(index).unwrap();
+                    index == count - 1
+                }
+            })
+            .collect::<Vec<_>>();
+        let batch = tokio::spawn(poll_batch(checks));
+        for _ in 0..POLL_CONCURRENCY {
+            tokio::time::timeout(Duration::from_secs(2), started.recv()).await.unwrap().unwrap();
+        }
+        assert!(started.try_recv().is_err(), "polling should admit at most four concurrent accounts");
+        // Account 0 holds one permit; another lets all other accounts complete.
+        gate.add_permits(2);
+        for _ in 1..count {
+            let index = tokio::time::timeout(Duration::from_secs(2), finished.recv()).await.unwrap().unwrap();
+            assert_ne!(index, 0);
+        }
+        assert!(!batch.is_finished());
+        release_first.notify_one();
+        assert!(tokio::time::timeout(Duration::from_secs(2), batch).await.unwrap().unwrap());
+    }
 
     #[test]
     fn partial_headers_preserve_known_five_hour_exhaustion() {

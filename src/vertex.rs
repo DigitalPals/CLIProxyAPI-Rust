@@ -84,7 +84,7 @@ pub async fn import(app: &App, text: &str, location: &str) -> Result<String> {
     }
     let project = sa["project_id"].as_str().ok_or_else(|| anyhow!("service account has no project_id"))?.to_string();
     let email = sa["client_email"].as_str().unwrap_or_default().to_string();
-    let (token, expires) = mint(&app.http.client(None), &sa).await?;
+    let (token, expires) = mint(&app.http.control(None), &sa).await?;
     let location = if location.trim().is_empty() { "us-central1" } else { location.trim() };
     let mut raw = Map::new();
     raw.insert("service_account".into(), sa);

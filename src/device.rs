@@ -100,7 +100,7 @@ pub async fn xai_token_endpoint(http: &reqwest::Client) -> Result<String> {
 }
 
 pub async fn start(app: &App, provider: Provider) -> Result<Device> {
-    let http = app.http.client(None);
+    let http = app.http.control(None);
     let device_id = uuid::Uuid::new_v4().to_string();
     type Headers = Vec<(String, String)>;
     let (url, token_endpoint, form, headers): (String, String, Vec<(&str, &str)>, Headers) = match provider {
@@ -159,7 +159,7 @@ pub struct Signed {
 
 /// Polls until the user approves (or the code expires).
 pub async fn wait(app: &App, provider: Provider, d: &Device) -> Result<Signed> {
-    let http = app.http.client(None);
+    let http = app.http.control(None);
     let deadline = std::time::Instant::now() + Duration::from_secs(d.expires_in.min(1800));
     let mut interval = d.interval;
     loop {
@@ -234,7 +234,7 @@ async fn finish(app: &App, provider: Provider, d: &Device, access: &str, v: &Val
             format!("xai-{}.json", file_safe(if who.is_empty() { "account" } else { &who }))
         }
         _ => {
-            let minted = meta_mint(&app.http.client(None), access).await?;
+            let minted = meta_mint(&app.http.control(None), access).await?;
             o.access_token = minted["api_key"].as_str().unwrap_or_default().to_string();
             o.base_url = minted["base_url"].as_str().filter(|s| !s.is_empty()).map(String::from);
             o.email = minted["user_email"].as_str().filter(|s| !s.is_empty()).map(String::from);

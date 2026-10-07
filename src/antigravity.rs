@@ -11,7 +11,7 @@ use parking_lot::RwLock;
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 
-use crate::accounts::{Account, Credential, write_oauth_file};
+use crate::accounts::{Account, Credential};
 use crate::schema;
 use crate::state::App;
 
@@ -189,7 +189,7 @@ pub async fn ensure_ready(app: &App, acct: &Arc<Account>) -> Result<()> {
     if project(acct).is_none() {
         let _guard = acct.refresh_lock.lock().await;
         if project(acct).is_none() {
-            let http = app.http.for_account(acct);
+            let http = app.http.control_for_account(acct);
             let id = fetch_project(app, &http, &base(acct, BASE_PROD), &token(acct)).await?;
             let snapshot = {
                 let mut cred = acct.cred.write();
@@ -197,14 +197,12 @@ pub async fn ensure_ready(app: &App, acct: &Arc<Account>) -> Result<()> {
                 o.project_id = Some(id);
                 o.clone()
             };
-            if let Some(path) = &acct.path {
-                app.suppress_reload();
-                write_oauth_file(path, acct.provider, &snapshot, &[])?;
-            }
+            app.suppress_reload();
+            crate::oauth::publish_refreshed(acct, snapshot, vec![]);
         }
     }
     if acct.discovered.read().is_empty() {
-        let app_http = app.http.for_account(acct);
+        let app_http = app.http.control_for_account(acct);
         if let Ok(models) = fetch_models(&app_http, &request_base(acct), &token(acct)).await
             && !models.is_empty()
         {

@@ -5,7 +5,7 @@
 //! every other provider is served through the normal pipeline, with
 //! `previous_response_id` expanded from a small local history.
 
-use std::collections::HashSet;
+use std::collections::{HashSet, VecDeque};
 use std::future::Future;
 use std::sync::Arc;
 use std::time::Duration;
@@ -27,6 +27,9 @@ type Upstream = tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsSt
 type ClientTx = futures::stream::SplitSink<WebSocket, Message>;
 
 const UPSTREAM_WRITE_TIMEOUT: Duration = Duration::from_secs(10);
+const CLIENT_WRITE_TIMEOUT: Duration = Duration::from_secs(10);
+const MAX_PENDING_TURNS: usize = 32;
+const MAX_PENDING_BYTES: usize = 16 * 1024 * 1024;
 /// A turn upload also gets time for a slow (about 256 kbit/s) uplink, so a long
 /// conversation isn't cut off while it is still moving.
 const SLOW_UPLINK_BYTES_PER_SEC: usize = 32 * 1024;
@@ -209,10 +212,23 @@ async fn drain_idle_upstream(sess: &mut Session) {
     sess.discard_upstream();
 }
 
+#[derive(Debug)]
 struct ClientGone;
 
 async fn send(tx: &mut ClientTx, text: String) -> Result<(), ClientGone> {
-    tx.send(Message::Text(text.into())).await.map_err(|_| ClientGone)
+    client_write(tx.send(Message::Text(text.into()))).await
+}
+
+async fn client_write<E>(write: impl Future<Output = Result<(), E>>) -> Result<(), ClientGone> {
+    tokio::time::timeout(CLIENT_WRITE_TIMEOUT, write).await.map_err(|_| ClientGone)?.map_err(|_| ClientGone)
+}
+
+fn message_bytes(message: &Message) -> usize {
+    match message {
+        Message::Text(text) => text.len(),
+        Message::Binary(data) => data.len(),
+        _ => 0,
+    }
 }
 
 fn error_event(status: u16, body: &Value) -> String {
@@ -231,22 +247,30 @@ fn input_items(body: &Value) -> Vec<Value> {
 pub async fn handle(app: Arc<App>, headers: HeaderMap, socket: WebSocket) {
     let (mut tx, mut rx) = socket.split();
     let mut sess = Session::default();
-    loop {
-        let msg = tokio::select! {
-            // The client gets priority; queued upstream frames are drained before submission.
-            biased;
-            msg = rx.next() => {
-                let Some(msg) = msg else { break };
-                msg
-            }
-            upstream = async {
-                match &mut sess.upstream {
-                    Some((_, up)) => up.next().await,
-                    None => std::future::pending().await,
+    let mut pending = VecDeque::new();
+    let mut pending_bytes = 0usize;
+    'connection: loop {
+        let msg = if let Some(message) = pending.pop_front() {
+            let message: Message = message;
+            pending_bytes -= message_bytes(&message);
+            Ok(message)
+        } else {
+            tokio::select! {
+                // The client gets priority; queued upstream frames are drained before submission.
+                biased;
+                msg = rx.next() => {
+                    let Some(msg) = msg else { break };
+                    msg
                 }
-            } => {
-                idle_upstream(&mut sess, upstream).await;
-                continue;
+                upstream = async {
+                    match &mut sess.upstream {
+                        Some((_, up)) => up.next().await,
+                        None => std::future::pending().await,
+                    }
+                } => {
+                    idle_upstream(&mut sess, upstream).await;
+                    continue;
+                }
             }
         };
         let text = match msg {
@@ -274,12 +298,37 @@ pub async fn handle(app: Arc<App>, headers: HeaderMap, socket: WebSocket) {
         if let Some(o) = body.as_object_mut() {
             o.remove("type");
         }
-        drain_idle_upstream(&mut sess).await;
-        if turn(&app, &headers, &mut sess, body, &mut tx).await.is_err() {
-            break;
+        // Continue reading the client during setup, upload, generation and writes.
+        // Dropping this future cancels the HTTP body or native socket immediately.
+        let running = async {
+            drain_idle_upstream(&mut sess).await;
+            turn(&app, &headers, &mut sess, body, &mut tx).await
+        };
+        tokio::pin!(running);
+        loop {
+            tokio::select! {
+                message = rx.next() => match message {
+                    Some(Ok(message @ (Message::Text(_) | Message::Binary(_)))) => {
+                        if pending.len() >= MAX_PENDING_TURNS || message_bytes(&message) > MAX_PENDING_BYTES - pending_bytes {
+                            tracing::warn!("websocket pending turn limit exceeded; closing connection");
+                            break 'connection;
+                        }
+                        pending_bytes += message_bytes(&message);
+                        pending.push_back(message);
+                    }
+                    Some(Ok(Message::Close(_))) | Some(Err(_)) | None => break 'connection,
+                    Some(Ok(_)) => {}
+                },
+                result = &mut running => {
+                    if result.is_err() { break 'connection; }
+                    break;
+                }
+            }
         }
     }
-    sess.close_upstream("client_closed").await;
+    // There is no next turn to reuse this socket; dropping it never waits for a
+    // provider that may have stopped reading its close handshake.
+    sess.discard_upstream();
 }
 
 async fn turn(
@@ -322,6 +371,7 @@ async fn turn(
                 sess.pending_selection = None;
                 if crate::affinity::ends_session(headers) {
                     app.sessions.end(sess.key.as_deref().unwrap());
+                    app.sessions.save_async().await;
                 }
                 return Ok(());
             }
@@ -448,6 +498,7 @@ async fn native_turn(
             return if result.is_ok() { Native::Done } else { Native::Gone };
         }
     };
+    app.sessions.persist_selection(&selected).await;
     sess.pending_selection = Some(selected.clone());
     let acct = selected.account.clone();
     let upstream_model = selected.model.clone();
@@ -583,6 +634,7 @@ async fn native_turn(
         parser.feed(&SseEvent { event: None, data: text.clone() }, &mut evs);
         for ev in evs.drain(..) {
             aggregate.push(&ev);
+            tracker.observe_stream_event(&ev);
             match ev {
                 Event::Usage(u) => usage.merge(&u),
                 Event::Error { status, message } => error = Some((status, message)),
@@ -661,6 +713,10 @@ async fn native_turn(
     }
     Native::Done
 }
+
+#[cfg(test)]
+#[path = "ws_cancel_tests.rs"]
+mod cancellation_tests;
 
 #[cfg(test)]
 mod tests {

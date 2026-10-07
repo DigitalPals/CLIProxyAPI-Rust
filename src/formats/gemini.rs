@@ -180,6 +180,59 @@ fn strip_schema(v: &Value) -> Value {
     }
 }
 
+/// Share effort and budget normalization between translated requests and native
+/// model suffixes, so `none` and `medium` cannot turn into high effort in one path.
+pub fn thinking_config(reasoning: Option<&Reasoning>, model: &str) -> Value {
+    let gemini3 = model.starts_with("gemini-3");
+    match reasoning {
+        Some(r) if r.disabled => {
+            if gemini3 {
+                json!({ "thinkingLevel": "low" })
+            } else {
+                json!({ "thinkingBudget": 0 })
+            }
+        }
+        Some(r) if gemini3 => {
+            let level = match r.effort_level().as_deref() {
+                Some("minimal") | Some("low") => "low",
+                Some("medium") => "medium",
+                _ => "high",
+            };
+            json!({ "includeThoughts": true, "thinkingLevel": level })
+        }
+        Some(r) => match r.budget_tokens() {
+            Some(b) => json!({ "includeThoughts": true, "thinkingBudget": b.min(32_768) }),
+            None => json!({ "includeThoughts": true }),
+        },
+        None => json!({ "includeThoughts": true }),
+    }
+}
+
+pub fn apply_native_reasoning(body: &mut Value, reasoning: &Reasoning, model: &str) {
+    let Some(object) = body.as_object_mut() else { return };
+    let legacy = object.remove("generation_config").unwrap_or_else(|| json!({}));
+    let config = object.entry("generationConfig").or_insert(legacy);
+    if !config.is_object() {
+        *config = json!({});
+    }
+    let old = g(config, "thinkingConfig", "thinking_config");
+    let include_thoughts = g(old, "includeThoughts", "include_thoughts").as_bool();
+    let mut thinking = thinking_config(Some(reasoning), model);
+    // A suffix controls effort, not whether the caller wants thought summaries.
+    if let Some(include) = include_thoughts {
+        thinking["includeThoughts"] = include.into();
+    } else if let Some(object) = thinking.as_object_mut() {
+        object.remove("includeThoughts");
+    }
+    let config = config.as_object_mut().unwrap();
+    config.remove("thinking_config");
+    if model.contains("-image") {
+        config.remove("thinkingConfig");
+    } else {
+        config.insert("thinkingConfig".into(), thinking);
+    }
+}
+
 pub fn build_request(req: &Request, model: &str) -> Value {
     let mut names: HashMap<String, String> = HashMap::new();
     let mut contents = Vec::new();
@@ -257,34 +310,11 @@ pub fn build_request(req: &Request, model: &str) -> Value {
     if !req.stop.is_empty() {
         gc.insert("stopSequences".into(), req.stop.clone().into());
     }
-    let gemini3 = model.starts_with("gemini-3");
-    let thinking = match &req.reasoning {
-        Some(r) if r.disabled => {
-            if gemini3 {
-                json!({ "thinkingLevel": "low" })
-            } else {
-                json!({ "thinkingBudget": 0 })
-            }
-        }
-        Some(r) if gemini3 => {
-            let level = match r.effort_level().as_deref() {
-                Some("minimal") | Some("low") => "low",
-                Some("medium") => "medium",
-                _ => "high",
-            };
-            json!({ "includeThoughts": true, "thinkingLevel": level })
-        }
-        Some(r) => match r.budget_tokens() {
-            Some(b) => json!({ "includeThoughts": true, "thinkingBudget": b.min(32_768) }),
-            None => json!({ "includeThoughts": true }),
-        },
-        None => json!({ "includeThoughts": true }),
-    };
     if model.contains("-image") {
         // Image models answer with pictures and don't take thinking settings.
         gc.insert("responseModalities".into(), json!(["TEXT", "IMAGE"]));
     } else {
-        gc.insert("thinkingConfig".into(), thinking);
+        gc.insert("thinkingConfig".into(), thinking_config(req.reasoning.as_ref(), model));
     }
     match &req.response_format {
         Some(ResponseFormat::JsonObject) => {
@@ -386,6 +416,12 @@ impl Parser {
         }
         if let Some(f) = cand["finishReason"].as_str() {
             out.push(Event::Finish(finish_of(f)));
+        } else if g(g(v, "promptFeedback", "prompt_feedback"), "blockReason", "block_reason")
+            .as_str()
+            .is_some_and(|reason| !reason.is_empty() && reason != "BLOCK_REASON_UNSPECIFIED")
+        {
+            // A blocked prompt legitimately has no candidate or finishReason.
+            out.push(Event::Finish(Finish::Filter));
         }
     }
 }
@@ -493,6 +529,12 @@ impl StreamRenderer for Renderer {
             }
             Event::Usage(u) => return self.usage.merge(u),
             Event::Finish(f) => return self.finish = Some(*f),
+            Event::Error { status, message } => {
+                self.tool = None;
+                self.errored = true;
+                out.push(Frame::data(super::error_body(Format::Gemini, *status, message).to_string()));
+                return;
+            }
             _ => {}
         }
         self.flush_tool(out);
@@ -507,10 +549,6 @@ impl StreamRenderer for Renderer {
             }
             Event::ToolStart { key, id, name } => {
                 self.tool = Some((*key, id.clone(), name.clone(), String::new(), None))
-            }
-            Event::Error { status, message } => {
-                self.errored = true;
-                out.push(Frame::data(super::error_body(Format::Gemini, *status, message).to_string()))
             }
             _ => {}
         }

@@ -283,6 +283,13 @@ impl OAuth {
     }
 }
 
+#[derive(Clone)]
+pub struct PendingOAuthSave {
+    pub credential: OAuth,
+    pub extra: Vec<(String, Value)>,
+    pub retry_at: std::time::Instant,
+}
+
 #[derive(Debug, Default, Clone, Serialize)]
 pub struct Counters {
     pub requests: u64,
@@ -341,9 +348,12 @@ pub struct Account {
     pub models: Vec<ModelAlias>,
     pub headers: BTreeMap<String, String>,
     pub proxy_url: Option<String>,
-    pub cred: RwLock<Credential>,
+    pub cred: Arc<RwLock<Credential>>,
     pub state: Mutex<AccountState>,
-    pub refresh_lock: tokio::sync::Mutex<()>,
+    pub refresh_lock: Arc<tokio::sync::Mutex<()>>,
+    /// Rotated credentials that still need saving. Shared with in-flight users
+    /// across account/config reloads, as are the credentials and refresh lock.
+    pub pending_oauth_save: Arc<Mutex<Option<PendingOAuthSave>>>,
     /// Stable per-account device id for Claude cloaking.
     pub device_id: String,
     pub session_id: String,
@@ -662,8 +672,12 @@ pub fn read_oauth_file(path: &Path) -> Option<(Provider, OAuth, bool, Map<String
 
 /// Writes refreshed tokens back into the credential file, keeping unknown fields.
 pub fn write_oauth_file(path: &Path, provider: Provider, o: &OAuth, extra: &[(&str, Value)]) -> std::io::Result<()> {
-    let mut map: Map<String, Value> =
-        std::fs::read_to_string(path).ok().and_then(|t| serde_json::from_str(&t).ok()).unwrap_or_default();
+    let mut map = o.raw.clone();
+    if let Some(disk) =
+        std::fs::read_to_string(path).ok().and_then(|t| serde_json::from_str::<Map<String, Value>>(&t).ok())
+    {
+        map.extend(disk);
+    }
     map.insert("type".into(), provider.as_str().into());
     map.insert("access_token".into(), o.access_token.clone().into());
     map.insert("refresh_token".into(), o.refresh_token.clone().into());
@@ -935,8 +949,31 @@ impl Pool {
         let old: HashMap<String, Arc<Account>> =
             self.accounts.read().iter().map(|a| (a.id.clone(), a.clone())).collect();
         let mut next = Vec::with_capacity(specs.len());
-        for s in specs {
+        for mut s in specs {
             if let Some(prev) = old.get(&s.id) {
+                // Never replace a successfully rotated token with its older disk
+                // copy. A shared refresh lock also prevents a changed config from
+                // starting a second refresh while the old Account is in flight.
+                let guard = prev.refresh_lock.try_lock();
+                let pending = prev.pending_oauth_save.lock();
+                if guard.is_err() || pending.is_some() {
+                    s.cred = prev.cred.read().clone();
+                } else if let Some(path) = &s.path {
+                    // Collection happened before taking the refresh lock; reread
+                    // here in case a refresh completed while files were scanned.
+                    if let Some((_, oauth, _, _)) = read_oauth_file(path) {
+                        s.cred = Credential::OAuth(oauth);
+                    }
+                }
+                let identity_changed = match (&*prev.cred.read(), &s.cred) {
+                    (Credential::OAuth(old), Credential::OAuth(new)) => {
+                        old.account_id != new.account_id || old.base_url != new.base_url
+                    }
+                    _ => false,
+                };
+                if guard.is_ok() && pending.is_none() {
+                    *prev.cred.write() = s.cred.clone();
+                }
                 // Keep counters and cooldowns; refresh credentials from disk/config.
                 let same_shape = prev.models.len() == s.models.len()
                     && prev.headers == s.headers
@@ -945,13 +982,6 @@ impl Pool {
                     && prev.excluded == s.excluded
                     && prev.aliases == s.aliases;
                 if same_shape {
-                    let identity_changed = match (&*prev.cred.read(), &s.cred) {
-                        (Credential::OAuth(old), Credential::OAuth(new)) => {
-                            old.account_id != new.account_id || old.base_url != new.base_url
-                        }
-                        _ => false,
-                    };
-                    *prev.cred.write() = s.cred;
                     let mut st = prev.state.lock();
                     st.disabled = s.disabled;
                     if identity_changed {
@@ -985,6 +1015,9 @@ impl Pool {
                 })
                 .unwrap_or_default();
             state.disabled = s.disabled;
+            let cred = old.get(&s.id).map(|prev| prev.cred.clone()).unwrap_or_else(|| Arc::new(RwLock::new(s.cred)));
+            let refresh_lock = old.get(&s.id).map(|prev| prev.refresh_lock.clone()).unwrap_or_default();
+            let pending_oauth_save = old.get(&s.id).map(|prev| prev.pending_oauth_save.clone()).unwrap_or_default();
             next.push(Arc::new(Account {
                 id: s.id,
                 provider: s.provider,
@@ -994,9 +1027,10 @@ impl Pool {
                 models: s.models,
                 headers: s.headers,
                 proxy_url: s.proxy_url,
-                cred: RwLock::new(s.cred),
+                cred,
                 state: Mutex::new(state),
-                refresh_lock: tokio::sync::Mutex::new(()),
+                refresh_lock,
+                pending_oauth_save,
                 device_id: s.device_id.unwrap_or_else(|| random_hex(32)),
                 session_id: uuid::Uuid::new_v4().to_string(),
                 discovered: RwLock::new(discovered),
@@ -1577,9 +1611,10 @@ claude-api-key:
             models: vec![],
             headers: BTreeMap::new(),
             proxy_url: None,
-            cred: RwLock::new(Credential::ApiKey { key: "k".into(), base_url: None }),
+            cred: Arc::new(RwLock::new(Credential::ApiKey { key: "k".into(), base_url: None })),
             state: Mutex::new(AccountState::default()),
-            refresh_lock: tokio::sync::Mutex::new(()),
+            refresh_lock: Arc::default(),
+            pending_oauth_save: Arc::default(),
             device_id: String::new(),
             session_id: String::new(),
             discovered: RwLock::new(vec![]),

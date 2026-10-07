@@ -323,17 +323,21 @@ function onRequest(log) {
     o.totals.requests += 1;
     if (log.status < 400) o.totals.ok += 1; else o.totals.failed += 1;
     const minute = Math.floor(Date.parse(log.ts) / 60000);
-    let b = o.series[o.series.length - 1];
-    if (!b || b.minute !== minute) {
+    const cutoff = Math.floor(Date.now() / 60000) - 59;
+    o.series = o.series.filter((bucket) => bucket.minute >= cutoff);
+    let b = o.series.find((bucket) => bucket.minute === minute);
+    if (!b && minute >= cutoff) {
       o.series.push((b = { minute, requests: 0, failed: 0, tokens: 0, input_tokens: 0, output_tokens: 0, cache_tokens: 0 }));
-      if (o.series.length > 60) o.series.shift();
+      o.series.sort((a, b) => a.minute - b.minute);
     }
-    b.requests += 1;
-    if (log.status >= 400) b.failed += 1;
-    b.tokens += log.input_tokens + log.output_tokens + log.cache_tokens;
-    b.input_tokens += log.input_tokens;
-    b.output_tokens += log.output_tokens;
-    b.cache_tokens += log.cache_tokens;
+    if (b) {
+      b.requests += 1;
+      if (log.status >= 400) b.failed += 1;
+      b.tokens += log.input_tokens + log.output_tokens + log.cache_tokens;
+      b.input_tokens += log.input_tokens;
+      b.output_tokens += log.output_tokens;
+      b.cache_tokens += log.cache_tokens;
+    }
   }
   if (log.account_id && S.activity[log.account_id]) S.activity[log.account_id].at = 0;
   renderFaults();

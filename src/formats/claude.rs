@@ -209,6 +209,76 @@ pub fn default_max_tokens(model: &str) -> u64 {
     }
 }
 
+/// Manual thinking needs at least 1024 tokens and a strictly larger output cap.
+/// Keep the usual answer reserve when possible, but never increase a caller's cap.
+pub fn thinking_budget(max_tokens: u64, requested: u64) -> Result<u64, String> {
+    if max_tokens <= 1024 {
+        return Err(
+            "Manual Claude thinking requires max_tokens greater than 1024; increase the limit or disable thinking"
+                .into(),
+        );
+    }
+    let ceiling = max_tokens.saturating_sub(1024).max(1024);
+    Ok(requested.clamp(1024, ceiling))
+}
+
+fn manual_thinking_allowed(req: &Request) -> bool {
+    let Some(last) = req.messages.iter().rev().find(|m| m.role == Role::Assistant) else { return true };
+    !last.parts.iter().any(|p| matches!(p, Part::ToolCall { .. }))
+        || last
+            .parts
+            .iter()
+            .any(|p| matches!(p, Part::Reasoning { sig: Some(Sig::Claude(_)), .. } | Part::RedactedReasoning(_)))
+}
+
+pub fn validate_thinking_budget(req: &Request, model: &str) -> Result<(), String> {
+    if uses_budget_thinking(model)
+        && manual_thinking_allowed(req)
+        && let Some(budget) = req.reasoning.as_ref().and_then(Reasoning::budget_tokens)
+    {
+        thinking_budget(req.max_tokens.unwrap_or_else(|| default_max_tokens(model)), budget)?;
+    }
+    Ok(())
+}
+
+/// Validate native requests too, including ones configured by a model suffix.
+pub fn validate_native_thinking_budget(body: &Value, model: &str) -> Result<(), String> {
+    if uses_budget_thinking(model) && body["thinking"]["type"] == "enabled" {
+        let max = body["max_tokens"].as_u64().unwrap_or_else(|| default_max_tokens(model));
+        let budget =
+            body["thinking"]["budget_tokens"].as_u64().ok_or("Manual Claude thinking requires budget_tokens")?;
+        if budget < 1024 || budget >= max {
+            return Err("Manual Claude thinking requires 1024 <= budget_tokens < max_tokens".into());
+        }
+    }
+    Ok(())
+}
+
+fn has_cache_control(value: &Value) -> bool {
+    match value {
+        Value::Object(object) => {
+            object.get("cache_control").is_some_and(|control| !control.is_null())
+                || object.get("prompt_cache_breakpoint").is_some_and(|control| !control.is_null())
+                || object.values().any(has_cache_control)
+        }
+        Value::Array(values) => values.iter().any(has_cache_control),
+        _ => false,
+    }
+}
+
+/// Enable Anthropic's moving cache boundary for translated conversations.
+/// Call only for an actual Claude provider, not every provider using its wire format.
+/// Explicit controls, including OpenAI's intentional explicit-with-no-markers mode,
+/// take precedence. With no existing markers, the default 5m TTL cannot conflict.
+pub fn apply_translated_cache_policy(original: &Value, body: &mut Value) {
+    if original["prompt_cache_options"]["mode"] != "explicit"
+        && !has_cache_control(original)
+        && !has_cache_control(body)
+    {
+        body["cache_control"] = json!({ "type": "ephemeral" });
+    }
+}
+
 pub fn sanitize_tool_id(id: &str) -> String {
     let s: String =
         id.chars().map(|c| if c.is_ascii_alphanumeric() || c == '_' || c == '-' { c } else { '_' }).collect();
@@ -252,16 +322,15 @@ pub fn build_request(req: &Request, model: &str) -> Value {
     let mut out = json!({ "model": model });
     let o = out.as_object_mut().unwrap();
 
-    let mut max_tokens = req.max_tokens.unwrap_or_else(|| default_max_tokens(model));
+    let max_tokens = req.max_tokens.unwrap_or_else(|| default_max_tokens(model));
     if let Some(r) = &req.reasoning {
         if r.disabled {
             o.insert("thinking".into(), json!({ "type": "disabled" }));
         } else if uses_budget_thinking(model) {
             if let Some(b) = r.budget_tokens() {
-                if max_tokens <= 1024 {
-                    max_tokens = default_max_tokens(model);
-                }
-                let budget = b.clamp(1024, max_tokens - 1024);
+                // The request pipeline validates incompatible limits before building.
+                // Still keep this builder panic-free for every parsed input.
+                let budget = thinking_budget(max_tokens, b).unwrap_or(1024);
                 o.insert("thinking".into(), json!({ "type": "enabled", "budget_tokens": budget }));
             }
         } else {
@@ -285,20 +354,10 @@ pub fn build_request(req: &Request, model: &str) -> Value {
 
     // Only manual thinking requires a signed thinking block on the last tool turn.
     // Adaptive thinking accepts unsigned history; keep its mode and effort stable.
-    if manual_thinking {
-        let last_assistant = req.messages.iter().rev().find(|m| m.role == Role::Assistant);
-        if let Some(m) = last_assistant {
-            let has_tool = m.parts.iter().any(|p| matches!(p, Part::ToolCall { .. }));
-            let signed = m
-                .parts
-                .iter()
-                .any(|p| matches!(p, Part::Reasoning { sig: Some(Sig::Claude(_)), .. } | Part::RedactedReasoning(_)));
-            if has_tool && !signed {
-                o.insert("thinking".into(), json!({ "type": "disabled" }));
-                o.remove("output_config");
-                thinking_on = false;
-            }
-        }
+    if manual_thinking && !manual_thinking_allowed(req) {
+        o.insert("thinking".into(), json!({ "type": "disabled" }));
+        o.remove("output_config");
+        thinking_on = false;
     }
     o.insert("max_tokens".into(), max_tokens.into());
 

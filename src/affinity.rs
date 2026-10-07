@@ -2,7 +2,7 @@
 //! conversation input stays in a bounded, process-local continuation cache.
 
 use std::collections::{HashMap, HashSet};
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::sync::Arc;
 
 use axum::http::HeaderMap;
@@ -14,6 +14,9 @@ use sha2::{Digest, Sha256};
 
 use crate::accounts::{Account, Only, PROVIDERS, Pick, Pool, Provider};
 use crate::config::{Config, Routing};
+
+mod persistence;
+use persistence::Persistence;
 
 const MAX_SESSIONS: usize = 10_000;
 const MAX_HISTORY_BYTES: usize = 64 * 1024 * 1024;
@@ -194,8 +197,8 @@ fn weighs_session_load(cfg: &Config) -> bool {
 }
 
 pub struct Sessions {
-    registry: Mutex<Registry>,
-    path: Option<PathBuf>,
+    registry: Arc<Mutex<Registry>>,
+    persistence: Option<Persistence>,
 }
 
 /// Keep an assignment alive until a call (including its response stream) ends.
@@ -273,7 +276,7 @@ impl Sessions {
         registry.responses.retain(|_, c| c.session != session);
         registry.history_bytes = registry.responses.values().map(|c| c.bytes).sum();
         registry.dirty = true;
-        self.flush_locked(&mut registry);
+        self.schedule_save();
     }
     pub fn load(auth_dir: &Path, idle: u64) -> Self {
         let path = auth_dir.join(".routing-sessions.state");
@@ -286,16 +289,19 @@ impl Sessions {
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
             Err(e) => tracing::warn!(path = %path.display(), "session assignments could not be read: {e}"),
         }
-        let sessions = Self { registry: Mutex::new(registry), path: Some(path) };
+        let registry = Arc::new(Mutex::new(registry));
+        let persistence = Persistence::new(registry.clone(), path);
+        let sessions = Self { registry, persistence };
         sessions.prune(idle);
         sessions
     }
 
     #[cfg(test)]
     pub fn memory() -> Self {
-        Self { registry: Mutex::new(Registry::default()), path: None }
+        Self { registry: Arc::new(Mutex::new(Registry::default())), persistence: None }
     }
 
+    #[cfg(test)]
     pub fn pick(
         &self,
         pool: &Pool,
@@ -419,7 +425,7 @@ impl Sessions {
             tracing::info!(from = %old.account, to = %acct.id, reason = moving.unwrap_or("quota_exhausted"), "session moved to another account");
         }
         registry.dirty = true;
-        self.flush_locked(&mut registry);
+        self.schedule_save();
         Ok(Selected {
             account: acct,
             model: upstream,
@@ -487,51 +493,45 @@ impl Sessions {
         let mut registry = self.registry.lock();
         Self::prune_locked(&mut registry, idle);
         if Utc::now().timestamp() - registry.last_flush >= 30 {
-            self.flush_locked(&mut registry);
+            drop(registry);
+            self.schedule_save();
         }
     }
 
+    #[cfg(test)]
     pub fn save(&self) {
-        self.flush_locked(&mut self.registry.lock());
+        if let Some(writer) = &self.persistence {
+            let _ = writer.flush().blocking_recv();
+        }
     }
 
-    fn flush_locked(&self, registry: &mut Registry) {
-        if !registry.dirty {
-            return;
+    /// Wait for the serial writer without blocking an async request worker.
+    pub async fn save_async(&self) {
+        if let Some(writer) = &self.persistence {
+            let _ = writer.flush().await;
         }
-        let Some(path) = &self.path else {
-            return;
-        };
-        let write = || -> anyhow::Result<()> {
-            use std::io::Write;
-            if let Some(parent) = path.parent() {
-                std::fs::create_dir_all(parent)?;
-            }
-            let temporary = path.with_extension(format!("{}.tmp", uuid::Uuid::new_v4()));
-            let mut opts = std::fs::OpenOptions::new();
-            opts.write(true).create_new(true);
-            #[cfg(unix)]
-            {
-                use std::os::unix::fs::OpenOptionsExt;
-                opts.mode(0o600);
-            }
-            let result = (|| -> anyhow::Result<()> {
-                let mut file = opts.open(&temporary)?;
-                file.write_all(&serde_json::to_vec(&registry.bindings)?)?;
-                file.sync_all()?;
-                std::fs::rename(&temporary, path)?;
-                Ok(())
-            })();
-            if result.is_err() {
-                let _ = std::fs::remove_file(&temporary);
-            }
-            result
-        };
-        match write() {
-            Ok(()) => registry.dirty = false,
-            Err(e) => tracing::warn!(path = %path.display(), "session assignments could not be persisted: {e}"),
+    }
+
+    /// New assignments and migrations reach disk before contacting the provider.
+    /// Activity timestamps on an existing assignment use the periodic flush.
+    pub async fn persist_selection(&self, selected: &Selected) {
+        if matches!(
+            selected.reason,
+            "new_session" | "quota_exhausted" | "account_removed" | "account_disabled" | "model_unavailable"
+        ) {
+            self.save_async().await;
+        } else if matches!(selected.reason, "session_reused" | "temporary_detour")
+            && let Some(writer) = &self.persistence
+            && let Some(pending) = writer.pending_write()
+        {
+            let _ = pending.await;
         }
-        registry.last_flush = Utc::now().timestamp();
+    }
+
+    fn schedule_save(&self) {
+        if let Some(writer) = &self.persistence {
+            writer.schedule();
+        }
     }
 
     pub fn previous(&self, headers: &HeaderMap, id: &str, session: Option<&str>) -> Option<(String, Vec<Value>)> {
@@ -1030,6 +1030,7 @@ mod tests {
         pool.reload(&cfg);
         let sessions = Sessions::load(&dir, 86_400);
         let a = sessions.pick(&pool, &cfg, "gpt-6.1-sol", Some("sensitive-task-id"), &[], None).unwrap().0;
+        sessions.save();
         let loaded = Sessions::load(&dir, 86_400);
         assert_eq!(loaded.pick(&pool, &cfg, "gpt-6.1-sol", Some("sensitive-task-id"), &[], None).unwrap().0.id, a.id);
         let data = std::fs::read_to_string(dir.join(".routing-sessions.state")).unwrap();

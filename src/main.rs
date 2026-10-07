@@ -20,6 +20,7 @@ mod schema;
 mod server;
 mod sse;
 mod state;
+mod token_count;
 mod upstream;
 mod vertex;
 mod ws;
@@ -134,10 +135,12 @@ async fn serve(app: Arc<App>) -> Result<()> {
         None
     };
 
-    tokio::spawn(oauth::refresher(app.clone()));
-    tokio::spawn(antigravity::version_updater(app.clone()));
-    tokio::spawn(quota::poller(app.clone()));
-    tokio::spawn(watch(app.clone()));
+    let background = [
+        tokio::spawn(oauth::refresher(app.clone())),
+        tokio::spawn(antigravity::version_updater(app.clone())),
+        tokio::spawn(quota::poller(app.clone())),
+        tokio::spawn(watch(app.clone())),
+    ];
 
     let scheme = if cfg.tls.enable { "https" } else { "http" };
     let shown = if addr.ip().is_unspecified() {
@@ -161,19 +164,26 @@ async fn serve(app: Arc<App>) -> Result<()> {
     println!();
 
     let service = server::router(app.clone()).into_make_service_with_connect_info::<SocketAddr>();
-    if let Some(tls) = tls {
+    let result = if let Some(tls) = tls {
         let handle = axum_server::Handle::new();
         let stop = handle.clone();
         tokio::spawn(async move {
             shutdown_signal().await;
             stop.graceful_shutdown(Some(Duration::from_secs(10)));
         });
-        axum_server::from_tcp_rustls(listener.into_std()?, tls)?.handle(handle).serve(service).await?;
+        axum_server::from_tcp_rustls(listener.into_std()?, tls)?.handle(handle).serve(service).await
     } else {
-        axum::serve(listener, service).with_graceful_shutdown(shutdown_signal()).await?;
+        axum::serve(listener, service).with_graceful_shutdown(shutdown_signal()).await
+    };
+    for task in background {
+        task.abort();
+        let _ = task.await;
     }
-    app.sessions.save();
-    Ok(())
+    // A provider may already have rotated a refresh token for a disconnected
+    // request. Let those bounded operations publish and persist before exiting.
+    app.refresh_tasks.shutdown().await;
+    app.sessions.save_async().await;
+    result.context("serving requests")
 }
 
 /// Ctrl-C, or SIGTERM from `docker stop` / systemd.
