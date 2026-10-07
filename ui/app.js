@@ -30,7 +30,7 @@ const PHONE = matchMedia('(max-width: 759px)');
 const mob = () => PHONE.matches;
 const MAC = /Mac|iPhone|iPad/.test(navigator.platform || navigator.userAgent);
 const MOD = MAC ? '⌘' : 'Ctrl ';
-const ROUTES = ['overview', 'accounts', 'requests', 'models', 'config'];
+const ROUTES = ['overview', 'accounts', 'requests', 'usage', 'models', 'config'];
 
 const S = {
   key: store.get('key') || '',
@@ -391,6 +391,8 @@ function refreshViews() {
   } else if (S.route === 'accounts') {
     if (S.sub) patch('det-root', detailBodyHTML);
     else { patch('acct-head', accountHeadHTML); patch('acct-filters', acctFiltersHTML); patch('acct-list', accountListHTML); }
+  } else if (S.route === 'usage') {
+    usageRender();
   } else if (S.route === 'models') {
     patch('models-head', modelsHeadHTML);
     patch('models-root', modelsBodyHTML);
@@ -409,7 +411,7 @@ function renderLive() {
 }
 
 function renderPrivacy() {
-  const label = S.private ? 'Show emails and keys' : 'Hide emails and keys';
+  const label = S.private ? 'Show account and client labels, paths and keys' : 'Hide account and client labels, paths and keys';
   for (const btn of $$('[data-privacy]')) {
     btn.innerHTML = S.private ? ICON.eyeOff : ICON.eye;
     btn.setAttribute('aria-pressed', String(S.private));
@@ -431,7 +433,7 @@ function renderFaults() {
   if (S.faults) renderFaultsMenu();
 }
 
-const TITLES = { overview: 'Overview', accounts: 'Accounts', requests: 'Requests', models: 'Models', config: 'Config' };
+const TITLES = { overview: 'Overview', accounts: 'Accounts', requests: 'Requests', usage: 'Usage & costs', models: 'Models', config: 'Config' };
 
 function renderChrome() {
   for (const a of $$('.tabs a, .mtabs a')) {
@@ -468,9 +470,10 @@ function render() {
   view.className = viewClass();
   if (S.locked) { closeResetModal(); closeLayers(); view.innerHTML = lockHTML(); bindLock(); return; }
   if (!S.overview) { view.innerHTML = skeletonHTML(); return; }
-  const pages = { overview: overviewHTML, accounts: accountsHTML, requests: requestsHTML, models: modelsHTML, config: configHTML };
+  const pages = { overview: overviewHTML, accounts: accountsHTML, requests: requestsHTML, usage: usageHTML, models: modelsHTML, config: configHTML };
   view.innerHTML = (pages[S.route] || overviewHTML)();
   if (S.route === 'config') bindConfig();
+  if (S.route === 'usage') bindUsage();
   if (S.route === 'accounts' && S.sub) loadActivity(S.sub);
   renderDrawer();
   syncResetModal();
