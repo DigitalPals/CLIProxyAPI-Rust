@@ -426,6 +426,10 @@ The dashboard lives in `ui/` and is embedded with `include_str!`, so rebuild aft
 See [release binary size](docs/binary-size.md) for compiler comparisons, measured
 savings, and Linux packed-relocation compatibility.
 
+## Credits
+
+Fusebox started as [CLIProxyAPI-Rust](https://github.com/IuCC123/CLIProxyAPI-Rust) by [IuCC123](https://github.com/IuCC123), who wrote the original Rust rewrite and dashboard. That project was in turn a rewrite of [CLIProxyAPI](https://github.com/router-for-me/CLIProxyAPI) by router-for-me. Thanks to both.
+
 ## License
 
 [Unlicense](LICENSE): public domain. Copy it, change it, sell it, ship it, no attribution required.
@@ -434,4 +438,4 @@ The provider logos in `ui/logos.svg` come from [LobeHub Icons](https://github.co
 
 <br>
 
-<div align="center"><sub>Inspired by <a href="https://github.com/router-for-me/CLIProxyAPI">CLIProxyAPI</a>. Created in <a href="https://t3.codes">T3 Code</a>.</sub></div>
+<div align="center"><sub>Based on <a href="https://github.com/IuCC123/CLIProxyAPI-Rust">CLIProxyAPI-Rust</a> by IuCC123 and inspired by <a href="https://github.com/router-for-me/CLIProxyAPI">CLIProxyAPI</a>. Created in <a href="https://t3.codes">T3 Code</a>.</sub></div>
