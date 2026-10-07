@@ -59,7 +59,7 @@ pub enum CollectorCommand {
         state_dir: PathBuf,
     },
 }
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct LocalState {
     version: u32,
@@ -274,6 +274,7 @@ fn validate_destination(destination: &str) -> Result<reqwest::Url> {
         bail!("destination must not contain credentials, query, or fragment")
     }
     let host = url.host_str().ok_or_else(|| anyhow!("destination host required"))?;
+    let host = host.trim_start_matches('[').trim_end_matches(']');
     let loopback = host == "localhost" || host.parse::<std::net::IpAddr>().is_ok_and(|ip| ip.is_loopback());
     if url.scheme() != "https" && !(url.scheme() == "http" && loopback) {
         bail!("non-loopback destination requires verified HTTPS")

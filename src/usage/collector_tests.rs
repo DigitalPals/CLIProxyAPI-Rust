@@ -305,6 +305,7 @@ fn transport_and_protected_credentials() {
     assert!(validate_destination("https://user:secret@example.com/api/usage-ingest").is_err());
     assert!(validate_destination("https://example.com/api/usage-ingest?key=secret").is_err());
     assert!(validate_destination("http://127.0.0.1/api/usage-ingest").is_ok());
+    assert!(validate_destination("http://[::1]/api/usage-ingest").is_ok());
     let dir = TestDir::new();
     let state = LocalState {
         version: 1,
