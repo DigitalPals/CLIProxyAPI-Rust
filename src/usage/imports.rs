@@ -208,12 +208,16 @@ struct Root {
 #[derive(Debug, Default, Clone, Serialize, Deserialize)]
 pub(crate) struct Context {
     session: Option<String>,
+    #[serde(default)]
+    thread: Option<String>,
     model: Option<String>,
     provider: Option<String>,
     #[serde(default)]
     meta_seen: bool,
     #[serde(default)]
     legacy_fork: bool,
+    #[serde(default)]
+    legacy_reset: bool,
     #[serde(default)]
     legacy_emitted: Vec<String>,
     #[serde(skip)]
@@ -328,9 +332,41 @@ fn native(v: &Value) -> Option<NativeTokens> {
         reasoning: number(v.get("reasoning_output_tokens")).unwrap_or(0),
     })
 }
+fn validated_native(v: &Value) -> Result<NativeTokens> {
+    valid_numbers(
+        v,
+        &[
+            "input_tokens",
+            "cached_input_tokens",
+            "cache_write_input_tokens",
+            "output_tokens",
+            "reasoning_output_tokens",
+        ],
+    )?;
+    let total = native(v).ok_or_else(|| anyhow!("estimated or invalid cumulative usage"))?;
+    total
+        .tokens()
+        .ok_or_else(|| anyhow!("inconsistent cumulative categories"))?
+        .validate()
+        .map_err(|_| anyhow!("invalid cumulative metadata"))?;
+    Ok(total)
+}
 
 /// Converts an allowlisted native row only. No transcript/path/credential fields survive.
 pub(crate) fn parse_record(source: &str, v: &Value, context: &mut Context) -> Result<Option<Observation>> {
+    let mut candidate = context.clone();
+    let result = parse_record_inner(source, v, &mut candidate);
+    if result.is_ok() {
+        *context = candidate;
+    } else if candidate.legacy_reset {
+        // A validated reset deliberately disables ambiguous legacy evidence. All
+        // other failed rows leave checkpoints, supersession, and baselines intact.
+        context.legacy_reset = true;
+    }
+    result
+}
+
+fn parse_record_inner(source: &str, v: &Value, context: &mut Context) -> Result<Option<Observation>> {
     if source == "claude_code" {
         if v.get("type").and_then(Value::as_str) != Some("assistant") {
             return Ok(None);
@@ -382,6 +418,7 @@ pub(crate) fn parse_record(source: &str, v: &Value, context: &mut Context) -> Re
             if !context.meta_seen {
                 context.meta_seen = true;
                 context.session = label(payload.get("session_id")).or_else(|| label(payload.get("id")));
+                context.thread = label(payload.get("id"));
                 context.provider = label(payload.get("model_provider"));
                 context.legacy_fork = payload.get("forked_from_id").is_some_and(|v| !v.is_null());
             }
@@ -433,10 +470,10 @@ pub(crate) fn parse_record(source: &str, v: &Value, context: &mut Context) -> Re
             {
                 bail!("inconsistent input categories")
             }
-            if let Some(total) = payload.get("thread_token_usage").and_then(native) {
+            if let Some(total) = payload.get("thread_token_usage").and_then(|v| validated_native(v).ok()) {
                 let key = total.key();
-                if let Some(session) = &context.session {
-                    let fallback = format!("counter:{}", hash(format!("{session}:{key}").as_bytes()));
+                if let Some(thread) = &context.thread {
+                    let fallback = format!("counter:{}", hash(format!("thread:{thread}:{key}").as_bytes()));
                     if let Some(index) = context.legacy_emitted.iter().position(|id| id == &fallback) {
                         context.legacy_emitted.remove(index);
                         context.superseded.push(fallback);
@@ -454,19 +491,18 @@ pub(crate) fn parse_record(source: &str, v: &Value, context: &mut Context) -> Re
             if context.legacy_fork {
                 bail!("unsupported ambiguous legacy fork usage")
             }
-            let Some(info) = payload.get("info").filter(|v| !v.is_null()) else { return Ok(None) };
-            let total = info
-                .get("total_token_usage")
-                .and_then(native)
-                .ok_or_else(|| anyhow!("estimated or invalid cumulative usage"))?;
-            let previous = context.cumulative.replace(total.clone()).unwrap_or_default();
-            if total == previous || context.modern_totals.contains(&total.key()) {
-                return Ok(None);
+            if context.legacy_reset {
+                bail!("unsupported ambiguous legacy usage after counter reset")
             }
-            let Some(delta) = total.diff(&previous) else { bail!("cumulative counter reset") };
+            let Some(info) = payload.get("info").filter(|v| !v.is_null()) else { return Ok(None) };
+            let total = validated_native(
+                info.get("total_token_usage").ok_or_else(|| anyhow!("estimated or invalid cumulative usage"))?,
+            )?;
             let session = context.session.clone().ok_or_else(|| anyhow!("missing session identity"))?;
+            let thread =
+                context.thread.as_deref().ok_or_else(|| anyhow!("unsupported missing legacy thread identity"))?;
             let at = timestamp(v).ok_or_else(|| anyhow!("missing timestamp"))?;
-            let identity = hash(format!("{session}:{}", total.key()).as_bytes());
+            let identity = hash(format!("thread:{thread}:{}", total.key()).as_bytes());
             let mut o = Observation::new(
                 source,
                 format!("counter:{identity}"),
@@ -474,15 +510,29 @@ pub(crate) fn parse_record(source: &str, v: &Value, context: &mut Context) -> Re
                 at,
             );
             o.parser_version = PARSER.into();
+            o.session_id = Some(session);
+            o.actual_model = context.model.clone();
+            o.tokens = total.tokens().ok_or_else(|| anyhow!("inconsistent cumulative categories"))?;
+            // Legacy token_count can contain estimates/replay; explicitly partial evidence.
+            o.completeness = "partial".into();
+            // Validate timestamps and cumulative subsets before recording a reset.
+            o.validate().map_err(|_| anyhow!("invalid usage metadata"))?;
+            let previous = context.cumulative.replace(total.clone()).unwrap_or_default();
+            if total == previous {
+                return Ok(None);
+            }
+            let Some(delta) = total.diff(&previous) else {
+                context.legacy_reset = true;
+                bail!("unsupported ambiguous legacy usage after counter reset")
+            };
+            if context.modern_totals.contains(&total.key()) {
+                return Ok(None);
+            }
             if context.legacy_emitted.len() >= 64 {
                 context.legacy_emitted.remove(0);
             }
             context.legacy_emitted.push(o.source_event_id.clone());
-            o.session_id = Some(session);
-            o.actual_model = context.model.clone();
             o.tokens = delta.tokens().ok_or_else(|| anyhow!("inconsistent cumulative categories"))?;
-            // Legacy token_count can contain estimates/replay; explicitly partial evidence.
-            o.completeness = "partial".into();
             o.validate().map_err(|_| anyhow!("invalid usage metadata"))?;
             Ok(Some(o))
         }

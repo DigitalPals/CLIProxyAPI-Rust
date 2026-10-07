@@ -72,6 +72,143 @@ fn native_categories_and_missing_values() {
     assert!(parse_record("codex", &invalid, &mut state).is_err());
 }
 #[test]
+fn malformed_modern_cannot_suppress_existing_or_future_legacy() {
+    let mut invalid = modern();
+    invalid["payload"]["usage"]["reasoning_output_tokens"] = json!(201);
+    for legacy_first in [true, false] {
+        let mut state = Context::default();
+        parse_record("codex", &meta("openai"), &mut state).unwrap();
+        if legacy_first {
+            parse_record("codex", &legacy(), &mut state).unwrap().unwrap();
+        }
+        let before = serde_json::to_value(&state).unwrap();
+        assert!(parse_record("codex", &invalid, &mut state).is_err());
+        assert_eq!(serde_json::to_value(&state).unwrap(), before);
+        assert!(state.superseded.is_empty());
+        if !legacy_first {
+            assert!(parse_record("codex", &legacy(), &mut state).unwrap().is_some());
+        }
+    }
+}
+
+#[test]
+fn malformed_legacy_does_not_advance_baseline_or_mark_reset() {
+    let mut state = Context::default();
+    parse_record("codex", &meta("openai"), &mut state).unwrap();
+    parse_record("codex", &legacy(), &mut state).unwrap().unwrap();
+    let before = serde_json::to_value(&state).unwrap();
+    let mut missing_timestamp = legacy();
+    missing_timestamp["timestamp"] = json!("invalid");
+    missing_timestamp["payload"]["info"]["total_token_usage"] = json!({
+        "input_tokens":500,"cached_input_tokens":300,"cache_write_input_tokens":50,
+        "output_tokens":100,"reasoning_output_tokens":40
+    });
+    let mut out_of_bounds_timestamp = missing_timestamp.clone();
+    out_of_bounds_timestamp["timestamp"] = json!("2010-01-01T00:00:00Z");
+    let mut invalid_subset = legacy();
+    invalid_subset["payload"]["info"]["total_token_usage"]["reasoning_output_tokens"] = json!(201);
+    let mut invalid_delta = legacy();
+    invalid_delta["payload"]["info"]["total_token_usage"]["output_tokens"] = json!(210);
+    invalid_delta["payload"]["info"]["total_token_usage"]["reasoning_output_tokens"] = json!(100);
+    for row in [missing_timestamp, out_of_bounds_timestamp, invalid_subset, invalid_delta] {
+        assert!(parse_record("codex", &row, &mut state).is_err());
+        assert_eq!(serde_json::to_value(&state).unwrap(), before);
+    }
+    let mut next = legacy();
+    next["payload"]["info"]["total_token_usage"] = json!({
+        "input_tokens":2000,"cached_input_tokens":1200,"cache_write_input_tokens":200,
+        "output_tokens":400,"reasoning_output_tokens":160
+    });
+    let observation = parse_record("codex", &next, &mut state).unwrap().unwrap();
+    assert_eq!(observation.tokens, codex_tokens(&usage()));
+}
+
+#[test]
+fn counter_reset_disables_ambiguous_legacy_across_restart() {
+    let mut state = Context::default();
+    parse_record("codex", &meta("openai"), &mut state).unwrap();
+    parse_record("codex", &legacy(), &mut state).unwrap().unwrap();
+    let baseline = state.cumulative.clone();
+    let mut reset = legacy();
+    reset["payload"]["info"]["total_token_usage"] = json!({
+        "input_tokens":500,"cached_input_tokens":300,"cache_write_input_tokens":50,
+        "output_tokens":100,"reasoning_output_tokens":40
+    });
+    assert!(parse_record("codex", &reset, &mut state).unwrap_err().to_string().starts_with("unsupported"));
+    assert_eq!(state.cumulative, baseline);
+    state = serde_json::from_value(serde_json::to_value(&state).unwrap()).unwrap();
+    assert!(parse_record("codex", &legacy(), &mut state).unwrap_err().to_string().starts_with("unsupported"));
+    assert!(parse_record("codex", &modern(), &mut state).unwrap().is_some());
+}
+
+#[tokio::test]
+async fn malformed_modern_does_not_remove_committed_legacy() {
+    let dir = TestDir::new();
+    let logs = dir.0.join("logs");
+    fs::create_dir(&logs).unwrap();
+    let file = logs.join("rollout.jsonl");
+    write_rows(&file, &[meta("openai"), legacy()]);
+    let store = dir.store();
+    configure(&store, "codex", logs.to_str().unwrap(), true).await.unwrap();
+    scan(&store, None).await.unwrap();
+    let mut invalid = modern();
+    invalid["payload"]["usage"]["reasoning_output_tokens"] = json!(201);
+    writeln!(fs::OpenOptions::new().append(true).open(file).unwrap(), "{}", invalid).unwrap();
+    scan(&store, None).await.unwrap();
+    assert_eq!(count(&store).await, 1);
+    let event = store
+        .call(|c| Ok(c.query_row("SELECT source_event_id FROM usage_entries", [], |r| r.get::<_, String>(0))?))
+        .await
+        .unwrap();
+    assert!(event.starts_with("counter:"));
+}
+
+#[tokio::test]
+async fn sibling_thread_counters_and_supersession_stay_separate() {
+    let dir = TestDir::new();
+    let logs = dir.0.join("logs");
+    fs::create_dir(&logs).unwrap();
+    let mut child_a = meta("openai");
+    child_a["payload"]["id"] = json!("child-a");
+    let mut child_b = meta("openai");
+    child_b["payload"]["id"] = json!("child-b");
+    write_rows(&logs.join("child-a.jsonl"), &[child_a.clone(), legacy()]);
+    let child_b_file = logs.join("child-b.jsonl");
+    write_rows(&child_b_file, &[child_b, legacy()]);
+    let store = dir.store();
+    configure(&store, "codex", logs.to_str().unwrap(), true).await.unwrap();
+    scan(&store, None).await.unwrap();
+    assert_eq!(count(&store).await, 2);
+    let mut expected_a = Context::default();
+    parse_record("codex", &child_a, &mut expected_a).unwrap();
+    let expected_a = parse_record("codex", &legacy(), &mut expected_a).unwrap().unwrap().source_event_id;
+    let mut child_b_modern = modern();
+    child_b_modern["payload"]["thread_id"] = json!("child-b");
+    writeln!(fs::OpenOptions::new().append(true).open(child_b_file).unwrap(), "{}", child_b_modern).unwrap();
+    scan(&store, None).await.unwrap();
+    assert_eq!(count(&store).await, 2);
+    let events = store
+        .call(|c| {
+            let mut stmt = c.prepare("SELECT source_event_id FROM usage_entries ORDER BY source_event_id")?;
+            Ok(stmt.query_map([], |r| r.get::<_, String>(0))?.collect::<rusqlite::Result<Vec<_>>>()?)
+        })
+        .await
+        .unwrap();
+    assert!(events.contains(&expected_a));
+    assert!(events.contains(&"response:resp-one".to_string()));
+}
+
+#[test]
+fn older_checkpoint_without_thread_cannot_guess_legacy_identity() {
+    let mut state = Context::default();
+    parse_record("codex", &meta("openai"), &mut state).unwrap();
+    let mut checkpoint = serde_json::to_value(&state).unwrap();
+    checkpoint.as_object_mut().unwrap().remove("thread");
+    state = serde_json::from_value(checkpoint).unwrap();
+    assert!(parse_record("codex", &legacy(), &mut state).unwrap_err().to_string().starts_with("unsupported"));
+    assert!(parse_record("codex", &modern(), &mut state).unwrap().is_some());
+}
+#[test]
 fn custom_provider_is_never_upgraded_to_openai() {
     let mut state = Context::default();
     parse_record("codex", &meta("fusebox"), &mut state).unwrap();
