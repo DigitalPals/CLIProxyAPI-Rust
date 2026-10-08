@@ -440,6 +440,8 @@ fn atomic_state(path: &Path, state: &LocalState) -> Result<()> {
         file.write_all(&serde_json::to_vec(state)?)?;
         file.sync_all()?;
         fs::rename(&temporary, path)?;
+        // Windows can't open a directory as a file; its rename is already durable.
+        #[cfg(unix)]
         fs::File::open(parent)?.sync_all()?;
         Ok(())
     })();

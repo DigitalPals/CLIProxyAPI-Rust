@@ -618,7 +618,9 @@ pub fn reprice(conn: &mut Connection) -> Result<u64> {
     let catalogue: Catalogue = serde_json::from_str(&raw)?;
     let (mut cursor, mut repriced) = (0_i64, 0_u64);
     loop {
-        let tx = conn.savepoint()?;
+        // Take the write lock first: a read that later upgrades fails at once (SQLITE_BUSY_SNAPSHOT)
+        // when another connection wrote in between, where waiting for the lock just works.
+        let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
         let rows = tx.prepare("SELECT id,payload,canonical_key,source,pricing_basis FROM usage_observations WHERE id>?1 AND cost_nanos IS NULL AND pricing_basis IN ('outside_effective_period','local_override:outside_effective_period','unsupported_inference_region','local_override:unsupported_inference_region') ORDER BY id LIMIT 2000")?.query_map([cursor], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?, r.get::<_, String>(2)?, r.get::<_, String>(3)?, r.get::<_, String>(4)?)))?.collect::<rusqlite::Result<Vec<_>>>()?;
         let Some(last) = rows.last() else { break };
         cursor = last.0;

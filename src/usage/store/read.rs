@@ -15,7 +15,8 @@ use std::{
 use tokio::{sync::OwnedSemaphorePermit, task::AbortHandle};
 
 const QUEUE_TIMEOUT: Duration = Duration::from_secs(2);
-const EXECUTION_TIMEOUT: Duration = Duration::from_secs(10);
+// Unoptimised test builds on shared CI runners are many times slower than a release.
+const EXECUTION_TIMEOUT: Duration = Duration::from_secs(if cfg!(test) { 120 } else { 10 });
 const CANCELLED: u8 = 1;
 const EXPIRED: u8 = 2;
 

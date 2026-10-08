@@ -102,5 +102,6 @@ async fn only_server_startup_upgrades_the_index_while_collectors_keep_their_comp
     assert_eq!(server.call(|conn| Ok(columns(conn).len())).await.unwrap(), 7);
     server.shutdown().await.unwrap();
     drop(server);
-    std::fs::remove_dir_all(dir).unwrap();
+    // Windows keeps the file busy until the last reader thread lets go.
+    let _ = std::fs::remove_dir_all(dir);
 }

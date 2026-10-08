@@ -4,9 +4,10 @@ use std::io::Write;
 struct TestDir(PathBuf);
 impl TestDir {
     fn new() -> Self {
+        // Resolved, since symlinked state and import paths are refused (macOS's /var is one).
         let p = std::env::temp_dir().join(format!("fusebox-import-test-{}", uuid::Uuid::new_v4()));
         fs::create_dir_all(&p).unwrap();
-        Self(p)
+        Self(fs::canonicalize(&p).unwrap())
     }
     fn store(&self) -> Store {
         Store::open(&self.0.join("usage.sqlite3"), 128, 3650, None).unwrap()

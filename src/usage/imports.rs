@@ -156,7 +156,9 @@ fn validate_root(root: &Path) -> Result<PathBuf> {
     let mut part = PathBuf::new();
     for component in root.components() {
         part.push(component);
-        if fs::symlink_metadata(&part)?.file_type().is_symlink() {
+        // A drive prefix alone (`\\?\C:`) has no metadata on Windows; only names can be links.
+        if matches!(component, std::path::Component::Normal(_)) && fs::symlink_metadata(&part)?.file_type().is_symlink()
+        {
             bail!("symlink import roots are unsupported");
         }
     }
