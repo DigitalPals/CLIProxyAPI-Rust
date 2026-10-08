@@ -6,8 +6,10 @@ latest version, and keeps one GitHub issue per client that is behind: opened whe
 newer release appears, commented on as more follow, closed once Fusebox matches again.
 
 Without GITHUB_TOKEN and GITHUB_REPOSITORY (or with --dry-run) it only prints the
-comparison. Exits 1 when a release channel couldn't be read, so a broken source shows
-up as a failed run instead of silence.
+comparison. Exits 1 when a release channel couldn't be read or an issue couldn't be
+written, so a problem shows up as a failed run instead of silence. With Issues turned
+off for the repository, a client that is behind fails the run instead (with a warning
+per client), so GitHub's failed-run email still says so.
 """
 
 import json
@@ -100,9 +102,15 @@ def issue_body(client, latest_version):
     return "\n".join(lines)
 
 
+class IssuesOff(Exception):
+    pass
+
+
 class Issues:
     def __init__(self, repo, token):
         self.repo, self.token = repo, token
+        if not json.loads(self.call(f"/repos/{repo}")).get("has_issues"):
+            raise IssuesOff(repo)
         self.ensure_label()
         found = json.loads(self.call(f"/repos/{repo}/issues?labels={LABEL}&state=open&per_page=100"))
         self.open = {}
@@ -153,7 +161,14 @@ def main():
     token, repo = os.environ.get("GITHUB_TOKEN"), os.environ.get("GITHUB_REPOSITORY")
     with open(os.path.join(ROOT, ".github", "client-versions.json")) as f:
         clients = json.load(f)["clients"]
-    issues = None if dry or not (token and repo) else Issues(repo, token)
+    issues, issues_off = None, False
+    if not dry and token and repo:
+        try:
+            issues = Issues(repo, token)
+        except IssuesOff:
+            issues_off = True
+            print(f"::error::Issues are turned off for {repo}, so clients that are behind fail this run instead. "
+                  "Turn them on under Settings, General, Features to get one issue per client.")
     rows, failed = [], False
     for client in clients:
         try:
@@ -165,10 +180,17 @@ def main():
             rows.append((client["name"], client["version"], "?", f"could not check: {e}"))
             continue
         ahead = parse(newest) > parse(client["version"])
+        action = ""
         if issues:
-            action = issues.behind(client, newest) if ahead else issues.current(client)
-        else:
-            action = ""
+            try:
+                action = issues.behind(client, newest) if ahead else issues.current(client)
+            except urllib.error.HTTPError as e:
+                failed = True
+                action = f"issue update failed: HTTP {e.code} {e.reason}"
+        elif issues_off and ahead:
+            failed = True
+            print(f"::warning title={client['name']} {newest} is out::Fusebox matches {client['version']}. "
+                  f"Where: {client['where']}")
         rows.append((client["name"], client["version"], newest, ("behind" if ahead else "current") + (f", {action}" if action else "")))
     table = ["| Client | Fusebox | Latest | Status |", "|---|---|---|---|"]
     table += [f"| {a} | {b} | {c} | {d} |" for a, b, c, d in rows]

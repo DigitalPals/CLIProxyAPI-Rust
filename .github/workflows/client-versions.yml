@@ -15,7 +15,7 @@ jobs:
   check:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - name: Compare with the latest releases
         run: python3 .github/scripts/client_versions.py
         env:
