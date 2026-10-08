@@ -985,6 +985,15 @@ impl Pool {
     pub fn reload(&self, cfg: &Config) {
         self.force_prefix.store(cfg.force_model_prefix, std::sync::atomic::Ordering::Relaxed);
         let specs = collect(cfg);
+        for s in &specs {
+            // `claude/<model>` would otherwise pick any Claude account.
+            if let Some(prefix) = s.prefix.as_deref().filter(|p| Provider::parse(p).is_some()) {
+                tracing::warn!(
+                    "{}: model prefix \"{prefix}\" is a provider name, so {prefix}/<model> only reaches this account; choose another prefix",
+                    s.label
+                );
+            }
+        }
         let old: HashMap<String, Arc<Account>> =
             self.accounts.read().iter().map(|a| (a.id.clone(), a.clone())).collect();
         let mut next = Vec::with_capacity(specs.len());

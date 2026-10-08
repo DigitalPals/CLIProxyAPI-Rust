@@ -17,7 +17,7 @@ use axum::routing::{delete, get, post};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
-use crate::accounts::{Credential, Provider, set_file_disabled, write_oauth_file};
+use crate::accounts::{Credential, Only, Provider, set_file_disabled, write_oauth_file};
 use crate::config::{Config, ModelAlias};
 use crate::oauth;
 use crate::state::App;
@@ -531,8 +531,13 @@ async fn routes(State(app): State<Arc<App>>) -> Json<Value> {
     }))
 }
 
+/// Public models; `prefix` marks ids that only reach the accounts carrying that prefix.
 async fn models(State(app): State<Arc<App>>) -> Json<Value> {
-    Json(Value::Array(app.pool.models().into_iter().map(|(m, p)| json!({ "id": m, "provider": p })).collect()))
+    let models = app.pool.models().into_iter().map(|(m, p)| match app.pool.route(&m).0 {
+        Some(Only::Prefix(prefix)) => json!({ "id": m, "provider": p, "prefix": prefix }),
+        _ => json!({ "id": m, "provider": p }),
+    });
+    Json(Value::Array(models.collect()))
 }
 
 #[derive(Deserialize)]

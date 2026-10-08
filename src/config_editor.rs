@@ -9,6 +9,7 @@ use serde_yaml::{Mapping, Value as Yaml};
 use sha2::{Digest, Sha256};
 use yaml_edit::{Document, Mapping as EditMapping, YamlFile, YamlNode};
 
+use crate::accounts::Provider;
 use crate::config::Config;
 
 const PROVIDERS: &[(&str, &str)] = &[
@@ -516,6 +517,12 @@ fn validate(values: &Value, changes: &Map<String, Value>) -> Result<()> {
                     "Provider API key cannot be empty"
                 );
             }
+            if let Some(prefix) = entry["prefix"].as_str().filter(|p| !p.trim().is_empty()) {
+                ensure!(
+                    Provider::parse(prefix).is_none(),
+                    "Model prefix \"{prefix}\" is a provider name; {prefix}/<model> already picks that provider, so choose another prefix"
+                );
+            }
             if let Some(url) = entry["base-url"].as_str() {
                 check_url(url, false, "Provider base URL")?;
             }
@@ -955,6 +962,19 @@ mod tests {
         assert_eq!(cfg.gemini_api_key[1].api_key, "replacement");
         assert!(out.contains("# Legacy Gemini keys"));
         assert!(yaml(&out).unwrap()["generative-language-api-key"].is_null());
+    }
+
+    #[test]
+    fn prefixes_that_name_a_provider_are_rejected() {
+        let source = "claude-api-key:\n  - api-key: upstream\n";
+        let mut keys = values(source).unwrap()["claude-api-key"].clone();
+        for prefix in ["claude", "Codex", "anthropic"] {
+            keys[0]["prefix"] = json!(prefix);
+            let err = apply(source, json!({"claude-api-key": keys}).as_object().unwrap()).unwrap_err();
+            assert!(err.to_string().contains("is a provider name"), "{err}");
+        }
+        keys[0]["prefix"] = json!("team");
+        assert_eq!(edit(source, json!({"claude-api-key": keys})).1.claude_api_key[0].prefix.as_deref(), Some("team"));
     }
 
     #[test]

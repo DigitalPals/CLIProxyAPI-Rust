@@ -2108,6 +2108,9 @@ const FAMILIES = [
 ];
 
 const routeSteps = (id) => (S.routes?.models || {})[id] || [];
+// `team/model` reaches only the accounts with the team/ prefix; the model is `model`.
+const modelPrefix = (id) => S.models.find((m) => m.id === id)?.prefix;
+const unprefixed = (id) => { const p = modelPrefix(id); return p ? id.slice(p.length + 1) : id; };
 
 function modelFamilies() {
   const fams = new Map();
@@ -2150,8 +2153,10 @@ function famRoute(f) {
       if (!seen.has(s.account)) { seen.add(s.account); rows.push({ ...s, next: false }); }
     }
   }
-  for (const r of rows) r.serves = f.ids.filter((id) => routeSteps(id).some((s) => s.account === r.account)).length;
-  return { rep, rows: rows.filter((r) => accountById(r.account)) };
+  // Coverage counts models, so an account's prefixed copies don't make the others look partial.
+  const models = new Set(f.ids.map(unprefixed));
+  for (const r of rows) r.serves = new Set(f.ids.filter((id) => routeSteps(id).some((s) => s.account === r.account)).map(unprefixed)).size;
+  return { rep, models: models.size, rows: rows.filter((r) => accountById(r.account)) };
 }
 
 function failuresByModel() {
@@ -2217,9 +2222,12 @@ function modelsBodyHTML() {
     // A failed request doesn't take an account out of rotation; an expired sign-in does.
     const usable = route.rows.some((r) => r.state === 'ready' && !acctState(accountById(r.account)).signin);
     const chips = f.ids.map((id) => {
-      const target = routeSteps(id).map((s) => s.upstream).find((u) => u && u.toLowerCase() !== id.toLowerCase() && !(f.key === 'kimi' && !f.compat));
+      const prefix = modelPrefix(id);
+      const base = unprefixed(id);
+      const target = routeSteps(id).map((s) => s.upstream).find((u) => u && u.toLowerCase() !== base.toLowerCase() && !(f.key === 'kimi' && !f.compat));
+      const only = prefix ? routeSteps(id).map((s) => accountById(s.account)).filter(Boolean) : [];
       const bad = (fails[id] || []).length >= 3;
-      return { id, target, bad, match: !q || `${id} ${target || ''}`.toLowerCase().includes(q) };
+      return { id, prefix, base, only, target, bad, match: !q || `${id} ${target || ''}`.toLowerCase().includes(q) };
     }).filter((c) => c.match);
     let note = null;
     const worst = Object.entries(fails).filter(([m, l]) => f.ids.includes(m) && l.length >= 3).sort((x, y) => y[1].length - x[1].length)[0];
@@ -2240,11 +2248,17 @@ function modelsBodyHTML() {
     const empty = q ? `No model matches “${esc(S.modelFilter)}”.` : 'No models yet. Connect an account to see what it serves.';
     return mob() ? `<p class="empty-line">${empty}</p>` : `<div class="card rivets table"><div class="empty" style="border-top:0">${empty}</div></div>`;
   }
-  const chipHTML = (f, c) => `<button class="idchip${c.target ? ' alias' : ''}${c.bad ? ' bad' : ''}${f.off ? ' off' : ''}${q ? ' hit' : ''}" type="button" data-act="copy-model" data-id="${esc(c.id)}" title="${esc(c.target ? `${c.id} is an alias for ${c.target}` : c.bad ? `${c.id} is failing` : `Copy ${c.id}`)}">${esc(c.id)}${c.target ? `<span class="to">→ ${esc(c.target)}</span>` : ''}${c.bad ? '<span class="dot s6 err"></span>' : ''}</button>`;
+  const onlyText = (c) => (c.only.length === 1 ? acctLabel(c.only[0]) : plural(c.only.length, 'account'));
+  const chipTitle = (c) => [
+    c.prefix ? `${c.id} only goes to ${c.only.length ? c.only.map(acctLabel).join(', ') : `accounts with the ${c.prefix}/ prefix`}` : '',
+    c.target ? `${c.prefix ? c.base : c.id} is an alias for ${c.target}` : '',
+    c.bad ? `${c.id} is failing` : '',
+  ].filter(Boolean).join('. ') || `Copy ${c.id}`;
+  const chipHTML = (f, c) => `<button class="idchip${c.target ? ' alias' : ''}${c.bad ? ' bad' : ''}${f.off ? ' off' : ''}${q ? ' hit' : ''}" type="button" data-act="copy-model" data-id="${esc(c.id)}" title="${esc(chipTitle(c))}">${c.prefix ? `<span><span class="pfx">${esc(c.prefix)}/</span>${esc(c.base)}</span>` : esc(c.id)}${c.target ? `<span class="to">→ ${esc(c.target)}</span>` : ''}${c.prefix && c.only.length ? `<span class="to">only ${esc(onlyText(c))}</span>` : ''}${c.bad ? '<span class="dot s6 err"></span>' : ''}</button>`;
   const stepHTML = (f, r, i, short) => {
     const a = accountById(r.account);
     const t = routeStepText(r, a);
-    const sub = `${provName(a)}${planName(a) ? ` ${planName(a)}` : ''}${r.serves < f.ids.length ? ` · ${r.serves} of ${f.ids.length} ids` : ''}`;
+    const sub = `${provName(a)}${planName(a) ? ` ${planName(a)}` : ''}${r.serves < f.route.models ? ` · ${r.serves} of ${f.route.models} models` : ''}`;
     return `<button class="rstep" type="button" data-act="open-acc" data-id="${esc(a.id)}"><span class="idx">${i + 1}</span><span class="dot s7 ${acctState(a).dot}"></span>${acctLogo(a, 15)}
       <span class="nm"><span${a.disabled ? ' class="off"' : ''}>${esc(acctLabel(a))}</span>${short ? '' : `<span>${esc(sub)}</span>`}</span>
       <span class="txt ${t.cls}">${r.next ? '<span class="next-tag">Next</span>' : ''}${esc(short ? t.short : t.txt)}</span></button>`;

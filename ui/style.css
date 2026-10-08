@@ -191,6 +191,7 @@ h1, h2, h3, p { margin: 0; }
 }
 .idchip:hover { border-color: var(--fg-3); color: var(--fg); }
 .idchip .to { color: var(--fg-3); }
+.idchip .pfx { color: var(--fg-3); }
 .idchip.alias { border-style: dashed; border-color: var(--line-hover); }
 .idchip.bad { color: var(--err); border-color: var(--err-line); }
 .idchip.off { color: var(--fg-3); text-decoration: line-through; }
