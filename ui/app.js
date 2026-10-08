@@ -759,11 +759,11 @@ function windowHTML(a, short, size) {
     ${segsHTML(w, `${title} window`, size === 'xl' ? 'xl' : 'lg')}<span class="note">${note}</span></div>`;
 }
 
-function quotaControlsHTML(short = false, label = true, kbd = true) {
+function quotaControlsHTML(short = false, label = true) {
   return `<div class="quota-ctl">${label ? '<span class="meta" style="font-size:12px">Quota</span>' : ''}
     <div class="seg" role="group" aria-label="Quota display" title="Display preference saved in this browser">
       ${['used', 'remaining'].map((mode) => `<button type="button" data-act="quota-display" data-id="${mode}" aria-pressed="${S.quotaDisplay === mode}">${mode === 'used' ? 'Used' : short ? 'Left' : 'Remaining'}</button>`).join('')}
-    </div>${kbd ? '<kbd class="kbd" title="Press U to switch">U</kbd>' : ''}</div>`;
+    </div></div>`;
 }
 
 function setQuotaDisplay(mode, persist = true) {
@@ -918,7 +918,7 @@ function ovSubsHTML() {
         <div class="metaline indent">${st.cls === 'cooling' ? `<span class="fg2">${esc(modelScope(st.model))} · back ${esc(when(st.until))}</span>` : ''}${bankedLineHTML(a)}<span>${fmt(a.counters.requests)} requests · <span data-now="${esc(a.id)}" data-inline>${nowHTML(a, true)}</span></span></div>
       </div>`;
     }).join('');
-    return `<div class="sec-head"><div class="stack"><h2 class="h-sec">Subscriptions</h2><span class="meta" data-subs-meta="short">${esc(subsMeta(true))}</span></div>${quotaControlsHTML(true, false, false)}</div>
+    return `<div class="sec-head"><div class="stack"><h2 class="h-sec">Subscriptions</h2><span class="meta" data-subs-meta="short">${esc(subsMeta(true))}</span></div>${quotaControlsHTML(true, false)}</div>
       <div class="card stack-list">${items}</div>`;
   }
   const rows = subs.map((a, i) => {
@@ -1452,7 +1452,7 @@ function acctFiltersHTML() {
   if (!list.length) return '';
   const groups = acctGroups();
   const chips = ACCT_FILTERS.map(([id, label, short]) => `<button class="chip" type="button" data-act="acct-filter" data-id="${id}" aria-pressed="${S.acctFilter === id}">${mob() ? short : label} <span class="n">${list.filter(groups[id]).length}</span></button>`).join('');
-  if (mob()) return `<div class="m-filters" role="group" aria-label="Show">${chips}</div><div class="m-row" style="margin-top:14px">${quotaControlsHTML(true, true, false)}</div>`;
+  if (mob()) return `<div class="m-filters" role="group" aria-label="Show">${chips}</div><div class="m-row" style="margin-top:14px">${quotaControlsHTML(true, true)}</div>`;
   return `<div class="acct-filters"><div class="chips" role="group" aria-label="Show">${chips}</div><span class="grow"></span>${quotaControlsHTML()}</div>`;
 }
 
@@ -1550,7 +1550,7 @@ function detailBodyHTML() {
          <div class="det-actions"><span class="status-pill">${statusHTML(a)}</span>${a.kind === 'oauth' ? `<button class="btn" type="button" data-act="refresh" data-id="${esc(a.id)}">Refresh</button>` : ''}${toggle}${remove}</div></div>
        ${a.last_error ? `<div class="banner err"><span class="dot err"></span><span class="errtext">${esc(hideEmails(a.last_error))}</span><span class="meta" style="font-size:12px">${liveAgo(a.last_used)}</span></div>` : ''}`;
   const limits = metered(a) ? `<section class="card pad block" style="gap:20px" aria-label="Limits">
-      <div class="card-head"><span class="label">Limits · ${quotaWord()}</span>${quotaControlsHTML(mob(), false, false)}</div>
+      <div class="card-head"><span class="label">Limits · ${quotaWord()}</span>${quotaControlsHTML(mob(), false)}</div>
       <div class="windows">${windowHTML(a, true, 'xl')}${windowHTML(a, false, 'xl')}</div>
       ${detBankedHTML(a)}</section>` : '';
   const cds = Object.entries(a.cooldowns || {}).sort((x, y) => Date.parse(x[1]) - Date.parse(y[1]));
