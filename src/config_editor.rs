@@ -104,6 +104,7 @@ pub fn values(text: &str) -> Result<Value> {
     obj.insert("force-model-prefix".into(), json!(cfg.force_model_prefix));
     obj.insert("oauth-model-alias".into(), json!(cfg.oauth_model_alias));
     obj.insert("oauth-excluded-models".into(), json!(cfg.oauth_excluded_models));
+    obj.insert("extra-models".into(), json!(cfg.extra_models));
     for (field, group) in PROVIDERS {
         let sources = provider_sources(&doc, field, group);
         for (entry, source) in obj.get_mut(*field).and_then(Value::as_array_mut).into_iter().flatten().zip(sources) {
@@ -544,6 +545,17 @@ fn validate(values: &Value, changes: &Map<String, Value>) -> Result<()> {
             }
         }
     }
+    if changes.contains_key("extra-models") {
+        for (provider, models) in &cfg.extra_models {
+            ensure!(
+                Provider::parse(provider).is_some_and(|p| p != Provider::Compat),
+                "Added models: {provider} is not a provider (compatible providers list their models themselves)"
+            );
+            for model in models {
+                ensure!(crate::discovery::valid_model_id(model), "Added models: \"{model}\" is not a model id");
+            }
+        }
+    }
     if changes.contains_key("oauth-model-alias") {
         for aliases in cfg.oauth_model_alias.values() {
             for alias in aliases {
@@ -962,6 +974,22 @@ mod tests {
         assert_eq!(cfg.gemini_api_key[1].api_key, "replacement");
         assert!(out.contains("# Legacy Gemini keys"));
         assert!(yaml(&out).unwrap()["generative-language-api-key"].is_null());
+    }
+
+    #[test]
+    fn added_models_are_written_validated_and_removed_with_their_section() {
+        let source = "# Keep me\nport: 8317\n";
+        let (out, cfg) = edit(source, json!({"extra-models": {"claude": ["claude-opus-6"]}}));
+        assert_eq!(cfg.extra_models["claude"], ["claude-opus-6"]);
+        assert!(out.contains("# Keep me"));
+        let (out, cfg) = edit(&out, json!({"extra-models": {}}));
+        assert!(cfg.extra_models.is_empty());
+        assert!(out.contains("# Keep me"));
+        for bad in
+            [json!({"nope": ["x"]}), json!({"openai-compatibility": ["x"]}), json!({"claude": ["team/claude-x"]})]
+        {
+            assert!(apply(source, json!({"extra-models": bad}).as_object().unwrap()).is_err());
+        }
     }
 
     #[test]

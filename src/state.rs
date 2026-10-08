@@ -30,6 +30,8 @@ pub struct App {
     pub logins: Mutex<HashMap<String, crate::mgmt::Login>>,
     pub reset_quotes: Mutex<HashMap<String, crate::banked_resets::Quote>>,
     pub push: crate::push::Push,
+    /// Model lists fetched from Claude and Codex, and removed dashboard additions.
+    pub models: crate::discovery::Store,
     #[cfg(test)]
     pub reset_test_origin: Mutex<Option<String>>,
     pub started: DateTime<Utc>,
@@ -45,6 +47,8 @@ impl App {
         let (live, _) = broadcast::channel(512);
         let sessions = Arc::new(crate::affinity::Sessions::load(&cfg.auth_dir(), cfg.session_affinity_idle_seconds));
         let push = crate::push::Push::load(&cfg.auth_dir());
+        let models = crate::discovery::Store::load(&cfg.auth_dir());
+        models.apply(&pool);
         // Tests opt in with an explicit isolated database; never touch a user's default DB.
         let usage_enabled = cfg.usage.enabled && (!cfg!(test) || cfg.usage.database.is_some());
         let (usage, usage_error) = if usage_enabled {
@@ -83,6 +87,7 @@ impl App {
             logins: Mutex::new(HashMap::new()),
             reset_quotes: Mutex::new(HashMap::new()),
             push,
+            models,
             #[cfg(test)]
             reset_test_origin: Mutex::new(None),
             started: Utc::now(),
@@ -98,6 +103,7 @@ impl App {
     pub fn set_config(&self, cfg: Config) {
         self.http.set_default_proxy(&cfg.proxy_url);
         self.pool.reload(&cfg);
+        self.models.apply(&self.pool);
         self.retain_account_pools();
         self.cfg.store(Arc::new(cfg));
         self.broadcast("accounts", serde_json::Value::Null);
@@ -105,6 +111,7 @@ impl App {
 
     pub fn reload_accounts(&self) {
         self.pool.reload(&self.cfg());
+        self.models.apply(&self.pool);
         self.retain_account_pools();
         self.broadcast("accounts", serde_json::Value::Null);
     }

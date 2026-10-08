@@ -1,0 +1,51 @@
+{
+  "_doc": "The client releases Fusebox speaks as. The daily client-versions workflow compares them with each client's latest release and keeps one issue open per client that is behind. A Rust test (clients.rs) checks that the constants named in `where` say the same version, so bump both together.",
+  "clients": [
+    {
+      "id": "claude-code",
+      "name": "Claude Code",
+      "version": "2.1.293",
+      "source": { "kind": "npm", "package": "@anthropic-ai/claude-code" },
+      "where": "src/upstream.rs: CC_VERSION, CC_USER_AGENT; check the anthropic-beta list, x-stainless-* headers, cloak_body and the billing header",
+      "notes": "https://github.com/anthropics/claude-code/blob/main/CHANGELOG.md"
+    },
+    {
+      "id": "codex",
+      "name": "Codex CLI",
+      "version": "0.161.0",
+      "source": { "kind": "github-release", "repo": "openai/codex", "strip": "rust-v" },
+      "where": "src/upstream.rs: CODEX_VERSION, CODEX_USER_AGENT, CODEX_WS_BETA, CODEX_FIELD_ORDER, codex_headers; src/ws.rs for websocket messages",
+      "notes": "https://github.com/openai/codex/releases",
+      "compare": "https://github.com/openai/codex/compare/rust-v{from}...rust-v{to}"
+    },
+    {
+      "id": "grok-build",
+      "name": "Grok Build",
+      "version": "1.0.44",
+      "source": { "kind": "text", "url": "https://x.ai/cli/stable" },
+      "where": "src/device.rs: xai::CLIENT_VERSION",
+      "notes": "https://x.ai/cli"
+    },
+    {
+      "id": "muse-code",
+      "name": "Muse Code",
+      "version": "1.3.0",
+      "source": { "kind": "json", "url": "https://api.meta.ai/muse-code/channels/muse-stable", "path": "version", "cut": "-R" },
+      "where": "src/device.rs: meta::API_UA (the build hash in it has no public source)"
+    },
+    {
+      "id": "devin-cli",
+      "name": "Devin CLI",
+      "version": "3000.10.21",
+      "source": { "kind": "json", "url": "https://static.devin.ai/cli/current/manifest.json", "path": "version" },
+      "where": "src/devin.rs: CLIENT_VERSION"
+    },
+    {
+      "id": "antigravity",
+      "name": "Antigravity",
+      "version": "2.21.1",
+      "source": { "kind": "yaml-line", "url": "https://antigravity-hub-auto-updater-974169037036.us-central1.run.app/manifest/latest-arm64-mac.yml", "key": "version" },
+      "where": "src/antigravity.rs: FALLBACK_VERSION (Fusebox reads the current version from this manifest at runtime; the constant is only its fallback)"
+    }
+  ]
+}

@@ -28,7 +28,7 @@ pub const SCOPES: &str = "https://www.googleapis.com/auth/cloud-platform https:/
 pub const BASE_DAILY: &str = "https://daily-cloudcode-pa.googleapis.com";
 pub const BASE_PROD: &str = "https://cloudcode-pa.googleapis.com";
 
-const FALLBACK_VERSION: &str = "2.9.1";
+pub(crate) const FALLBACK_VERSION: &str = "2.21.1";
 const MANIFEST_URL: &str =
     "https://antigravity-hub-auto-updater-974169037036.us-central1.run.app/manifest/latest-arm64-mac.yml";
 const NODE_CLIENT: &str = "google-api-nodejs-client/10.3.0";

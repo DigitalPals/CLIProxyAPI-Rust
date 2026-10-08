@@ -14,12 +14,14 @@ pub const CODEX_BACKEND: &str = "https://chatgpt.com/backend-api/codex";
 pub const OPENAI_API: &str = "https://api.openai.com/v1";
 pub const GEMINI_API: &str = "https://generativelanguage.googleapis.com";
 
-pub const CC_VERSION: &str = "2.1.280";
-pub const CC_USER_AGENT: &str = "claude-cli/2.1.280 (external, cli)";
+pub const CC_VERSION: &str = "2.1.293";
+pub const CC_USER_AGENT: &str = "claude-cli/2.1.293 (external, cli)";
 const CC_IDENTITY: &str = "You are Claude Code, Anthropic's official CLI for Claude.";
 const CC_FINGERPRINT_SALT: &str = "59cf53e54c78";
-pub const CODEX_USER_AGENT: &str = "codex-tui/0.154.0 (Mac OS 26.5.2; arm64) iTerm.app/3.6.11 (codex-tui; 0.154.0)";
+pub const CODEX_USER_AGENT: &str = "codex-tui/0.161.0 (Mac OS 26.5.2; arm64) iTerm.app/3.6.11 (codex-tui; 0.161.0)";
 pub const CODEX_ORIGINATOR: &str = "codex-tui";
+/// The Codex release `CODEX_USER_AGENT` claims; its model list depends on it.
+pub const CODEX_VERSION: &str = "0.161.0";
 pub const CODEX_WS_BETA: &str = "responses_websockets=2026-02-06";
 
 pub struct Prepared {
@@ -177,7 +179,7 @@ fn claude(t: &Target, mut body: Value) -> Prepared {
                 ("x-app", "cli"),
                 ("user-agent", CC_USER_AGENT),
                 ("x-stainless-lang", "js"),
-                ("x-stainless-package-version", "0.112.1"),
+                ("x-stainless-package-version", "0.128.0"),
                 ("x-stainless-os", "MacOS"),
                 ("x-stainless-arch", "arm64"),
                 ("x-stainless-runtime", "node"),
@@ -403,7 +405,7 @@ fn has_claude_cache_control(body: &Value) -> bool {
 
 // ----------------------------------------------------------------------- codex
 
-/// Fields the ChatGPT Codex backend rejects.
+/// Fields the ChatGPT Codex backend rejects (`generate` is fine on websockets).
 const CODEX_STRIP: &[&str] = &[
     "max_output_tokens",
     "max_completion_tokens",
@@ -418,14 +420,16 @@ const CODEX_STRIP: &[&str] = &[
     "background",
 ];
 
-pub fn sanitize_codex_body(body: &mut Value, model: &str, keep_previous: bool) {
+/// `websocket`: the request is a native websocket turn, which keeps `previous_response_id`
+/// and `generate` (Codex warms a connection up with `generate: false`).
+pub fn sanitize_codex_body(body: &mut Value, model: &str, websocket: bool) {
     body["model"] = model.into();
     body["store"] = false.into();
     if body["instructions"].is_null() {
         body["instructions"] = "".into();
     }
     if let Some(o) = body.as_object_mut() {
-        for k in CODEX_STRIP {
+        for k in CODEX_STRIP.iter().filter(|k| !(websocket && **k == "generate")) {
             o.remove(*k);
         }
         // The ChatGPT backend only takes a list ("Input must be a list").
@@ -435,7 +439,7 @@ pub fn sanitize_codex_body(body: &mut Value, model: &str, keep_previous: bool) {
                 json!([{ "type": "message", "role": "user", "content": [{ "type": "input_text", "text": text }] }]),
             );
         }
-        if !keep_previous {
+        if !websocket {
             o.remove("previous_response_id");
         }
         if let Some(Value::Array(items)) = o.get_mut("input") {
@@ -453,6 +457,41 @@ pub fn sanitize_codex_body(body: &mut Value, model: &str, keep_previous: bool) {
             }
         }
     }
+}
+
+/// Codex 0.161 sends routing fields first; other keys keep their order after these.
+const CODEX_FIELD_ORDER: &[&str] = &[
+    "type",
+    "model",
+    "stream",
+    "service_tier",
+    "instructions",
+    "previous_response_id",
+    "input",
+    "tools",
+    "tool_choice",
+    "parallel_tool_calls",
+    "reasoning",
+    "store",
+    "stream_options",
+    "include",
+    "prompt_cache_key",
+    "text",
+    "generate",
+    "client_metadata",
+    "access_programs",
+];
+
+/// Puts a Codex request body's fields in the order Codex itself writes them.
+pub fn order_codex_body(body: &mut Value) {
+    let Some(o) = body.as_object_mut() else { return };
+    let mut rest = std::mem::take(o);
+    for k in CODEX_FIELD_ORDER {
+        if let Some(v) = rest.remove(*k) {
+            o.insert((*k).to_string(), v);
+        }
+    }
+    o.extend(rest);
 }
 
 pub fn codex_headers(client: &HeaderMap, token: &str, account_id: Option<&str>, oauth: bool) -> Vec<(String, String)> {
@@ -473,7 +512,20 @@ pub fn codex_headers(client: &HeaderMap, token: &str, account_id: Option<&str>, 
             h.push((name.into(), v));
         }
     }
-    if oauth {
+    if oauth && crate::clients::is_codex(client) {
+        // A real Codex client keeps its own identity, as Claude Code does.
+        for name in ["user-agent", "originator"] {
+            if let Some(v) = header(client, name) {
+                h.push((name.into(), v));
+            }
+        }
+        if let Some(a) = account_id {
+            h.push(("chatgpt-account-id".into(), a.into()));
+        }
+    } else if oauth {
+        if !h.iter().any(|(k, _)| k == "version") {
+            h.push(("version".into(), CODEX_VERSION.into()));
+        }
         h.push(("user-agent".into(), CODEX_USER_AGENT.into()));
         h.push(("originator".into(), CODEX_ORIGINATOR.into()));
         if let Some(a) = account_id {
@@ -503,6 +555,9 @@ fn codex(t: &Target, mut body: Value) -> Prepared {
         && let Some(key) = t.cache_key
     {
         body["prompt_cache_key"] = key.into();
+    }
+    if oauth {
+        order_codex_body(&mut body);
     }
     let mut headers = codex_headers(t.client_headers, &token, account_id.as_deref(), oauth);
     if let Some(key) = body["prompt_cache_key"].as_str().filter(|_| oauth)
@@ -931,6 +986,52 @@ mod tests {
         cloak_body(&mut body, &acct, None, false);
         assert_eq!(body["system"][2]["text"], "<system-reminder>\ninstructions\n</system-reminder>");
         assert_eq!(body["system"][2]["cache_control"], json!({"type":"ephemeral","ttl":"1h"}));
+    }
+
+    #[test]
+    fn codex_bodies_follow_codex_field_order_and_keep_websocket_fields() {
+        let mut body = json!({"input": [], "instructions": "", "prompt_cache_key": "k", "x-extra": 1, "stream": true,
+            "model": "m", "type": "response.create", "store": false, "generate": false, "previous_response_id": "r"});
+        sanitize_codex_body(&mut body, "gpt-6.1-sol", true);
+        order_codex_body(&mut body);
+        let keys: Vec<&String> = body.as_object().unwrap().keys().collect();
+        assert_eq!(
+            keys,
+            [
+                "type",
+                "model",
+                "stream",
+                "instructions",
+                "previous_response_id",
+                "input",
+                "store",
+                "prompt_cache_key",
+                "generate",
+                "x-extra"
+            ]
+        );
+        let mut http = json!({"generate": false, "previous_response_id": "r", "input": []});
+        sanitize_codex_body(&mut http, "gpt-6.1-sol", false);
+        assert!(http.get("generate").is_none() && http.get("previous_response_id").is_none());
+    }
+
+    #[test]
+    fn codex_identity_is_the_clients_own_or_the_built_in_release() {
+        let get = |h: &[(String, String)], k: &str| h.iter().find(|(n, _)| n == k).map(|(_, v)| v.clone());
+        let mut real = HeaderMap::new();
+        real.insert("user-agent", "codex-tui/0.170.0 (Linux 6.12; x86_64) xterm (codex-tui; 0.170.0)".parse().unwrap());
+        real.insert("originator", "codex-tui".parse().unwrap());
+        real.insert("version", "0.170.0".parse().unwrap());
+        let h = codex_headers(&real, "t", Some("acct"), true);
+        assert_eq!(get(&h, "user-agent").unwrap(), "codex-tui/0.170.0 (Linux 6.12; x86_64) xterm (codex-tui; 0.170.0)");
+        assert_eq!(get(&h, "version").unwrap(), "0.170.0");
+        assert_eq!(get(&h, "chatgpt-account-id").unwrap(), "acct");
+        let other = HeaderMap::new();
+        let h = codex_headers(&other, "t", None, true);
+        assert_eq!(get(&h, "user-agent").unwrap(), CODEX_USER_AGENT);
+        assert_eq!(get(&h, "version").unwrap(), CODEX_VERSION);
+        assert_eq!(get(&h, "originator").unwrap(), CODEX_ORIGINATOR);
+        assert_eq!(h.iter().filter(|(k, _)| k == "user-agent").count(), 1);
     }
 
     #[test]

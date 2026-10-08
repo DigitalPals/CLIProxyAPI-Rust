@@ -126,6 +126,8 @@ struct Session {
     source: Option<&'static str>,
     pending_selection: Option<crate::affinity::Selected>,
     connection_id: String,
+    /// `response.interrupt` messages the client sent during a native turn, for upstream.
+    interrupts: Option<tokio::sync::mpsc::UnboundedReceiver<String>>,
 }
 
 impl Default for Session {
@@ -138,6 +140,7 @@ impl Default for Session {
             source: None,
             pending_selection: None,
             connection_id: uuid::Uuid::new_v4().to_string(),
+            interrupts: None,
         }
     }
 }
@@ -269,8 +272,13 @@ fn input_items(body: &Value) -> Vec<Value> {
 }
 
 pub async fn handle(app: Arc<App>, headers: HeaderMap, socket: WebSocket) {
+    if crate::clients::observe(&headers) {
+        app.models.save_clients();
+    }
     let (mut tx, mut rx) = socket.split();
     let mut sess = Session::default();
+    let (interrupt, interrupts) = tokio::sync::mpsc::unbounded_channel();
+    sess.interrupts = Some(interrupts);
     let mut pending = VecDeque::new();
     let mut pending_bytes = 0usize;
     'connection: loop {
@@ -309,6 +317,11 @@ pub async fn handle(app: Arc<App>, headers: HeaderMap, socket: WebSocket) {
             }
             continue;
         };
+        // Codex stops a response early with `response.interrupt`; once it has ended there
+        // is nothing to stop.
+        if body["type"] == "response.interrupt" {
+            continue;
+        }
         if body["type"] != "response.create" {
             let msg = format!("unsupported message type `{}`", body["type"].as_str().unwrap_or_default());
             if send(&mut tx, error_event(400, &json!({ "error": { "message": msg, "type": "invalid_request_error" } })))
@@ -334,6 +347,10 @@ pub async fn handle(app: Arc<App>, headers: HeaderMap, socket: WebSocket) {
             tokio::select! {
                 message = rx.next() => match message {
                     Some(Ok(message @ (Message::Text(_) | Message::Binary(_)))) => {
+                        if let Some(text) = interrupt_text(&message) {
+                            let _ = interrupt.send(text);
+                            continue;
+                        }
                         if pending.len() >= MAX_PENDING_TURNS || message_bytes(&message) > MAX_PENDING_BYTES - pending_bytes {
                             downstream.set("downstream_queue_limit");
                             tracing::warn!("websocket pending turn limit exceeded; closing connection");
@@ -362,6 +379,25 @@ pub async fn handle(app: Arc<App>, headers: HeaderMap, socket: WebSocket) {
     // There is no next turn to reuse this socket; dropping it never waits for a
     // provider that may have stopped reading its close handshake.
     sess.discard_upstream();
+}
+
+/// A `response.interrupt` for the running turn, which goes upstream instead of queueing.
+fn interrupt_text(message: &Message) -> Option<String> {
+    let text = match message {
+        Message::Text(t) => t.to_string(),
+        Message::Binary(b) => String::from_utf8_lossy(b).into_owned(),
+        _ => return None,
+    };
+    let is_interrupt = text.contains("response.interrupt")
+        && serde_json::from_str::<Value>(&text).is_ok_and(|v| v["type"] == "response.interrupt");
+    is_interrupt.then_some(text)
+}
+
+async fn next_interrupt(rx: &mut Option<tokio::sync::mpsc::UnboundedReceiver<String>>) -> Option<String> {
+    match rx {
+        Some(rx) => rx.recv().await,
+        None => std::future::pending().await,
+    }
 }
 
 async fn turn(
@@ -590,6 +626,7 @@ async fn native_turn(
         payload["reasoning"]["effort"] = e.into();
     }
     payload["type"] = "response.create".into();
+    crate::upstream::order_codex_body(&mut payload);
 
     let quota_epoch = acct.quota_epoch();
     sess.upstream_quota_epoch = quota_epoch;
@@ -618,8 +655,19 @@ async fn native_turn(
     let mut error: Option<(u16, String)> = None;
     let mut forwarded = false;
     let mut terminal = false;
+    // An interrupt meant for an earlier response must not stop this one.
+    while let Some(Ok(_)) = sess.interrupts.as_mut().map(|rx| rx.try_recv()) {}
     loop {
-        let next = tokio::time::timeout(Duration::from_secs(600), up.next()).await;
+        let next = tokio::select! {
+            next = tokio::time::timeout(Duration::from_secs(600), up.next()) => next,
+            Some(text) = next_interrupt(&mut sess.interrupts) => {
+                // The response still ends with response.completed, read as usual.
+                if let Err(failure) = upstream_write("interrupt", up.send(tungstenite::Message::Text(text.into()))).await {
+                    failure.log(&sess.connection_id, "interrupt");
+                }
+                continue;
+            }
+        };
         let text = match next {
             Ok(Some(Ok(tungstenite::Message::Text(t)))) => t.to_string(),
             Ok(Some(Ok(tungstenite::Message::Binary(b)))) => String::from_utf8_lossy(&b).into_owned(),

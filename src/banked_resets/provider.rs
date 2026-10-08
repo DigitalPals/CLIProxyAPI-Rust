@@ -268,11 +268,13 @@ impl HttpProvider {
             .header("accept", "application/json")
             .timeout(Duration::from_secs(25));
         if self.provider == Provider::Claude {
-            rb = rb.header("anthropic-beta", "oauth-2025-04-20").header("user-agent", crate::upstream::CC_USER_AGENT);
+            rb = rb
+                .header("anthropic-beta", "oauth-2025-04-20")
+                .header("user-agent", crate::clients::claude_user_agent());
         } else {
             rb = rb
                 .header("chatgpt-account-id", &self.account_id)
-                .header("user-agent", crate::upstream::CODEX_USER_AGENT)
+                .header("user-agent", crate::clients::codex_user_agent())
                 .header("originator", crate::upstream::CODEX_ORIGINATOR)
                 .header("openai-beta", "codex-1");
         }

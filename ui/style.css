@@ -192,6 +192,13 @@ h1, h2, h3, p { margin: 0; }
 .idchip:hover { border-color: var(--fg-3); color: var(--fg); }
 .idchip .to { color: var(--fg-3); }
 .idchip .pfx { color: var(--fg-3); }
+.idchip .tag { color: var(--brand); font-size: 11px; }
+.idchip.add { border-style: dashed; color: var(--fg-3); }
+.idchip.add:hover { color: var(--fg); }
+.idchip-pair { display: inline-flex; }
+.idchip-pair > .idchip { border-top-right-radius: 0; border-bottom-right-radius: 0; }
+.idchip-x { padding: 0 7px; background: transparent; color: var(--fg-3); font: 400 12px/1.5 var(--mono); border: 1px solid var(--line-strong); border-left: 0; border-radius: 0 4px 4px 0; }
+.idchip-x:hover { color: var(--err); border-color: var(--fg-3); }
 .idchip.alias { border-style: dashed; border-color: var(--line-hover); }
 .idchip.bad { color: var(--err); border-color: var(--err-line); }
 .idchip.off { color: var(--fg-3); text-decoration: line-through; }
@@ -807,6 +814,8 @@ h1, h2, h3, p { margin: 0; }
 .fam-note.err { color: var(--err); }
 .fam-note.warn { color: var(--warn); }
 .fam-note .btn { color: var(--fg); }
+.models-note { padding: 10px 14px; }
+.models-add .actions { align-items: center; }
 .route-col { display: flex; flex-direction: column; min-width: 0; max-width: 520px; }
 .route-col > .capsm { margin-bottom: 4px; letter-spacing: .1em; }
 .rstep { display: grid; grid-template-columns: 14px 8px 16px minmax(0, 1fr) auto; gap: 9px; align-items: center; padding: 5px 6px; margin: 0 -6px; border-radius: 5px; text-align: left; background: transparent; border: 0; color: var(--fg); width: calc(100% + 12px); }

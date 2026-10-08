@@ -322,6 +322,8 @@ impl Counters {
 pub struct AccountState {
     /// Shared across account reloads so in-flight requests remain counted.
     pub active_requests: Arc<AtomicUsize>,
+    /// Codex's `x-models-etag` from the latest response: a changed value means its model list changed.
+    pub models_etag: Option<String>,
     pub disabled: bool,
     /// Cooldowns keyed by model ("*" = whole account).
     pub cooldowns: HashMap<String, DateTime<Utc>>,
@@ -400,8 +402,10 @@ pub struct Account {
     /// Stable per-account device id for Claude cloaking.
     pub device_id: String,
     pub session_id: String,
-    /// Models discovered from the upstream at runtime (Antigravity).
+    /// Models the upstream lists for this account (Antigravity, Claude and Codex sign-ins).
     pub discovered: RwLock<Vec<String>>,
+    /// Models added from the dashboard (`extra-models`) until Fusebox knows them.
+    pub extra: Vec<String>,
     /// Clients reach this account as `prefix/model`.
     pub prefix: Option<String>,
     /// Model patterns this account must not serve.
@@ -489,7 +493,8 @@ impl Account {
         }
         let aggregator = matches!(self.provider, Provider::Antigravity | Provider::Devin);
         let known = if forced { aggregator || self.provider.family(model) } else { self.provider.serves(model) }
-            || self.discovered.read().iter().any(|m| m.eq_ignore_ascii_case(model));
+            || self.discovered.read().iter().any(|m| m.eq_ignore_ascii_case(model))
+            || self.extra.iter().any(|m| m.eq_ignore_ascii_case(model));
         known.then(|| self.upstream_name(model))
     }
 
@@ -520,7 +525,7 @@ impl Account {
             return self.models.iter().filter(|m| !self.excludes(&m.name)).map(|m| m.public().to_string()).collect();
         }
         let mut out: Vec<String> = self.provider.builtin_models().iter().map(|s| s.to_string()).collect();
-        for m in self.discovered.read().iter() {
+        for m in self.discovered.read().iter().chain(&self.extra) {
             if !out.iter().any(|o| o.eq_ignore_ascii_case(m)) {
                 out.push(m.clone());
             }
@@ -790,6 +795,7 @@ struct Spec {
     prefix: Option<String>,
     excluded: Vec<String>,
     aliases: Vec<OAuthAlias>,
+    extra: Vec<String>,
 }
 
 /// Config sections keyed by provider name (`claude`, `codex`, `aistudio`, ...).
@@ -841,6 +847,7 @@ fn collect(cfg: &Config) -> Vec<Spec> {
             prefix,
             excluded,
             aliases,
+            extra: for_provider(&cfg.extra_models, provider),
             id: format!("file:{name}"),
             provider,
             label: oauth
@@ -884,6 +891,7 @@ fn collect(cfg: &Config) -> Vec<Spec> {
                 prefix: nonempty(&e.prefix),
                 excluded: e.excluded_models.clone(),
                 aliases: vec![],
+                extra: for_provider(&cfg.extra_models, provider),
             });
         }
     }
@@ -904,6 +912,7 @@ fn collect(cfg: &Config) -> Vec<Spec> {
                 prefix: nonempty(&c.prefix),
                 excluded: c.excluded_models.clone(),
                 aliases: vec![],
+                extra: vec![],
             });
         }
         // Keyless local endpoints (Ollama, LM Studio, ...)
@@ -923,6 +932,7 @@ fn collect(cfg: &Config) -> Vec<Spec> {
                 prefix: nonempty(&c.prefix),
                 excluded: c.excluded_models.clone(),
                 aliases: vec![],
+                extra: vec![],
             });
         }
     }
@@ -1028,7 +1038,8 @@ impl Pool {
                     && prev.proxy_url == s.proxy_url
                     && prev.prefix == s.prefix
                     && prev.excluded == s.excluded
-                    && prev.aliases == s.aliases;
+                    && prev.aliases == s.aliases
+                    && prev.extra == s.extra;
                 if same_shape {
                     let mut st = prev.state.lock();
                     st.disabled = s.disabled;
@@ -1082,6 +1093,7 @@ impl Pool {
                 device_id: s.device_id.unwrap_or_else(|| random_hex(32)),
                 session_id: uuid::Uuid::new_v4().to_string(),
                 discovered: RwLock::new(discovered),
+                extra: s.extra,
                 prefix: s.prefix,
                 excluded: s.excluded,
                 aliases: s.aliases,
@@ -1151,6 +1163,20 @@ impl Pool {
 
     pub fn all(&self) -> Vec<Arc<Account>> {
         self.accounts.read().clone()
+    }
+
+    /// True when this release or a provider's own model list already has `model`,
+    /// so an `extra-models` entry for it is no longer needed.
+    pub fn knows(&self, provider: Provider, model: &str) -> bool {
+        let same =
+            |m: &str| m.eq_ignore_ascii_case(model) || dot_versions(m).eq_ignore_ascii_case(&dot_versions(model));
+        provider.builtin_models().iter().any(|m| same(m))
+            || self
+                .accounts
+                .read()
+                .iter()
+                .filter(|a| a.provider == provider)
+                .any(|a| a.discovered.read().iter().any(|m| same(m)))
     }
 
     pub fn get(&self, id: &str) -> Option<Arc<Account>> {
@@ -1738,6 +1764,30 @@ mod tests {
     }
 
     #[test]
+    fn added_models_are_served_and_listed_until_fusebox_knows_them() {
+        let text = r#"
+auth-dir: /nonexistent
+claude-api-key:
+  - api-key: k
+extra-models:
+  claude: [mythos-1, claude-opus-5-5]
+  codex: [gpt-7]
+"#;
+        let cfg = Config::parse(text).unwrap();
+        let pool = Pool::default();
+        pool.reload(&cfg);
+        // Even a name outside the claude-* family reaches the provider it was added for.
+        assert!(matches!(pool.pick("mythos-1", &[], &cfg, None, None, &HashMap::new()), Pick::Ok(..)));
+        assert!(matches!(pool.pick("gpt-7", &[], &cfg, None, None, &HashMap::new()), Pick::None));
+        let models: Vec<String> = pool.models().into_iter().map(|(m, _)| m).collect();
+        assert!(models.contains(&"mythos-1".to_string()) && !models.contains(&"gpt-7".to_string()));
+        assert!(pool.knows(Provider::Claude, "claude-opus-5-5") && pool.knows(Provider::Claude, "CLAUDE-OPUS-5.5"));
+        assert!(!pool.knows(Provider::Claude, "mythos-1") && !pool.knows(Provider::Codex, "mythos-1"));
+        pool.all()[0].discovered.write().push("mythos-1".into());
+        assert!(pool.knows(Provider::Claude, "mythos-1"));
+    }
+
+    #[test]
     fn close_model_names_resolve() {
         assert_eq!(dot_versions("gemini-3-8-flash"), "gemini-3.8-flash");
         assert_eq!(dot_versions("gpt-6-1-sol"), "gpt-6.1-sol");
@@ -1808,6 +1858,7 @@ claude-api-key:
             device_id: String::new(),
             session_id: String::new(),
             discovered: RwLock::new(vec![]),
+            extra: vec![],
             prefix: None,
             excluded: vec![],
             aliases,

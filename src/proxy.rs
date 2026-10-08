@@ -550,6 +550,9 @@ fn shorten_tool_names(req: &mut Request) -> HashMap<String, String> {
 }
 
 pub async fn execute(app: Arc<App>, mut call: Call) -> Reply {
+    if crate::clients::observe(&call.headers) {
+        app.models.save_clients();
+    }
     if let Some(identity) = crate::affinity::session_identity(&call.headers, &call.body) {
         call.session = Some(identity.key);
         call.session_source = Some(identity.source);

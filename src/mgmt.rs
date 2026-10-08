@@ -306,6 +306,8 @@ pub fn router(app: Arc<App>) -> Router<Arc<App>> {
         .route("/vertex", post(import_vertex))
         .route("/requests", get(requests))
         .route("/models", get(models))
+        .route("/models/added", post(add_model).delete(remove_model))
+        .route("/models/check", post(check_models))
         .route("/config", get(get_config).put(put_config))
         .route("/config/settings", get(get_settings).patch(patch_settings))
         .route("/login/{target}", post(login_start).get(login_status))
@@ -528,16 +530,78 @@ async fn routes(State(app): State<Arc<App>>) -> Json<Value> {
         "session_affinity": cfg.session_affinity,
         "request_retry": cfg.request_retry.max(1),
         "models": models,
+        "removed_models": app.models.removed(),
     }))
 }
 
-/// Public models; `prefix` marks ids that only reach the accounts carrying that prefix.
+/// Public models; `prefix` marks ids that only reach the accounts carrying that prefix,
+/// `added` the ones added from the dashboard that Fusebox doesn't know yet.
 async fn models(State(app): State<Arc<App>>) -> Json<Value> {
-    let models = app.pool.models().into_iter().map(|(m, p)| match app.pool.route(&m).0 {
-        Some(Only::Prefix(prefix)) => json!({ "id": m, "provider": p, "prefix": prefix }),
-        _ => json!({ "id": m, "provider": p }),
+    let models = app.pool.models().into_iter().map(|(m, p)| {
+        let mut v = json!({ "id": m, "provider": p });
+        match app.pool.route(&m) {
+            (Some(Only::Prefix(prefix)), _) => v["prefix"] = prefix.into(),
+            (_, base) if crate::discovery::added(&app, p, &base) => v["added"] = true.into(),
+            _ => {}
+        }
+        v
     });
     Json(Value::Array(models.collect()))
+}
+
+#[derive(Deserialize)]
+struct AddedModel {
+    provider: String,
+    model: String,
+}
+
+/// Adds a model Fusebox doesn't know yet to `extra-models`.
+async fn add_model(State(app): State<Arc<App>>, Json(b): Json<AddedModel>) -> Response {
+    let model = b.model.trim();
+    let provider = match Provider::parse(&b.provider) {
+        Some(Provider::Compat) => {
+            return err(StatusCode::BAD_REQUEST, "Compatible providers list their models in Config");
+        }
+        Some(p) => p,
+        None => return err(StatusCode::BAD_REQUEST, "Choose a provider"),
+    };
+    if !crate::discovery::valid_model_id(model) {
+        return err(StatusCode::BAD_REQUEST, "Use the model id as the provider writes it, like claude-opus-6");
+    }
+    if app.pool.knows(provider, model) {
+        return err(StatusCode::CONFLICT, format!("Fusebox already knows {model}"));
+    }
+    let mut models = app.cfg().extra_models.clone();
+    let list = models.entry(provider.as_str().to_string()).or_default();
+    if !list.iter().any(|m| m.eq_ignore_ascii_case(model)) {
+        list.push(model.to_string());
+    }
+    match crate::discovery::save_extra_models(&app, models) {
+        Ok(()) => ok(),
+        Err(e) => err(StatusCode::INTERNAL_SERVER_ERROR, format!("Could not save config: {e:#}")),
+    }
+}
+
+async fn remove_model(State(app): State<Arc<App>>, Json(b): Json<AddedModel>) -> Response {
+    let Some(provider) = Provider::parse(&b.provider) else { return err(StatusCode::BAD_REQUEST, "Choose a provider") };
+    let mut models = app.cfg().extra_models.clone();
+    for (key, list) in models.iter_mut() {
+        if Provider::parse(key) == Some(provider) {
+            list.retain(|m| !m.eq_ignore_ascii_case(b.model.trim()));
+        }
+    }
+    models.retain(|_, list| !list.is_empty());
+    match crate::discovery::save_extra_models(&app, models) {
+        Ok(()) => ok(),
+        Err(e) => err(StatusCode::INTERNAL_SERVER_ERROR, format!("Could not save config: {e:#}")),
+    }
+}
+
+/// Asks Claude and Codex for their model lists now (at most once per 10 minutes per account).
+async fn check_models(State(app): State<Arc<App>>) -> Json<Value> {
+    let (asked, new) = crate::discovery::check_now(&app).await;
+    app.broadcast("accounts", Value::Null);
+    Json(json!({ "asked": asked, "new": new }))
 }
 
 #[derive(Deserialize)]
@@ -737,7 +801,7 @@ async fn import_vertex(State(app): State<Arc<App>>, Json(b): Json<VertexBody>) -
 /// Applies an edit to the config file's YAML tree, keeping every setting this
 /// binary doesn't know about (so the file still works with CLIProxyAPI).
 /// A rewrite drops comments, so the commented original is kept once as config.yaml.bak.
-fn keep_original(app: &App, text: &str) {
+pub(crate) fn keep_original(app: &App, text: &str) {
     let backup = app.cfg_path.with_extension("yaml.bak");
     if text.contains('#') && !backup.exists() {
         let _ = std::fs::write(&backup, text);

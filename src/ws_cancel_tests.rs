@@ -285,3 +285,55 @@ async fn native_completion_reports_full_usage_without_durable_analytics() {
     .await
     .unwrap();
 }
+
+#[tokio::test]
+async fn codex_interrupts_reach_the_running_native_response() {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let base = format!("http://{}", listener.local_addr().unwrap());
+    let (seen_tx, mut seen) = mpsc::unbounded_channel::<Value>();
+    let task = tokio::spawn(async move {
+        let (socket, _) = listener.accept().await.unwrap();
+        let mut socket = tokio_tungstenite::accept_async(socket).await.unwrap();
+        socket.next().await.unwrap().unwrap();
+        socket
+            .send(tungstenite::Message::Text(
+                json!({"type":"response.created","response":{"id":"resp-int","status":"in_progress"}})
+                    .to_string()
+                    .into(),
+            ))
+            .await
+            .unwrap();
+        // The response only ends once the interrupt arrives.
+        let tungstenite::Message::Text(text) = socket.next().await.unwrap().unwrap() else { panic!() };
+        seen_tx.send(serde_json::from_str(&text).unwrap()).unwrap();
+        socket
+            .send(tungstenite::Message::Text(
+                json!({
+                    "type":"response.completed", "response":{"id":"resp-int","status":"completed","output":[],
+                        "usage":{"input_tokens":3,"output_tokens":0}}
+                })
+                .to_string()
+                .into(),
+            ))
+            .await
+            .unwrap();
+        while socket.next().await.is_some() {}
+    });
+    let _upstream = Server { url: base.clone(), task };
+    let app = app(&base, true);
+    let proxy = serve(crate::server::router(app.clone())).await;
+    let mut socket = client(&proxy).await;
+    create(&mut socket, true, "long answer").await;
+    until_event(&mut socket, "response.created").await;
+    let interrupt = json!({"type":"response.interrupt","response_id":"resp-int","mode":"discard_partial_items"});
+    socket.send(tungstenite::Message::Text(interrupt.to_string().into())).await.unwrap();
+    until_event(&mut socket, "response.completed").await;
+    assert_eq!(seen.recv().await.unwrap(), interrupt);
+    // A late interrupt, after the response ended, is dropped rather than answered with an error.
+    socket.send(tungstenite::Message::Text(interrupt.to_string().into())).await.unwrap();
+    create(&mut socket, true, "next").await;
+    let next = tokio::time::timeout(Duration::from_millis(500), socket.next()).await;
+    if let Ok(Some(Ok(tungstenite::Message::Text(text)))) = next {
+        assert!(!text.contains("unsupported message type"), "{text}");
+    }
+}

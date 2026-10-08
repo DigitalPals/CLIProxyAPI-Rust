@@ -197,6 +197,9 @@ pub fn observe(acct: &Account, headers: &reqwest::header::HeaderMap, epoch: u64)
                 });
             }
             plan = h("x-codex-plan-type").map(String::from);
+            if let Some(etag) = h("x-models-etag") {
+                acct.state.lock().models_etag = Some(etag.to_string());
+            }
         }
         _ => return,
     }
@@ -282,7 +285,7 @@ pub async fn poll(app: &App, acct: &Arc<Account>) -> anyhow::Result<()> {
                 .get(CLAUDE_USAGE)
                 .bearer_auth(&token)
                 .header("anthropic-beta", "oauth-2025-04-20")
-                .header("user-agent", crate::upstream::CC_USER_AGENT)
+                .header("user-agent", crate::clients::claude_user_agent())
                 .timeout(Duration::from_secs(15))
                 .send()
                 .await?
@@ -295,7 +298,7 @@ pub async fn poll(app: &App, acct: &Arc<Account>) -> anyhow::Result<()> {
             let mut rb = http
                 .get(CODEX_USAGE)
                 .bearer_auth(&token)
-                .header("user-agent", crate::upstream::CODEX_USER_AGENT)
+                .header("user-agent", crate::clients::codex_user_agent())
                 .header("originator", crate::upstream::CODEX_ORIGINATOR)
                 .timeout(Duration::from_secs(15));
             if let Some(id) = &account_id {
@@ -348,12 +351,15 @@ pub fn usage(st: &mut crate::accounts::AccountState, provider: Provider, value: 
     authoritative(st, windows, plan);
 }
 
-/// Keeps quota fresh for signed-in Claude and ChatGPT accounts.
+/// Keeps quota and model lists fresh for signed-in Claude and ChatGPT accounts.
 pub async fn poller(app: Arc<App>) {
     tokio::time::sleep(Duration::from_secs(2)).await;
     loop {
         let checks = app.pool.all().into_iter().map(|acct| poll_account(&app, acct));
-        if poll_batch(checks).await {
+        let quota = poll_batch(checks).await;
+        let lists = crate::discovery::refresh_due(&app).await;
+        crate::discovery::prune(&app);
+        if quota || lists {
             app.broadcast("accounts", Value::Null);
         }
         tokio::time::sleep(Duration::from_secs(60)).await;

@@ -61,6 +61,10 @@ pub struct Config {
     /// Per-provider model patterns OAuth accounts must not serve (`*` wildcards).
     #[serde(skip_serializing_if = "BTreeMap::is_empty")]
     pub oauth_excluded_models: BTreeMap<String, Vec<String>>,
+    /// Models added from the dashboard before Fusebox knows them (`claude: [claude-opus-6]`).
+    /// Each is dropped once a release lists it or the provider's model list includes it.
+    #[serde(skip_serializing_if = "BTreeMap::is_empty")]
+    pub extra_models: BTreeMap<String, Vec<String>>,
     /// CLIProxyAPI settings found in the file that have no effect here.
     #[serde(skip)]
     pub ignored: Vec<String>,
@@ -266,6 +270,7 @@ impl Default for Config {
             force_model_prefix: false,
             oauth_model_alias: BTreeMap::new(),
             oauth_excluded_models: BTreeMap::new(),
+            extra_models: BTreeMap::new(),
             ignored: vec![],
             legacy_auth_dir: false,
             claude_api_key: vec![],
@@ -321,6 +326,11 @@ usage:
 #   provider-exhausted: true   # every account of a provider is out, and when one is back
 #   account-used-up: false     # one account used up its 5-hour or weekly limit
 #   account-errors: false      # account errors and runs of failed requests
+
+# Models released after this Fusebox version, served until it knows them. The dashboard's
+# "Add model" writes here; an entry is removed once Fusebox or the provider lists the model.
+# extra-models:
+#   claude: [claude-opus-6]
 
 # Optional named inference credentials; existing api-keys continue to work.
 named-clients: []

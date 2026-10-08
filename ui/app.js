@@ -55,6 +55,7 @@ const S = {
   openReq: null,
   acctFilter: 'all',
   modelFilter: '',
+  addModel: null, // { provider, picked, model, msg, err } while the Add model form is open
   drawer: null,
   palette: null, // { q, i, opener }
   faults: false,
@@ -502,6 +503,7 @@ function refreshViews() {
     usageRender();
   } else if (S.route === 'models') {
     patch('models-head', modelsHeadHTML);
+    if (!S.addModel) patch('models-panel', modelsPanelHTML);
     patch('models-root', modelsBodyHTML);
   }
   renderDrawer();
@@ -2108,8 +2110,9 @@ const FAMILIES = [
 ];
 
 const routeSteps = (id) => (S.routes?.models || {})[id] || [];
+const modelInfo = (id) => S.models.find((m) => m.id === id) || {};
 // `team/model` reaches only the accounts with the team/ prefix; the model is `model`.
-const modelPrefix = (id) => S.models.find((m) => m.id === id)?.prefix;
+const modelPrefix = (id) => modelInfo(id).prefix;
 const unprefixed = (id) => { const p = modelPrefix(id); return p ? id.slice(p.length + 1) : id; };
 
 function modelFamilies() {
@@ -2189,9 +2192,114 @@ function routeStepText(step, a) {
 
 function modelsHTML() {
   const search = `<div class="searchbox"${mob() ? ' style="flex:none;height:44px;padding:0 12px"' : ' style="flex:0 1 280px"'}>${ICON.search}<label class="sr-only" for="model-filter">Find a model</label><input id="model-filter" type="text" placeholder="Find a model" value="${esc(S.modelFilter)}" autocomplete="off" spellcheck="false"${mob() ? ' style="font-size:14px"' : ''}>${S.modelFilter && !mob() ? '<button class="clear" type="button" data-act="clear-model-filter" aria-label="Clear">×</button>' : ''}</div>`;
-  if (mob()) return `${search}<div id="models-head">${modelsHeadHTML()}</div><div id="models-root" style="display:contents">${modelsBodyHTML()}</div>`;
-  return `<div class="page-head"><div><h1 class="h-page">Models</h1><p class="meta" id="models-count">${modelsCountText()}</p></div><span class="grow"></span>${search}</div>
-    <div id="models-head">${modelsHeadHTML()}</div><div id="models-root">${modelsBodyHTML()}</div>`;
+  if (mob()) return `${search}<div id="models-head">${modelsHeadHTML()}</div><div id="models-panel" style="display:contents">${modelsPanelHTML()}</div><div id="models-root" style="display:contents">${modelsBodyHTML()}</div>`;
+  const add = `<button class="btn" type="button" id="add-model-btn" data-act="add-model" aria-expanded="${!!S.addModel}">Add model</button>`;
+  return `<div class="page-head"><div><h1 class="h-page">Models</h1><p class="meta" id="models-count">${modelsCountText()}</p></div><span class="grow"></span>${add}${search}</div>
+    <div id="models-head">${modelsHeadHTML()}</div><div id="models-panel" style="display:contents">${modelsPanelHTML()}</div><div id="models-root">${modelsBodyHTML()}</div>`;
+}
+
+const MODEL_EXAMPLE = {
+  claude: 'claude-opus-6', codex: 'gpt-7', gemini: 'gemini-4-pro', vertex: 'gemini-4-pro', antigravity: 'gemini-4-pro',
+  kimi: 'kimi-k4', xai: 'grok-5', meta: 'muse-spark-2', devin: 'swe-2',
+};
+
+// Providers a model can be added for: the connected ones (compatible providers list their own).
+function addModelProviders() {
+  const have = new Set((S.accounts || []).map((a) => a.provider));
+  return Object.keys(MODEL_EXAMPLE).filter((p) => have.has(p));
+}
+
+function guessProvider(id) {
+  const f = FAMILIES.find(([, , , re]) => re.test(id.trim().toLowerCase()));
+  return f && addModelProviders().includes(f[2]) ? f[2] : null;
+}
+
+function modelsPanelHTML() {
+  return `${removedNoteHTML()}${addModelHTML()}`;
+}
+
+// Models someone added that Fusebox has since learned, and so took off the list.
+function removedNoteHTML() {
+  const seen = Date.parse(store.get('removedSeen') || '') || 0;
+  const list = (S.routes?.removed_models || []).filter((r) => Date.parse(r.at) > seen && Date.now() - Date.parse(r.at) < 7 * 864e5);
+  if (!list.length) return '';
+  const names = list.map((r) => r.model).join(', ');
+  return `<div class="card fam-note models-note"><span>Fusebox now knows ${esc(names)}, so ${list.length === 1 ? 'it was' : 'they were'} removed from the models you added.</span><span class="grow"></span><button class="btn sm" type="button" data-act="dismiss-removed">Dismiss</button></div>`;
+}
+
+function addModelHTML() {
+  const m = S.addModel;
+  if (!m) return mob() ? '<button class="btn" type="button" data-act="add-model">Add model</button>' : '';
+  const provs = addModelProviders();
+  const p = provs.includes(m.provider) ? m.provider : provs[0];
+  const lists = (S.accounts || []).some((a) => ['claude', 'codex'].includes(a.provider) && a.kind !== 'api-key');
+  return `<form class="panel models-add" data-form="add-model" aria-label="Add a model">
+    <h3>Add a model</h3>
+    <p>For a model released after this version of Fusebox. It is listed and served right away, and taken off this list once Fusebox or the provider's own model list knows it.</p>
+    ${provs.length ? `<div class="seg" role="group" aria-label="Provider">${provs.map((id) => `<button type="button" data-act="add-model-provider" data-id="${id}" aria-pressed="${p === id}">${logo(id, null, null, 14)}${esc(PROVIDER[id])}</button>`).join('')}</div>` : '<p class="msg err">Connect an account first.</p>'}
+    <div class="grid"><label class="field wide"><span>Model id</span><input type="text" name="model" value="${esc(m.model || '')}" placeholder="${esc(MODEL_EXAMPLE[p] || '')}" autocomplete="off" spellcheck="false" required><small>Exactly as the provider writes it; clients ask for this name.</small></label></div>
+    <div class="actions"><button class="btn primary" type="submit"${provs.length ? '' : ' disabled'}>Add model</button><button class="btn ghost" type="button" data-act="close-add-model">Cancel</button>
+      ${lists ? '<span class="grow"></span><button class="btn" type="button" data-act="check-models">Check Claude and Codex for new models</button>' : ''}</div>
+    <p class="msg${m.err ? ' err' : ''}" id="add-model-msg" aria-live="polite">${esc(m.msg || '')}</p>
+  </form>`;
+}
+
+function patchModelsPanel() {
+  patch('models-panel', modelsPanelHTML);
+  $('#add-model-btn')?.setAttribute('aria-expanded', String(!!S.addModel));
+}
+
+function openAddModel(provider) {
+  S.addModel = { provider: provider || null, picked: !!provider, model: S.addModel?.model || '' };
+  patchModelsPanel();
+  const input = $('#models-panel input[name="model"]');
+  input?.focus();
+  input?.scrollIntoView({ block: 'nearest' });
+}
+
+async function submitAddModel(form) {
+  const m = S.addModel;
+  const provider = addModelProviders().includes(m.provider) ? m.provider : addModelProviders()[0];
+  const model = form.elements.model.value.trim();
+  const btn = form.querySelector('button[type="submit"]');
+  btn.disabled = true;
+  try {
+    await api('/models/added', { method: 'POST', body: JSON.stringify({ provider, model }) });
+    S.addModel = null;
+    S.modelFilter = '';
+    toast(`Added ${model}`);
+    patchModelsPanel();
+    refreshAccounts();
+  } catch (e) {
+    Object.assign(m, { model, msg: e.message, err: true });
+    patchModelsPanel();
+  }
+}
+
+async function checkModels(btn) {
+  btn.disabled = true;
+  btn.textContent = 'Checking…';
+  const m = S.addModel;
+  try {
+    const r = await api('/models/check', { method: 'POST' });
+    const msg = !r.asked ? 'Every account was checked in the last 10 minutes.'
+      : r.new.length ? `New: ${r.new.join(', ')}.` : `Asked ${plural(r.asked, 'account')}; nothing new.`;
+    if (m) Object.assign(m, { msg, err: false, model: $('#models-panel input[name="model"]')?.value || m.model });
+    refreshAccounts();
+  } catch (e) {
+    if (m) Object.assign(m, { msg: e.message, err: true });
+  }
+  patchModelsPanel();
+}
+
+async function removeModel(id, provider) {
+  try {
+    await api('/models/added', { method: 'DELETE', body: JSON.stringify({ provider, model: id }) });
+    toast(`Removed ${id}`);
+    refreshAccounts();
+  } catch (e) {
+    toast(e.message);
+  }
 }
 
 function modelsCountText() {
@@ -2222,12 +2330,12 @@ function modelsBodyHTML() {
     // A failed request doesn't take an account out of rotation; an expired sign-in does.
     const usable = route.rows.some((r) => r.state === 'ready' && !acctState(accountById(r.account)).signin);
     const chips = f.ids.map((id) => {
-      const prefix = modelPrefix(id);
+      const { prefix, added, provider } = modelInfo(id);
       const base = unprefixed(id);
       const target = routeSteps(id).map((s) => s.upstream).find((u) => u && u.toLowerCase() !== base.toLowerCase() && !(f.key === 'kimi' && !f.compat));
       const only = prefix ? routeSteps(id).map((s) => accountById(s.account)).filter(Boolean) : [];
       const bad = (fails[id] || []).length >= 3;
-      return { id, prefix, base, only, target, bad, match: !q || `${id} ${target || ''}`.toLowerCase().includes(q) };
+      return { id, prefix, added, provider, base, only, target, bad, match: !q || `${id} ${target || ''}`.toLowerCase().includes(q) };
     }).filter((c) => c.match);
     let note = null;
     const worst = Object.entries(fails).filter(([m, l]) => f.ids.includes(m) && l.length >= 3).sort((x, y) => y[1].length - x[1].length)[0];
@@ -2253,8 +2361,12 @@ function modelsBodyHTML() {
     c.prefix ? `${c.id} only goes to ${c.only.length ? c.only.map(acctLabel).join(', ') : `accounts with the ${c.prefix}/ prefix`}` : '',
     c.target ? `${c.prefix ? c.base : c.id} is an alias for ${c.target}` : '',
     c.bad ? `${c.id} is failing` : '',
+    c.added ? 'You added this model; it goes once Fusebox knows it' : '',
   ].filter(Boolean).join('. ') || `Copy ${c.id}`;
-  const chipHTML = (f, c) => `<button class="idchip${c.target ? ' alias' : ''}${c.bad ? ' bad' : ''}${f.off ? ' off' : ''}${q ? ' hit' : ''}" type="button" data-act="copy-model" data-id="${esc(c.id)}" title="${esc(chipTitle(c))}">${c.prefix ? `<span><span class="pfx">${esc(c.prefix)}/</span>${esc(c.base)}</span>` : esc(c.id)}${c.target ? `<span class="to">→ ${esc(c.target)}</span>` : ''}${c.prefix && c.only.length ? `<span class="to">only ${esc(onlyText(c))}</span>` : ''}${c.bad ? '<span class="dot s6 err"></span>' : ''}</button>`;
+  const chipHTML = (f, c) => (c.added ? `<span class="idchip-pair">${idChipHTML(f, c)}<button class="idchip-x" type="button" data-act="remove-model" data-id="${esc(c.id)}" data-provider="${esc(c.provider)}" aria-label="Remove ${esc(c.id)}" title="Remove ${esc(c.id)}">×</button></span>` : idChipHTML(f, c));
+  // Families of a provider that takes added models end with a "+ Add" chip.
+  const addChip = (f) => (!q && !f.compat && addModelProviders().includes(f.logoKey[0]) ? `<button class="idchip add" type="button" data-act="add-model" data-provider="${f.logoKey[0]}" title="Add a ${esc(f.name)} model Fusebox doesn't list yet">+ Add</button>` : '');
+  const idChipHTML = (f, c) => `<button class="idchip${c.target ? ' alias' : ''}${c.added ? ' added' : ''}${c.bad ? ' bad' : ''}${f.off ? ' off' : ''}${q ? ' hit' : ''}" type="button" data-act="copy-model" data-id="${esc(c.id)}" title="${esc(chipTitle(c))}">${c.prefix ? `<span><span class="pfx">${esc(c.prefix)}/</span>${esc(c.base)}</span>` : esc(c.id)}${c.target ? `<span class="to">→ ${esc(c.target)}</span>` : ''}${c.prefix && c.only.length ? `<span class="to">only ${esc(onlyText(c))}</span>` : ''}${c.added ? '<span class="tag">added</span>' : ''}${c.bad ? '<span class="dot s6 err"></span>' : ''}</button>`;
   const stepHTML = (f, r, i, short) => {
     const a = accountById(r.account);
     const t = routeStepText(r, a);
@@ -2269,13 +2381,13 @@ function modelsBodyHTML() {
     return fams.map((f) => `<section class="card m-fam" aria-label="${esc(f.name)}">
       <div class="m-fam-head">${logo(f.logoKey[0], f.logoKey[1], null, 18)}<span class="nm">${esc(f.name)}</span><span class="pat">${esc(famPattern(f))}</span><span class="grow"></span><span class="meta" style="font-size:12px">${countLabel(f)}</span></div>
       ${f.route.rows.length ? `<div class="m-route">${f.route.rows.map((r, i) => stepHTML(f, r, i, true)).join('')}</div>` : ''}
-      <div class="chipset" style="gap:6px">${f.chips.map((c) => chipHTML(f, c)).join('')}</div>${noteHTML2(f)}</section>`).join('');
+      <div class="chipset" style="gap:6px">${f.chips.map((c) => chipHTML(f, c)).join('')}${addChip(f)}</div>${noteHTML2(f)}</section>`).join('');
   }
   return `<div class="card rivets table fams" role="table" aria-label="Model families">
     <div class="th" role="row"><span>Family</span><span>Model ids</span><span class="c-route-h">Route order · ${quotaWord()}</span></div>
     ${fams.map((f) => `<div class="fam" role="row">
       <div class="fam-name">${logo(f.logoKey[0], f.logoKey[1])}<div class="cell2"><span>${esc(f.name)}</span><span class="pat">${esc(famPattern(f))}</span><span class="meta" style="font-size:12px">${countLabel(f)}</span></div></div>
-      <div class="fam-ids"><div class="chipset" style="gap:6px">${f.chips.map((c) => chipHTML(f, c)).join('')}</div>${noteHTML2(f)}</div>
+      <div class="fam-ids"><div class="chipset" style="gap:6px">${f.chips.map((c) => chipHTML(f, c)).join('')}${addChip(f)}</div>${noteHTML2(f)}</div>
       <div class="route-col"><span class="capsm">Route order · ${quotaWord()}</span>${f.route.rows.map((r, i) => stepHTML(f, r, i, false)).join('') || '<span class="dim" style="font-size:12px">No account serves these right now.</span>'}</div>
     </div>`).join('')}</div>`;
 }
@@ -2613,6 +2725,17 @@ document.addEventListener('click', (e) => {
   switch (act) {
     case 'copy': return copy(el);
     case 'copy-model': return copyText(id).then(() => toast(`Copied ${id}`));
+    case 'add-model': return openAddModel(el.dataset.provider);
+    case 'close-add-model': S.addModel = null; return patchModelsPanel();
+    case 'add-model-provider':
+      Object.assign(S.addModel, { provider: id, picked: true, model: $('#models-panel input[name="model"]')?.value || '' });
+      patchModelsPanel();
+      return $('#models-panel input[name="model"]')?.focus();
+    case 'check-models': return checkModels(el);
+    case 'remove-model': return removeModel(id, el.dataset.provider);
+    case 'dismiss-removed':
+      store.set('removedSeen', (S.routes?.removed_models || []).map((r) => r.at).sort().pop() || new Date().toISOString());
+      return patchModelsPanel();
     case 'privacy': return togglePrivacy();
     case 'push-on': case 'push-off': case 'push-test': case 'push-remove': return pushAction(act, id);
     case 'palette': return openPalette();
@@ -2738,6 +2861,15 @@ document.addEventListener('input', (e) => {
     S.openReq = null;
     patch('req-tools', reqToolsHTML);
     patch('req-list', reqListHTML);
+  } else if (e.target.closest('form[data-form="add-model"]') && S.addModel) {
+    // Pick the provider from the name until one is chosen by hand.
+    S.addModel.model = e.target.value;
+    const guess = !S.addModel.picked && guessProvider(e.target.value);
+    if (guess && guess !== S.addModel.provider) {
+      S.addModel.provider = guess;
+      for (const b of $$('[data-act="add-model-provider"]')) b.setAttribute('aria-pressed', String(b.dataset.id === guess));
+      e.target.placeholder = MODEL_EXAMPLE[guess] || '';
+    }
   } else if (e.target.id === 'model-filter') {
     S.modelFilter = e.target.value;
     patch('models-root', modelsBodyHTML);
@@ -2805,6 +2937,7 @@ document.addEventListener('submit', async (e) => {
   const kind = form.dataset.form;
   if (kind === 'paste') return submitPaste(form);
   if (kind === 'key') return submitKey(form);
+  if (kind === 'add-model') return submitAddModel(form);
   if (kind === 'vertex') return submitVertex(form);
   if (kind === 'unlock') {
     S.key = form.elements.key.value.trim();

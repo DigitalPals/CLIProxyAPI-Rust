@@ -22,7 +22,7 @@ const CONFIG_KEY_SECTION = {
   routing: 'routing', 'five-hour-reserve-percent': 'routing', 'request-retry': 'routing', 'session-affinity': 'routing',
   'session-affinity-idle-seconds': 'routing', 'force-model-prefix': 'routing',
   'proxy-url': 'connections', 'codex-websockets': 'connections', 'claude-cloak': 'connections', 'banked-resets': 'connections',
-  'oauth-model-alias': 'models', 'oauth-excluded-models': 'models', notifications: 'notifications', debug: 'diagnostics',
+  'oauth-model-alias': 'models', 'oauth-excluded-models': 'models', 'extra-models': 'models', notifications: 'notifications', debug: 'diagnostics',
 };
 const CONFIG_OAUTH = [['claude', 'Claude'], ['codex', 'Codex'], ['antigravity', 'Antigravity'], ['kimi', 'Kimi'], ['xai', 'Grok'], ['meta', 'Meta'], ['devin', 'Devin'], ['vertex', 'Vertex AI']];
 const CONFIG_PROVIDERS = [
@@ -117,10 +117,12 @@ function configListHead(title, help, addLabel, addAttrs) {
     ${addLabel ? `<button type="button" class="btn sm" ${addAttrs}>${esc(addLabel)}</button>` : ''}</div>`;
 }
 
-function configStrings(path, label, help = '', secret = false, empty = '') {
+// `words` renames the rows for lists that aren't patterns: { add, item, one, placeholder }.
+function configStrings(path, label, help = '', secret = false, empty = '', words = null) {
   const list = configGet(path) || [];
-  return `<div class="cfg-list wide">${configListHead(label, help, secret ? 'Add key' : 'Add pattern', `data-config-act="add-string" data-path="${configPath(path)}"${secret && path[0] === 'api-keys' ? ' data-generate="true"' : ''}`)}
-    ${list.length ? list.map((_, i) => `<div class="cfg-row">${configField([...path, i], `${secret ? 'API key' : 'Model pattern'} ${i + 1}`, { type: secret ? 'password' : 'text', required: true, bare: true, placeholder: secret ? 'Enter an API key' : 'claude-*' })}${configRemove([...path, i], `Remove ${secret ? 'API key' : 'pattern'} ${i + 1}`)}</div>`).join('')
+  const w = words || (secret ? { add: 'Add key', item: 'API key', one: 'API key', placeholder: 'Enter an API key' } : { add: 'Add pattern', item: 'Model pattern', one: 'pattern', placeholder: 'claude-*' });
+  return `<div class="cfg-list wide">${configListHead(label, help, w.add, `data-config-act="add-string" data-path="${configPath(path)}"${secret && path[0] === 'api-keys' ? ' data-generate="true"' : ''}`)}
+    ${list.length ? list.map((_, i) => `<div class="cfg-row">${configField([...path, i], `${w.item} ${i + 1}`, { type: secret ? 'password' : 'text', required: true, bare: true, placeholder: w.placeholder })}${configRemove([...path, i], `Remove ${w.one} ${i + 1}`)}</div>`).join('')
       : `<p class="cfg-empty">${esc(empty || (secret ? 'No keys configured.' : 'No models excluded.'))}</p>`}</div>`;
 }
 
@@ -249,13 +251,16 @@ function configProvidersHTML() {
 
 function configModelsHTML() {
   const known = CONFIG_OAUTH.map(([p]) => p);
-  const names = [...new Set([...known, ...Object.keys(configGet(['oauth-model-alias']) || {}), ...Object.keys(configGet(['oauth-excluded-models']) || {})])];
+  const sections = ['oauth-model-alias', 'oauth-excluded-models', 'extra-models'];
+  const names = [...new Set([...known, ...sections.flatMap((f) => Object.keys(configGet([f]) || {}))])];
   const provider = S.config.oauthProvider;
-  const count = (p) => ((configGet(['oauth-model-alias', p]) || []).length + (configGet(['oauth-excluded-models', p]) || []).length);
+  const count = (p) => sections.reduce((n, f) => n + (configGet([f, p]) || []).length, 0);
   return `<div class="cfg-tabs" role="group" aria-label="Provider">${names.map((p) => `<button type="button" data-config-act="oauth-provider" data-provider="${esc(p)}" aria-pressed="${p === provider}">${logo(p, null, null, 14)}${esc((CONFIG_OAUTH.find(([id]) => id === p) || [, PROVIDER[p] || p])[1])}<span class="n">${count(p)}</span></button>`).join('')}</div>
     ${configAliases(['oauth-model-alias', provider], true)}
     <div class="cfg-divider"></div>
-    ${configStrings(['oauth-excluded-models', provider], 'Excluded models', 'Model names or patterns these accounts must not serve. Use * as a wildcard.')}`;
+    ${configStrings(['oauth-excluded-models', provider], 'Excluded models', 'Model names or patterns these accounts must not serve. Use * as a wildcard.')}
+    <div class="cfg-divider"></div>
+    ${configStrings(['extra-models', provider], 'Added models', 'Models released after this version of Fusebox, served by every account of this provider. Each is removed once Fusebox or the provider’s model list knows it.', false, 'No models added.', { add: 'Add model', item: 'Model', one: 'model', placeholder: 'claude-opus-6' })}`;
 }
 
 function configDiagnosticsHTML() {
@@ -470,6 +475,9 @@ function configValidate() {
   });
   if ('oauth-excluded-models' in changed) for (const [provider, patterns] of Object.entries(v['oauth-excluded-models'] || {})) patterns.forEach((pattern, i) => {
     if (!pattern.trim()) invalid(['oauth-excluded-models', provider, i], 'Enter a model pattern or remove this row.');
+  });
+  if ('extra-models' in changed) for (const [provider, models] of Object.entries(v['extra-models'] || {})) models.forEach((model, i) => {
+    if (!/^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/.test(model.trim())) invalid(['extra-models', provider, i], 'Enter a model id like claude-opus-6, or remove this row.');
   });
   if (Object.keys(c.errors).length) {
     const id = Object.keys(c.errors)[0];

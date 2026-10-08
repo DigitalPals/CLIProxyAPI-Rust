@@ -296,7 +296,8 @@ fn image_block(img: &Image) -> Value {
 
 /// Map explicit disable requests to the lowest supported thinking configuration.
 /// Sonnet 5.5 can disable up-front thinking; Opus 5.5, Fable and Mythos cannot
-/// disable thinking, so use adaptive thinking at low effort instead.
+/// disable thinking, so use adaptive thinking at low effort instead. Newer models
+/// follow Anthropic's model list (`discovery`).
 pub fn normalize_disabled_thinking(body: &mut Value, model: &str) {
     if body["thinking"]["type"] != "disabled" {
         return;
@@ -312,6 +313,7 @@ pub fn normalize_disabled_thinking(body: &mut Value, model: &str) {
         || model.contains("fable-5")
         || model.contains("mythos-5")
         || model.contains("mythos-preview")
+        || crate::discovery::thinking_always_on(&model)
     {
         body["thinking"] = json!({ "type": "adaptive" });
         body["output_config"]["effort"] = "low".into();
@@ -338,6 +340,9 @@ pub fn build_request(req: &Request, model: &str) -> Value {
                 Some("minimal") | Some("low") => "low",
                 Some("medium") => "medium",
                 Some("xhigh") if model.contains("4-6") => "max",
+                Some("xhigh") if crate::discovery::lacks_effort(model, "xhigh") => {
+                    if crate::discovery::lacks_effort(model, "max") { "high" } else { "max" }
+                }
                 Some("xhigh") => "xhigh",
                 Some("max") => "max",
                 _ => "high",

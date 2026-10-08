@@ -191,6 +191,21 @@ Model names are forgiving: `gpt-6-1-sol` finds `gpt-6.1-sol`, and `gemini-3-8-fl
 
 When more than one provider has a model, the vendor's own accounts answer first and Antigravity or Devin take the overflow when those are rate limited. To choose a provider yourself, prefix the model: `antigravity/claude-sonnet-4-6`, `devin/gpt-6-astra`, `vertex/gemini-3.1-pro`.
 
+### New models
+
+A model a provider releases after your Fusebox version usually works straight away: requests go by name family, so `claude-*` reaches Claude, `gpt-*` reaches Codex, `gemini-*` Gemini, and so on.
+
+Fusebox also asks the providers what they serve, so new models show up in `/v1/models` and on the dashboard by themselves. Signed-in Claude and Codex accounts each fetch their model list once every 6 to 7 hours, retrying after 15 minutes (then 30, 60, …) when that fails. The lists are kept in `<auth-dir>/.model-lists.state`, so a restart fetches nothing. Codex marks a changed list on its ordinary responses, which brings that account's next check forward, but never to within 10 minutes of the last one. Claude's list also says whether a model can turn thinking off and which effort levels it takes, and requests follow it. Antigravity has always fetched its own list.
+
+For everything else (Gemini, Grok, Kimi, Meta, Devin, API keys), or when you don't want to wait, use **Add model** on the Models page, or the `+ Add` chip at the end of a family. It writes the model to `extra-models` in `config.yaml`:
+
+```yaml
+extra-models:
+  claude: [claude-opus-6]
+```
+
+Every account of that provider then serves and lists it, apart from API keys with their own `models` list. Once a Fusebox release or the provider's model list includes it, Fusebox removes the entry from `config.yaml` and says so on the Models page. **Check Claude and Codex for new models** in the Add model form asks every signed-in Claude and Codex account now, skipping any checked in the last 10 minutes.
+
 ### Reasoning effort, from the model name
 
 Append an effort level or a token budget to any model:
@@ -483,6 +498,12 @@ cargo run -- --config dev.yaml
 ```
 
 The dashboard lives in `ui/` and is embedded with `include_str!`, so rebuild after editing it.
+
+### Client versions
+
+Requests Fusebox builds for other clients look like one release of Claude Code, the Codex CLI, Grok Build, Muse Code, the Devin CLI and Antigravity. Those releases are listed in `.github/client-versions.json`, and `cargo test` checks the code says the same. Every morning the **Client versions** workflow compares them with each client's latest release and keeps one issue (label `client-version`) open per client that is behind, closing it once Fusebox catches up. To catch up, check what the new release sends, update the code to match, and bump the version in both places.
+
+Real Claude Code and Codex clients keep their own identity on the way through, and Fusebox's own small requests (usage, model lists) say they come from the newest Claude Code or Codex release your clients use.
 
 See [release binary size](docs/binary-size.md) for compiler comparisons, measured
 savings, and Linux packed-relocation compatibility.

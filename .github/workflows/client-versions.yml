@@ -1,0 +1,22 @@
+name: Client versions
+
+# Daily: compare the client releases Fusebox speaks as (.github/client-versions.json)
+# with the latest ones, and keep one issue per client that is behind.
+on:
+  schedule:
+    - cron: "17 6 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  issues: write
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Compare with the latest releases
+        run: python3 .github/scripts/client_versions.py
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
