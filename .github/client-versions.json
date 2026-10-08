@@ -21,22 +21,22 @@
     {
       "id": "grok-build",
       "name": "Grok Build",
-      "version": "1.0.44",
+      "version": "1.0.46",
       "source": { "kind": "text", "url": "https://x.ai/cli/stable" },
-      "where": "src/device.rs: xai::CLIENT_VERSION",
+      "where": "src/device.rs: xai::CLIENT_VERSION; src/upstream.rs: the xAI CLI-proxy headers (user agent, x-grok-*)",
       "notes": "https://x.ai/cli"
     },
     {
       "id": "muse-code",
       "name": "Muse Code",
-      "version": "1.3.0",
+      "version": "1.4.3",
       "source": { "kind": "json", "url": "https://api.meta.ai/muse-code/channels/muse-stable", "path": "version", "cut": "-R" },
-      "where": "src/device.rs: meta::API_UA (the build hash in it has no public source)"
+      "where": "src/device.rs: meta::API_UA, whose build hash is the git commit compiled into the release (find it next to the version string in the macOS arm64 binary from the channel's release manifest)"
     },
     {
       "id": "devin-cli",
       "name": "Devin CLI",
-      "version": "3000.10.21",
+      "version": "3000.11.3",
       "source": { "kind": "json", "url": "https://static.devin.ai/cli/current/manifest.json", "path": "version" },
       "where": "src/devin.rs: CLIENT_VERSION"
     },

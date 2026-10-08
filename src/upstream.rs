@@ -770,8 +770,13 @@ fn responses_api(t: &Target, mut body: Value) -> Prepared {
                 [
                     ("x-xai-token-auth", "xai-grok-cli".to_string()),
                     ("x-grok-client-version", device::xai::CLIENT_VERSION.to_string()),
-                    ("user-agent", format!("xai-grok-workspace/{}", device::xai::CLIENT_VERSION)),
+                    // The interactive CLI: its pager names itself and the shell it runs.
+                    (
+                        "user-agent",
+                        format!("grok-pager/{v} grok-shell/{v} (macos; aarch64)", v = device::xai::CLIENT_VERSION),
+                    ),
                     ("x-grok-client-identifier", "grok-shell".to_string()),
+                    ("x-grok-client-mode", "interactive".to_string()),
                     ("x-authenticateresponse", "authenticate-response".to_string()),
                 ]
                 .map(|(k, v)| (k.to_string(), v)),
