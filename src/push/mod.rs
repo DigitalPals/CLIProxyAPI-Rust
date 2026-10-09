@@ -256,6 +256,14 @@ async fn check(app: &App) {
     }
 }
 
+/// Every current fault in the management API's form, errors first, as the faults
+/// menu lists them.
+pub fn current_faults(app: &App) -> Value {
+    let mut current = faults::faults(&views(app), Utc::now());
+    current.sort_by_key(|f| f.level != "err");
+    Value::Array(current.iter().map(Fault::json).collect())
+}
+
 /// The rules' view of every account.
 fn views(app: &App) -> Vec<AccountView> {
     let now = Utc::now();
@@ -467,6 +475,7 @@ async fn test(State(app): State<Arc<App>>, Json(req): Json<TestRequest>) -> Resp
         title: "Notifications are on".into(),
         body: format!("Fusebox will tell {} when something trips.", sub.label),
         path: "#/config/notifications".into(),
+        ..Default::default()
     };
     let badge = faults::faults(&views(&app), Utc::now()).len();
     match deliver(&app, &sub, &fault, badge, "normal").await {

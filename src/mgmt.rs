@@ -305,6 +305,7 @@ pub fn router(app: Arc<App>) -> Router<Arc<App>> {
         .route("/keys", post(add_key))
         .route("/vertex", post(import_vertex))
         .route("/requests", get(requests))
+        .route("/faults", get(faults))
         .route("/models", get(models))
         .route("/models/added", post(add_model).delete(remove_model))
         .route("/models/check", post(check_models))
@@ -453,6 +454,13 @@ async fn accounts(State(app): State<Arc<App>>) -> Json<Value> {
 async fn requests(State(app): State<Arc<App>>) -> Json<Value> {
     let recent = app.stats.recent.lock();
     Json(serde_json::to_value(recent.iter().rev().collect::<Vec<_>>()).unwrap_or_default())
+}
+
+/// What has tripped: expired sign-ins, used-up limits, rate limits, account errors,
+/// runs of failed requests and providers with no account left. The same rules as the
+/// faults menu and push notifications.
+async fn faults(State(app): State<Arc<App>>) -> Json<Value> {
+    Json(crate::push::current_faults(&app))
 }
 
 /// One account's last hour, and the coding sessions pinned to it. Session details
@@ -974,15 +982,19 @@ async fn login_code(State(app): State<Arc<App>>, Path(target): Path<String>, Jso
 }
 
 /// What each busy account is doing right now: requests in flight (including
-/// streams that have not finished) and coding sessions seen in the last few minutes.
+/// streams that have not finished), coding sessions seen in the last few minutes,
+/// and those seen in the last half hour, which are still going on between turns.
 fn account_load(app: &App) -> Value {
-    let sessions = app.sessions.recent_sessions(app.cfg().session_affinity_idle_seconds);
+    let counts = app.sessions.session_counts(app.cfg().session_affinity_idle_seconds);
     let mut load = serde_json::Map::new();
     for a in app.pool.all() {
         let in_flight = a.state.lock().active_requests.load(Ordering::Relaxed);
-        let sessions = sessions.get(&a.id).copied().unwrap_or(0);
-        if in_flight > 0 || sessions > 0 {
-            load.insert(a.id.clone(), json!({ "in_flight": in_flight, "sessions": sessions }));
+        let (sessions, ongoing) = counts.get(&a.id).copied().unwrap_or_default();
+        if in_flight > 0 || ongoing > 0 {
+            load.insert(
+                a.id.clone(),
+                json!({ "in_flight": in_flight, "sessions": sessions, "ongoing_sessions": ongoing }),
+            );
         }
     }
     Value::Object(load)
@@ -992,10 +1004,12 @@ async fn live(State(app): State<Arc<App>>, ws: WebSocketUpgrade) -> Response {
     ws.on_upgrade(move |mut socket| async move {
         let mut rx = app.live.subscribe();
         let mut tick = tokio::time::interval(Duration::from_secs(5));
-        // Account load is checked every second but only sent when it changes.
+        // Account load and faults are checked every second but only sent when they
+        // change. Faults carry no countdown text, so time passing alone sends nothing.
         let mut load_tick = tokio::time::interval(Duration::from_secs(1));
         load_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         let mut sent_load = String::new();
+        let mut sent_faults = String::new();
         loop {
             tokio::select! {
                 _ = load_tick.tick() => {
@@ -1004,6 +1018,12 @@ async fn live(State(app): State<Arc<App>>, ws: WebSocketUpgrade) -> Response {
                         let msg = format!(r#"{{"type":"load","data":{load}}}"#);
                         if socket.send(Message::Text(msg.into())).await.is_err() { break }
                         sent_load = load;
+                    }
+                    let faults = crate::push::current_faults(&app).to_string();
+                    if faults != sent_faults {
+                        let msg = format!(r#"{{"type":"faults","data":{faults}}}"#);
+                        if socket.send(Message::Text(msg.into())).await.is_err() { break }
+                        sent_faults = faults;
                     }
                 }
                 msg = rx.recv() => match msg {
@@ -1070,6 +1090,76 @@ mod tests {
         assert_eq!(status(nginx, Some("secret")).await, 403, "a proxied request is remote");
         assert_eq!(status(None, Some("secret")).await, 200);
         server.abort();
+    }
+
+    #[tokio::test]
+    async fn faults_are_listed_and_streamed_when_they_change() {
+        use futures::StreamExt;
+
+        let cfg = Config {
+            auth_dir: "/nonexistent".into(),
+            management_key: "secret".into(),
+            codex_api_key: vec![crate::config::KeyEntry { api_key: "mock-only".into(), ..Default::default() }],
+            ..Default::default()
+        };
+        let app = App::new(cfg, "/nonexistent/config.yaml".into());
+        let account = app.pool.all()[0].clone();
+        account.state.lock().last_error = Some("upstream exploded".into());
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let service = router(app.clone()).with_state(app.clone()).into_make_service_with_connect_info::<SocketAddr>();
+        let server = tokio::spawn(async move { axum::serve(listener, service).await.unwrap() });
+
+        let client = reqwest::Client::new();
+        let proxied = client.get(format!("http://{addr}/faults")).header("x-forwarded-for", "100.64.0.7");
+        assert_eq!(proxied.send().await.unwrap().status(), 401, "faults need the management key");
+        let listed: Value = client
+            .get(format!("http://{addr}/faults"))
+            .header("x-forwarded-for", "100.64.0.7")
+            .bearer_auth("secret")
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        let fault = &listed.as_array().unwrap()[0];
+        assert_eq!((fault["kind"].as_str(), fault["level"].as_str()), (Some("error"), Some("err")));
+        assert_eq!(
+            (fault["account_id"].as_str(), fault["detail"].as_str()),
+            (Some(account.id.as_str()), Some("upstream exploded"))
+        );
+
+        let mut request =
+            tokio_tungstenite::tungstenite::client::IntoClientRequest::into_client_request(format!("ws://{addr}/live"))
+                .unwrap();
+        request.headers_mut().insert("authorization", "Bearer secret".parse().unwrap());
+        let (mut socket, _) = tokio_tungstenite::connect_async(request).await.unwrap();
+        let mut next_faults = async || loop {
+            let frame = tokio::time::timeout(Duration::from_secs(5), socket.next()).await.unwrap().unwrap().unwrap();
+            let msg: Value = serde_json::from_str(frame.to_text().unwrap()).unwrap();
+            if msg["type"] == "faults" {
+                return msg["data"].clone();
+            }
+        };
+        assert_eq!(next_faults().await, listed, "a new socket starts with every fault");
+        account.state.lock().last_error = None;
+        assert_eq!(next_faults().await, json!([]), "a cleared fault is sent at once");
+        server.abort();
+    }
+
+    #[test]
+    fn load_reports_live_and_ongoing_sessions_per_account() {
+        let cfg = Config {
+            auth_dir: "/nonexistent".into(),
+            codex_api_key: vec![crate::config::KeyEntry { api_key: "mock-only".into(), ..Default::default() }],
+            ..Default::default()
+        };
+        let mut app = App::new(cfg.clone(), "/nonexistent/config.yaml".into());
+        Arc::get_mut(&mut app).unwrap().sessions = Arc::new(crate::affinity::Sessions::memory());
+        assert_eq!(account_load(&app), json!({}), "idle accounts are left out");
+        let (account, _) = app.sessions.pick(&app.pool, &cfg, "gpt-6.1-sol", Some("task"), &[], None).unwrap();
+        assert_eq!(account_load(&app)[&account.id], json!({ "in_flight": 0, "sessions": 1, "ongoing_sessions": 1 }));
     }
 
     #[tokio::test]

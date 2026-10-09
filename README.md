@@ -254,7 +254,7 @@ Sharing a screenshot or your screen? The eye button in the top bar (or <kbd>.</k
 
 Choose **Used** or **Remaining** beside the quota meters (or press <kbd>U</kbd>); your browser remembers it. Each meter has 20 segments of 5%: they light up off-white while there's room, amber from 75% used and red from 95%.
 
-<kbd>⌘K</kbd> / <kbd>Ctrl K</kbd> or <kbd>/</kbd> opens a command palette for accounts, models and actions such as connecting an account or clearing cooldowns. The faults button in the top bar lists what has tripped: expired sign-ins, used-up limits, rate limits and runs of failed requests.
+<kbd>⌘K</kbd> / <kbd>Ctrl K</kbd> or <kbd>/</kbd> opens a command palette for accounts, models and actions such as connecting an account or clearing cooldowns. The faults button in the top bar lists what has tripped: expired sign-ins, used-up limits, rate limits and runs of failed requests. Other tools can read the same list from the management API ([details](docs/notifications.md#reading-faults-from-other-tools)).
 
 **Install it as an app, with notifications.** Over HTTPS (or on `localhost`) the dashboard installs like an app: from Chrome or Edge's install button, Safari's **Add to Dock**, or **Add to Home Screen** on a phone. It opens in its own window, shows the number of faults on its icon, and can send push notifications when a sign-in expires or every account of a provider is used up (and when one is back). Turn them on per device under **Config, Notifications** and choose the events there. See [notifications](docs/notifications.md).
 

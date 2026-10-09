@@ -25,6 +25,9 @@ const MAX_RESPONSE_BYTES: usize = 8 * 1024 * 1024;
 const MAX_RESPONSES: usize = 1_000;
 /// Recent assignments count immediately, including the gaps between coding turns.
 const LOAD_IDLE_SECONDS: i64 = 5 * 60;
+/// For display only: a session quiet for longer than the load window, waiting on its
+/// user or a long tool run, is still going on. Routing never reads this.
+const ONGOING_IDLE_SECONDS: i64 = 30 * 60;
 /// Session source for a client that sent no session id: the conversation's first user message.
 pub const INFERRED_SOURCE: &str = "conversation_start";
 /// Provider prompt caches last an hour at most, so an inferred assignment is not kept longer.
@@ -281,6 +284,31 @@ impl Registry {
             }
         }
         load
+    }
+}
+
+impl Registry {
+    /// Per account, in one pass: sessions in the load window (as `recent_sessions`) and
+    /// sessions still going on (seen within `ONGOING_IDLE_SECONDS`). Calls in flight
+    /// count in both.
+    fn session_counts(&self, idle: u64) -> HashMap<String, (usize, usize)> {
+        let idle = idle.min(i64::MAX as u64) as i64;
+        let now = Utc::now().timestamp();
+        let (recent, ongoing) = (now - LOAD_IDLE_SECONDS.min(idle), now - ONGOING_IDLE_SECONDS.min(idle));
+        let mut latest: HashMap<(&str, &str), i64> = HashMap::new();
+        for (key, b) in &self.bindings {
+            let session = if b.session.is_empty() { key.as_str() } else { b.session.as_str() };
+            let seen = if self.active.contains_key(session) { i64::MAX } else { b.last_seen };
+            let entry = latest.entry((b.account.as_str(), session)).or_insert(i64::MIN);
+            *entry = (*entry).max(seen);
+        }
+        let mut counts: HashMap<String, (usize, usize)> = HashMap::new();
+        for ((account, _), seen) in latest.into_iter().filter(|(_, seen)| *seen > ongoing) {
+            let count = counts.entry(account.to_string()).or_default();
+            count.0 += usize::from(seen > recent);
+            count.1 += 1;
+        }
+        counts
     }
 }
 
@@ -554,10 +582,11 @@ impl Sessions {
         self.registry.lock().account_load(cfg)
     }
 
-    /// Sessions per account seen in the last few minutes or with a call in flight,
-    /// whatever the routing strategy. The dashboard shows these as live sessions.
-    pub fn recent_sessions(&self, idle: u64) -> HashMap<String, usize> {
-        self.registry.lock().recent_sessions(idle)
+    /// Per account, whatever the routing strategy: sessions seen in the last few minutes
+    /// (the dashboard's live sessions) and sessions seen in the last half hour, both
+    /// counting calls in flight.
+    pub fn session_counts(&self, idle: u64) -> HashMap<String, (usize, usize)> {
+        self.registry.lock().session_counts(idle)
     }
 
     /// Sessions currently assigned to `account`: their owner digest (see [`owner_of`]),
@@ -960,7 +989,7 @@ mod tests {
     }
 
     #[test]
-    fn recent_sessions_count_for_every_strategy_until_idle() {
+    fn live_and_ongoing_sessions_count_for_every_strategy_until_idle() {
         let cfg = config(Routing::RoundRobin);
         let pool = Pool::default();
         pool.reload(&cfg);
@@ -968,14 +997,22 @@ mod tests {
         let a = sessions.pick(&pool, &cfg, "gpt-6.1-sol", Some("task"), &[], None).unwrap().0;
         let idle = cfg.session_affinity_idle_seconds;
         assert!(sessions.account_load(&cfg).is_empty()); // routing does not weigh it
-        assert_eq!(sessions.recent_sessions(idle)[&a.id], 1);
-        sessions.registry.lock().bindings.values_mut().for_each(|b| b.last_seen -= LOAD_IDLE_SECONDS + 1);
-        assert!(sessions.recent_sessions(idle).is_empty());
+        assert_eq!(sessions.session_counts(idle)[&a.id], (1, 1));
+        let age = |seconds| sessions.registry.lock().bindings.values_mut().for_each(|b| b.last_seen -= seconds);
+        age(LOAD_IDLE_SECONDS + 1);
+        // Quiet past the load window: no longer live, still going on.
+        assert_eq!(sessions.session_counts(idle)[&a.id], (0, 1));
         let lease = sessions.hold("task", idle);
-        assert_eq!(sessions.recent_sessions(idle)[&a.id], 1); // long-running stream
+        assert_eq!(sessions.session_counts(idle)[&a.id], (1, 1)); // long-running stream
         drop(lease);
+        age(ONGOING_IDLE_SECONDS);
+        assert!(sessions.session_counts(idle).is_empty());
+        // A shorter affinity expiry bounds both windows.
+        let b = sessions.pick(&pool, &cfg, "gpt-6.1-sol", Some("other"), &[], None).unwrap().0;
+        sessions.registry.lock().bindings.values_mut().for_each(|b| b.last_seen -= 120);
+        assert_eq!(sessions.session_counts(60).get(&b.id), None);
+        assert_eq!(sessions.session_counts(idle)[&b.id], (1, 1));
         sessions.end("task");
-        assert!(sessions.recent_sessions(idle).is_empty());
     }
 
     #[test]

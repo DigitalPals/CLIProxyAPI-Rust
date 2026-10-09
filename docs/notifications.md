@@ -34,6 +34,33 @@ Fusebox checks every 30 seconds, using the rules behind the dashboard's faults b
 
 Rate limits are never sent; they come and go too quickly. The app's icon shows the number of faults the dashboard shows.
 
+## Reading faults from other tools
+
+Desktop widgets and scripts can read the same faults through the management API, with the management key as a bearer token, like every other `/api` route:
+
+- `GET /api/faults` lists them, errors first.
+- `/api/live` sends a `faults` event with the whole list as soon as a socket connects, then again whenever the list changes. The dashboard's `load` events work the same way.
+
+```json
+{
+  "key": "quota:file:claude-work.json",
+  "kind": "quota",
+  "level": "warn",
+  "provider": "claude",
+  "provider_name": "Claude",
+  "account_id": "file:claude-work.json",
+  "label": "work@example.com",
+  "title": "Weekly limit used up",
+  "detail": null,
+  "until": "2026-10-12T09:00:00+00:00",
+  "path": "#/accounts/file%3Aclaude-work.json"
+}
+```
+
+The same socket's `load` event says what each busy account is doing: `in_flight` requests, `sessions` seen in the last five minutes (the dashboard's live sessions, and what smart-quota routing weighs), and `ongoing_sessions` seen in the last 30 minutes, which still counts a session waiting on its user or a long tool run. Each counts calls in flight, and no window outlasts `session-affinity-idle-seconds`.
+
+`kind` is `signin`, `quota`, `rate_limit`, `error`, `failures` or `provider`. `level` is `err` while requests fail and `warn` while an account sits out for a while. `title` and `detail` never contain a countdown: `until` is when the fault should clear by itself, so a client counts down on its own and a fault only changes when something does. A whole provider (`kind: "provider"`) has no `account_id` or `label`. `path` is where the fault opens in the dashboard. Unlike notifications, the list includes rate limits and doesn't wait for a second check.
+
 ## Privacy
 
 Notifications go from Fusebox to your browser's push service (Google for Chrome and Edge, Mozilla for Firefox, Apple for Safari), which delivers them to the device. The message is end-to-end encrypted ([RFC 8291](https://www.rfc-editor.org/rfc/rfc8291)); the push service sees only when a message is sent and how large it is. Nothing is sent unless a device has turned notifications on.
