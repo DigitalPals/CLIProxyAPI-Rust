@@ -1,10 +1,11 @@
 'use strict';
 
 const CONFIG_SECTIONS = [
-  ['server', 'Server'], ['access', 'Access'], ['routing', 'Routing'], ['connections', 'Connections'],
+  ['clients', 'Clients'], ['server', 'Server'], ['access', 'Access'], ['routing', 'Routing'], ['connections', 'Connections'],
   ['providers', 'Providers'], ['models', 'Model rules'], ['notifications', 'Notifications'], ['diagnostics', 'Diagnostics'], ['yaml', 'YAML file'],
 ];
 const CONFIG_DESCRIPTIONS = {
+  clients: 'The endpoint and key your tools use, and how to set each one up.',
   server: 'Where Fusebox listens and where it keeps sign-in files.',
   access: 'Who can use the proxy and the dashboard.',
   routing: 'How Fusebox picks an account for each request.',
@@ -146,6 +147,18 @@ function configHeaders(path) {
       <small class="cfg-error" data-header-error="true">${esc(S.config.errors[configId([...path, i, 'key'])] || '')}</small></div>
       <span class="arrow" aria-hidden="true">:</span>${configField([...path, key], `${key} value`, { bare: true, placeholder: 'Value' })}
       <button type="button" class="btn danger" data-config-act="remove-header" data-path="${configPath(path)}" data-key="${esc(key)}" aria-label="Remove ${esc(key)} header">Remove</button></div>`).join('') || '<p class="cfg-empty">No extra headers configured.</p>'}</div>`;
+}
+
+// Nothing to edit here: client keys are set under Access.
+function configClientsHTML() {
+  const keys = S.overview.client_keys;
+  const access = '<button type="button" class="linkbtn" data-config-act="section" data-section="access">Access</button>';
+  const help = keys.length
+    ? `Clients send ${keys.length > 1 ? 'this or another client key' : 'this key'} as their API key. Add or replace keys under ${access}.`
+    : `Any client that can reach the endpoint can use it. Add a key under ${access}.`;
+  return `<div class="cfg-clients">${connectItemsHTML()}<p class="cfg-description">${help}</p></div>
+    <div class="cfg-divider"></div>
+    <div class="setup" id="client-setup">${setupHTML()}</div>`;
 }
 
 function configServerHTML() {
@@ -346,10 +359,12 @@ function configFootHTML() {
     <button type="button" class="btn primary" data-config-act="save" ${can ? '' : 'disabled'}>${c.busy ? 'Saving…' : mob() ? 'Save' : f.save}</button>`;
 }
 
-// Phones only show the save bar while there is something to save or report.
+// On phones, and in Clients (which has no settings of its own), the save bar only
+// shows while there is something to save or report.
 function configFootClass() {
   const f = configFootState();
-  return `cfg-foot${f.dirty || ['ok', 'err'].includes(f.msg.kind) ? '' : ' idle'}`;
+  if (f.dirty || ['ok', 'err'].includes(f.msg.kind)) return 'cfg-foot';
+  return `cfg-foot idle${S.config.section === 'clients' ? ' quiet' : ''}`;
 }
 
 function configDirtySections() {
@@ -373,14 +388,18 @@ function configHTML() {
   const restart = { host: 'bind address', port: 'port', tls: 'HTTPS', debug: 'debug logging' };
   const sectionAction = c.section === 'providers' ? `<button type="button" class="btn" data-config-act="add-provider">Add ${c.provider === 'compat' ? 'provider' : 'key'}</button>` : '';
   const reload = `<button type="button" class="btn" data-config-act="reload" ${c.busy ? 'disabled' : ''}>Reload from file</button>`;
+  const head = `<div class="cfg-sec-head"><div class="cell2"><h2 class="h-sec">${esc(name)}</h2><p class="meta">${esc(CONFIG_DESCRIPTIONS[c.section])}</p></div>${sectionAction}</div>`;
+  // Clients has nothing to save, so it isn't a form.
+  const content = c.section === 'clients'
+    ? `<section class="card cfg-content" aria-label="Clients">${head}${configClientsHTML()}</section>`
+    : `<form id="config-form" class="card cfg-content" aria-label="${esc(name)} settings" novalidate>${head}
+      <fieldset ${c.busy ? 'disabled' : ''}>${sections[c.section]()}</fieldset></form>`;
   return `<div class="page-head">${mob() ? `<span class="mono meta ellipsis" style="font-size:12px">${esc(home(c.path))}</span>` : `<div><h1 class="h-page">Config</h1><span class="mono meta" style="font-size:12.5px">${esc(home(c.path))}</span></div>`}<span class="grow"></span>${reload}</div>
     ${c.reloadConfirm ? '<div class="banner plain"><span class="grow">Reloading will discard your unsaved changes.</span><button class="btn sm" type="button" data-config-act="confirm-reload">Reload and discard</button><button class="btn sm ghost" type="button" data-config-act="cancel-reload">Keep editing</button></div>' : ''}
     ${c.restart_fields.length ? `<div class="banner warn" role="status"><span class="dot warn"></span><span class="grow">Restart Fusebox to apply changes to ${esc(c.restart_fields.map((f) => restart[f] || f).join(', '))}.</span></div>` : ''}
     <div class="cfg-chips" role="group" aria-label="Config sections">${CONFIG_SECTIONS.map(([id, label]) => `<button type="button" data-config-act="section" data-section="${id}" ${c.section === id ? 'aria-current="page"' : ''}>${label}<span class="cfg-dot${dirty.has(id) ? ' on' : ''}" aria-label="${dirty.has(id) ? 'Unsaved changes' : ''}"></span></button>`).join('')}</div>
     <div class="cfg-layout"><nav class="cfg-nav" aria-label="Config sections">${CONFIG_SECTIONS.map(([id, label]) => `<button type="button" data-config-act="section" data-section="${id}" ${c.section === id ? 'aria-current="page"' : ''}><span>${label}</span><span class="cfg-dot${dirty.has(id) ? ' on' : ''}"${dirty.has(id) ? ' title="Unsaved changes"' : ''}></span></button>`).join('')}</nav>
-    <form id="config-form" class="card cfg-content" aria-label="${esc(name)} settings" novalidate>
-      <div class="cfg-sec-head"><div class="cell2"><h2 class="h-sec">${esc(name)}</h2><p class="meta">${esc(CONFIG_DESCRIPTIONS[c.section])}</p></div>${sectionAction}</div>
-      <fieldset ${c.busy ? 'disabled' : ''}>${sections[c.section]()}</fieldset></form></div>
+    ${content}</div>
     <div class="${configFootClass()}" id="config-foot" aria-live="polite">${configFootHTML()}</div>`;
 }
 

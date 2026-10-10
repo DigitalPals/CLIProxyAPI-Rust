@@ -46,7 +46,7 @@ No testimonials, benchmarks or user counts exist. Do not invent performance numb
 
 ## Product Principles
 
-1. One URL, every client: the endpoint and how to connect are never more than one glance away.
+1. One URL, every client: the endpoint and how to connect are never more than one step away (Config, Clients, or ⌘K), and the overview leads with them until the first request arrives.
 2. Account health is the product: cooldowns, expiry and errors are shown plainly, with the time until recovery.
 3. Simple over complete: fewer screens, fewer controls, sensible defaults in config.
 4. Works the same on a laptop and on a server.

@@ -272,7 +272,7 @@ Retiring an older Redis-based usage collector requires a compatible replacement 
 
 `config.yaml` reloads automatically when it changes, and the dashboard edits the same file.
 
-The dashboard's Config page has forms for server and access settings, routing, connections, provider keys, model rules and diagnostics, plus a **YAML file** section for everything else. Keys stay masked until revealed, and leaving an existing key blank keeps it unchanged. If the file changes elsewhere while you edit, the page asks you to reload before saving. Bind address, port, HTTPS and debug logging changes need a restart; the page shows which are pending.
+The dashboard's Config page starts with **Clients**, the endpoint and key with copyable setup for Claude Code, Codex, the OpenAI SDK and curl, then has forms for server and access settings, routing, connections, provider keys, model rules and diagnostics, plus a **YAML file** section for everything else. Keys stay masked until revealed, and leaving an existing key blank keeps it unchanged. If the file changes elsewhere while you edit, the page asks you to reload before saving. Bind address, port, HTTPS and debug logging changes need a restart; the page shows which are pending.
 
 ```yaml
 host: "127.0.0.1"             # 0.0.0.0 to expose it (set api-keys first)

@@ -12,7 +12,7 @@ const store = {
 };
 (function migrateStorage() {
   try {
-    for (const k of ['key', 'snippet', 'setup', 'private', 'quota-display']) {
+    for (const k of ['key', 'snippet', 'private', 'quota-display']) {
       const old = localStorage.getItem(LEGACY_STORE + k);
       if (old == null) continue;
       if (localStorage.getItem(STORE + k) == null) localStorage.setItem(STORE + k, old);
@@ -63,7 +63,7 @@ const S = {
   login: null, // { state, provider, url, callback, status, message }
   keyProvider: 'claude',
   snippet: store.get('snippet') || 'claude',
-  setup: store.get('setup'), // 'open' | 'closed' | null (auto)
+  served: store.get('served') === '1', // this browser has seen Fusebox serve a request
   private: store.get('private') === '1', // hide emails and keys
   quotaDisplay: store.get('quota-display') === 'remaining' ? 'remaining' : 'used',
   confirm: null,
@@ -71,7 +71,7 @@ const S = {
   resetModal: null,
   push: { loaded: false, loading: false, status: null, endpoint: null, busy: false, msg: null }, // Config, Notifications
   config: { values: null, saved: null, defaults: {}, revision: '', path: '', ignored: [], restart_fields: [],
-    msg: null, busy: false, loading: false, section: 'server', provider: 'claude', oauthProvider: 'claude',
+    msg: null, busy: false, loading: false, section: 'clients', provider: 'claude', oauthProvider: 'claude',
     errors: {}, opens: {}, secrets: {}, reloadConfirm: false, reveal: false, raw: { text: null, saved: null, loading: false } },
 };
 
@@ -133,7 +133,6 @@ const ICON = {
   check: svg('<path d="m3.5 8.5 3 3 6-7"/>', 16, 1.7),
   refresh: svg('<path d="M11.5 7a4.5 4.5 0 1 1-1.3-3.2"/><path d="M11.2 1.8v2.4H8.8"/>', 14, 1.3),
   trash: svg('<path d="M2.5 4h9M5.5 4V2.5h3V4M3.6 4l.6 7.5h5.6l.6-7.5"/>', 14, 1.3),
-  chevron: svg('<path d="M3 4.5l3 3 3-3"/>', 12, 1.4),
   back: svg('<path d="M10 3L5 8l5 5"/>', 16, 1.5),
   search: svg('<circle cx="6" cy="6" r="4.25"/><path d="M9.2 9.2l3 3"/>', 14, 1.3),
   eye: svg('<path d="M1.5 8s2.4-4.5 6.5-4.5S14.5 8 14.5 8s-2.4 4.5-6.5 4.5S1.5 8 1.5 8z"/><circle cx="8" cy="8" r="2"/>', 16, 1.3),
@@ -406,6 +405,7 @@ function onRequest(log) {
   if (log.account_id && S.activity[log.account_id]) S.activity[log.account_id].at = 0;
   renderFaults();
   if (S.route === 'overview') {
+    patchMainline();
     patch('figures', figuresHTML);
     patch('bars', barsHTML);
     patch('recent', recentHTML);
@@ -492,7 +492,7 @@ function refreshViews() {
   renderChrome();
   if (S.locked || !S.overview) return;
   if (S.route === 'overview') {
-    patch('ov-main', mainlineHTML);
+    patchMainline();
     patch('ov-subs', ovSubsHTML);
     patch('ov-other', ovOtherHTML);
     patch('recent', recentHTML);
@@ -826,7 +826,7 @@ function runAlert(i) {
 // ---------------------------------------------------------------- overview
 
 function overviewHTML() {
-  const main = `<section class="mainline-wrap" id="ov-main" aria-label="Main line">${mainlineHTML()}</section>`;
+  const main = firstRun() ? `<section class="mainline-wrap" id="ov-main" aria-label="Main line">${mainlineHTML()}</section>` : '';
   const load = `<section class="card pad load" aria-labelledby="load-title">
       <div class="load-head"><h2 class="label" id="load-title">Load · last 60 min</h2><dl class="stats" id="figures">${figuresHTML()}</dl></div>
       <div class="bars" id="bars">${barsHTML()}</div>
@@ -992,28 +992,42 @@ function snippet(kind) {
   }
 }
 
-function setupOpen() {
-  if (S.setup) return S.setup === 'open';
-  // Until the first request arrives, show how to connect.
-  return !S.overview.totals.requests;
+// Until this browser has seen Fusebox serve a request, the overview opens with the main
+// line and how to connect a client. After that they live in Config, Clients.
+function firstRun() {
+  if (!S.served && S.overview.totals.requests) {
+    S.served = true;
+    store.set('served', '1');
+  }
+  return !S.served;
+}
+
+// The main line leaves the overview when the first request arrives.
+function patchMainline() {
+  if (firstRun()) patch('ov-main', mainlineHTML);
+  else $('#ov-main')?.remove();
+}
+
+const copyBtn = (text, label, note) => `<button class="icon-btn copy" type="button" data-act="copy" data-text="${esc(text)}" data-toast="${note}" aria-label="${label}" title="${label}">${ICON.copy}</button>`;
+
+// The endpoint and the first client key: the overview's main line and Config, Clients.
+function connectItemsHTML() {
+  const key = S.overview.client_keys[0];
+  return `<div class="ml-item"><span class="k">Endpoint</span><span class="v" title="${esc(location.origin)}">${esc(location.origin)}</span>${copyBtn(location.origin, 'Copy endpoint', 'Endpoint copied')}</div>
+      <div class="ml-item">${key
+        ? `<span class="k">Key</span><span class="v">${esc(secret(key))}</span>${copyBtn(key, 'Copy client key', 'Key copied')}`
+        : '<span class="k">Key</span><span class="v" style="font-family:var(--sans);font-size:13px;color:var(--fg-2)">None required</span>'}</div>`;
 }
 
 function mainlineHTML() {
-  const o = S.overview;
-  const key = o.client_keys[0];
-  const open = setupOpen();
-  const copyBtn = (text, label, note) => `<button class="icon-btn copy" type="button" data-act="copy" data-text="${esc(text)}" data-toast="${note}" aria-label="${label}" title="${label}">${ICON.copy}</button>`;
-  const toggle = `<button class="setup-toggle" type="button" data-act="toggle-setup" aria-expanded="${open}" aria-controls="ov-setup"><span>Set up a client</span>${ICON.chevron}</button>`;
+  const setup = (cls) => `<div class="${cls}" id="client-setup">${setupHTML()}</div>`;
   return `<div class="card mainline-card"><div class="mainline">
       <span class="label">Main line</span>
-      <div class="ml-item"><span class="k">Endpoint</span><span class="v" title="${esc(location.origin)}">${esc(location.origin)}</span>${copyBtn(location.origin, 'Copy endpoint', 'Endpoint copied')}</div>
-      <div class="ml-item">${key
-        ? `<span class="k">Key</span><span class="v">${esc(secret(key))}</span>${copyBtn(key, 'Copy client key', 'Key copied')}`
-        : '<span class="k">Key</span><span class="v" style="font-family:var(--sans);font-size:13px;color:var(--fg-2)">None required</span>'}</div>
-      <div class="ml-item"><span class="k">Models</span><span class="v">${o.models}</span></div>
-      <span class="grow"></span>${mob() ? '' : toggle}
-    </div>${mob() ? toggle : ''}${mob() && open ? `<div class="setup" id="ov-setup">${setupHTML()}</div>` : ''}</div>
-    ${!mob() && open ? `<div class="card setup" id="ov-setup">${setupHTML()}</div>` : ''}`;
+      ${connectItemsHTML()}
+      <div class="ml-item"><span class="k">Models</span><span class="v">${S.overview.models}</span></div>
+    </div>${mob() ? setup('setup') : ''}</div>
+    ${mob() ? '' : setup('card setup')}
+    <p class="ml-later">After the first request this moves to <a class="linkbtn" href="#/config/clients">Config, Clients</a>.</p>`;
 }
 
 function setupHTML() {
@@ -1164,7 +1178,8 @@ function reqLineHTML(r) {
 function recentHTML() {
   const rows = S.requests.slice(0, 6);
   if (!rows.length) {
-    return '<div class="card table"><div class="empty" style="border-top:0"><h3>No requests yet</h3><p>Point a client at the endpoint above and requests will show up here as they happen.</p></div></div>';
+    const how = firstRun() ? 'Point a client at the endpoint above' : 'Point a client at Fusebox (<a class="linkbtn" href="#/config/clients">set up a client</a>)';
+    return `<div class="card table"><div class="empty" style="border-top:0"><h3>No requests yet</h3><p>${how} and requests will show up here as they happen.</p></div></div>`;
   }
   if (mob()) return `<div class="card lines">${rows.map(reqLineHTML).join('')}</div>`;
   return `<div class="card table flat recent" role="table" aria-label="Latest requests">
@@ -1365,11 +1380,8 @@ function runPalette(i) {
     case 'quota': return setQuotaDisplay(S.quotaDisplay === 'used' ? 'remaining' : 'used');
     case 'privacy': return togglePrivacy();
     case 'client':
-      S.setup = 'open';
-      store.set('setup', 'open');
-      if (S.route !== 'overview') location.hash = '#/overview';
-      else patch('ov-main', mainlineHTML);
-      return setTimeout(() => $('#ov-setup')?.scrollIntoView({ block: 'nearest' }), 50);
+      location.hash = '#/config/clients';
+      return;
     case 'copyurl': return copyText(location.origin).then(() => toast('Endpoint copied'));
     case 'clear': return accountAction('reset', it.id).then(() => toast('Cooldowns cleared'));
   }
@@ -2807,11 +2819,7 @@ document.addEventListener('click', (e) => {
     case 'snippet':
       S.snippet = id;
       store.set('snippet', id);
-      return patch('ov-main', mainlineHTML);
-    case 'toggle-setup':
-      S.setup = setupOpen() ? 'closed' : 'open';
-      store.set('setup', S.setup);
-      return patch('ov-main', mainlineHTML);
+      return patch('client-setup', setupHTML);
     case 'start-login':
       if (S.panel === el.dataset.provider && S.login && S.login.status === 'pending') return;
       return startLogin(el.dataset.provider);
