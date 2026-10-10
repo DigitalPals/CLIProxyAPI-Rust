@@ -18,10 +18,10 @@ pub const CC_VERSION: &str = "2.1.295";
 pub const CC_USER_AGENT: &str = "claude-cli/2.1.295 (external, cli)";
 const CC_IDENTITY: &str = "You are Claude Code, Anthropic's official CLI for Claude.";
 const CC_FINGERPRINT_SALT: &str = "59cf53e54c78";
-pub const CODEX_USER_AGENT: &str = "codex-tui/0.162.0 (Mac OS 26.5.2; arm64) iTerm.app/3.6.11 (codex-tui; 0.162.0)";
+pub const CODEX_USER_AGENT: &str = "codex-tui/0.162.1 (Mac OS 26.5.2; arm64) iTerm.app/3.6.11 (codex-tui; 0.162.1)";
 pub const CODEX_ORIGINATOR: &str = "codex-tui";
 /// The Codex release `CODEX_USER_AGENT` claims; its model list depends on it.
-pub const CODEX_VERSION: &str = "0.162.0";
+pub const CODEX_VERSION: &str = "0.162.1";
 pub const CODEX_WS_BETA: &str = "responses_websockets=2026-02-06";
 
 pub struct Prepared {
