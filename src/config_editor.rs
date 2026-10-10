@@ -1018,6 +1018,70 @@ mod tests {
     }
 
     #[test]
+    fn named_clients_round_trip_in_both_layouts() {
+        let whombat = json!({"id": "whombat-cybex", "label": "Whombat · Cybex BV", "key": "wbgw_secret"});
+        let laptop = json!({"id": "laptop", "label": "Laptop", "key": "fbx_laptop"});
+        for source in [
+            crate::config::template(),
+            "# flat\nport: 8317\napi-keys: [\"fbx_shared\"]\n".to_string(),
+            "# v8\nconfig-version: 8\naccess:\n  api-keys: [\"fbx_shared\"]\napi-keys:\n  claude:\n    - keys:\n        - api-key: sk-ant # upstream key\n".to_string(),
+        ] {
+            let before = Config::parse(&source).unwrap();
+            let first_line = source.lines().next().unwrap();
+            let (out, cfg) = edit(&source, json!({"named-clients": [whombat]}));
+            assert_eq!(cfg.named_clients.len(), 1);
+            assert_eq!(cfg.named_clients[0].label, "Whombat · Cybex BV");
+            assert_eq!(values(&out).unwrap()["named-clients"], json!([whombat]));
+            assert!(yaml(&out).unwrap()["named-clients"].is_sequence(), "named-clients stays at the top level");
+            let (out, cfg) = edit(&out, json!({"named-clients": [whombat, laptop]}));
+            assert_eq!(cfg.named_clients.iter().map(|c| c.id.as_str()).collect::<Vec<_>>(), ["whombat-cybex", "laptop"]);
+            let (out, cfg) = edit(&out, json!({"named-clients": [laptop]}));
+            assert_eq!(cfg.named_clients.len(), 1);
+            assert_eq!(cfg.named_clients[0].key, "fbx_laptop");
+            let (out, cfg) = edit(&out, json!({"named-clients": []}));
+            assert!(cfg.named_clients.is_empty());
+            // Nothing else moved, and the file kept its comments.
+            assert_eq!(cfg.api_keys, before.api_keys);
+            assert_eq!(cfg.claude_api_key.len(), before.claude_api_key.len());
+            assert!(out.starts_with(first_line));
+            if source.contains("config-version") {
+                assert_eq!(cfg.claude_api_key[0].api_key, "sk-ant");
+                assert!(out.contains("# upstream key"));
+                assert!(yaml(&out).unwrap()["api-keys"].is_mapping());
+            }
+        }
+    }
+
+    #[test]
+    fn removing_a_named_client_keeps_the_others_and_their_comments() {
+        let source = "named-clients:\n  - id: laptop # my laptop\n    label: Laptop\n    key: fbx_one\n  - id: whombat-cybex # added by Whombat\n    label: Whombat · Cybex BV\n    key: wbgw_two\n";
+        let mut list = values(source).unwrap()["named-clients"].clone();
+        list.as_array_mut().unwrap().remove(0);
+        let (out, cfg) = edit(source, json!({"named-clients": list}));
+        assert_eq!(cfg.named_clients.len(), 1);
+        assert_eq!(cfg.named_clients[0].id, "whombat-cybex");
+        assert_eq!(cfg.named_clients[0].key, "wbgw_two");
+        assert!(out.contains("# added by Whombat"));
+        assert!(!out.contains("# my laptop"));
+    }
+
+    #[test]
+    fn invalid_named_clients_are_rejected() {
+        let source = "named-clients:\n  - id: laptop\n    label: Laptop\n    key: fbx_one\n";
+        let laptop = json!({"id": "laptop", "label": "Laptop", "key": "fbx_one"});
+        for bad in [
+            json!([laptop, {"id": "laptop", "label": "Again", "key": "fbx_two"}]),
+            json!([{"id": "tool", "label": "Tool", "key": ""}]),
+            json!([{"id": "", "label": "Tool", "key": "fbx_two"}]),
+            json!([{"id": "tool", "label": "Tool", "key": "fbxc_collector"}]),
+            json!([{"id": "tool", "label": "Tool", "key": "fbx_two", "extra": true}]),
+            json!("laptop"),
+        ] {
+            assert!(apply(source, json!({"named-clients": bad}).as_object().unwrap()).is_err(), "{bad}");
+        }
+    }
+
+    #[test]
     fn model_rows_keep_their_hidden_properties_when_other_rows_are_removed() {
         let source = "claude-api-key:\n  - api-key: upstream\n    models:\n      - name: first\n        vendor-option: one\n      - name: second\n        vendor-option: two\n";
         let mut keys = values(source).unwrap()["claude-api-key"].clone();

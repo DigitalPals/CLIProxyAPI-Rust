@@ -274,6 +274,8 @@ Retiring an older Redis-based usage collector requires a compatible replacement 
 
 The dashboard's Config page starts with **Clients**, the endpoint and key with copyable setup for Claude Code, Codex, the OpenAI SDK and curl, then has forms for server and access settings, routing, connections, provider keys, model rules and diagnostics, plus a **YAML file** section for everything else. Keys stay masked until revealed, and leaving an existing key blank keeps it unchanged. If the file changes elsewhere while you edit, the page asks you to reload before saving. Bind address, port, HTTPS and debug logging changes need a restart; the page shows which are pending.
 
+**Named clients** (`named-clients`) give each tool its own key and a label, so the Usage page shows which tool sent what. Add and remove them under Config, Clients; other tools, such as Whombat, can add their own with the management key.
+
 ```yaml
 host: "127.0.0.1"             # 0.0.0.0 to expose it (set api-keys first)
 port: 8317

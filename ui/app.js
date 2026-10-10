@@ -72,7 +72,7 @@ const S = {
   push: { loaded: false, loading: false, status: null, endpoint: null, busy: false, msg: null }, // Config, Notifications
   config: { values: null, saved: null, defaults: {}, revision: '', path: '', ignored: [], restart_fields: [],
     msg: null, busy: false, loading: false, section: 'clients', provider: 'claude', oauthProvider: 'claude',
-    errors: {}, opens: {}, secrets: {}, reloadConfirm: false, reveal: false, raw: { text: null, saved: null, loading: false } },
+    errors: {}, opens: {}, secrets: {}, reloadConfirm: false, reveal: false, raw: { text: null, saved: null, loading: false }, named: namedIdle() },
 };
 
 const PROVIDER = {
@@ -958,7 +958,9 @@ function ovOtherHTML() {
 function snippet(kind) {
   const origin = location.origin;
   const key = S.overview.client_keys[0];
-  const token = key || 'fbx_local';
+  // Without a shared key, named clients still need their own, so the snippet asks for one.
+  const named = !key && S.overview.named_clients > 0;
+  const token = key || (named ? 'your-client-key' : 'fbx_local');
   const shown = key ? secret(key) : token; // what the page shows; copy gets the real token
   const pick = (prefix, fallback) => (S.models.find((m) => m.id.startsWith(prefix)) || {}).id || fallback;
   const any = (S.models[0] || {}).id || 'claude-sonnet-5-5';
@@ -967,15 +969,15 @@ function snippet(kind) {
   switch (kind) {
     case 'codex':
       return {
-        text: `# ~/.codex/config.toml\nmodel = "${pick('gpt-', 'gpt-6-astra')}"\nmodel_provider = "fusebox"\n\n[model_providers.fusebox]\nname = "Fusebox"\nbase_url = "${origin}/v1"\nwire_api = "responses"${key ? '\nenv_key = "FUSEBOX_KEY"' : ''}`,
-        html: `${k('# ~/.codex/config.toml')}\nmodel = ${v(`"${pick('gpt-', 'gpt-6-astra')}"`)}\nmodel_provider = ${v('"fusebox"')}\n\n[model_providers.fusebox]\nname = ${v('"Fusebox"')}\nbase_url = ${v(`"${origin}/v1"`)}\nwire_api = ${v('"responses"')}${key ? `\nenv_key = ${v('"FUSEBOX_KEY"')}` : ''}`,
-        note: `${key ? 'Then export FUSEBOX_KEY with your key. ' : ''}Both HTTP and websocket transports work, and any model your accounts serve can be used.`,
+        text: `# ~/.codex/config.toml\nmodel = "${pick('gpt-', 'gpt-6-astra')}"\nmodel_provider = "fusebox"\n\n[model_providers.fusebox]\nname = "Fusebox"\nbase_url = "${origin}/v1"\nwire_api = "responses"${key || named ? '\nenv_key = "FUSEBOX_KEY"' : ''}`,
+        html: `${k('# ~/.codex/config.toml')}\nmodel = ${v(`"${pick('gpt-', 'gpt-6-astra')}"`)}\nmodel_provider = ${v('"fusebox"')}\n\n[model_providers.fusebox]\nname = ${v('"Fusebox"')}\nbase_url = ${v(`"${origin}/v1"`)}\nwire_api = ${v('"responses"')}${key || named ? `\nenv_key = ${v('"FUSEBOX_KEY"')}` : ''}`,
+        note: `${key || named ? 'Then export FUSEBOX_KEY with your key. ' : ''}Both HTTP and websocket transports work, and any model your accounts serve can be used.`,
       };
     case 'sdk':
       return {
         text: `from openai import OpenAI\n\nclient = OpenAI(base_url="${origin}/v1", api_key="${token}")\nreply = client.chat.completions.create(\n    model="${any}",\n    messages=[{"role": "user", "content": "Hello"}],\n)`,
         html: `from openai import OpenAI\n\nclient = OpenAI(base_url=${v(`"${origin}/v1"`)}, api_key=${v(`"${shown}"`)})\nreply = client.chat.completions.create(\n    model=${v(`"${any}"`)},\n    messages=[{"role": "user", "content": "Hello"}],\n)`,
-        note: `Any model works with any client format; Fusebox translates between OpenAI, Anthropic and Gemini.${key ? '' : ' No key is required, so any value works.'}`,
+        note: `Any model works with any client format; Fusebox translates between OpenAI, Anthropic and Gemini.${key || named ? '' : ' No key is required, so any value works.'}`,
       };
     case 'curl':
       return {
@@ -1016,7 +1018,7 @@ function connectItemsHTML() {
   return `<div class="ml-item"><span class="k">Endpoint</span><span class="v" title="${esc(location.origin)}">${esc(location.origin)}</span>${copyBtn(location.origin, 'Copy endpoint', 'Endpoint copied')}</div>
       <div class="ml-item">${key
         ? `<span class="k">Key</span><span class="v">${esc(secret(key))}</span>${copyBtn(key, 'Copy client key', 'Key copied')}`
-        : '<span class="k">Key</span><span class="v" style="font-family:var(--sans);font-size:13px;color:var(--fg-2)">None required</span>'}</div>`;
+        : `<span class="k">Key</span><span class="v" style="font-family:var(--sans);font-size:13px;color:var(--fg-2)">${S.overview.named_clients > 0 ? 'Each named client\u2019s own' : 'None required'}</span>`}</div>`;
 }
 
 function mainlineHTML() {
@@ -2986,7 +2988,7 @@ function onRoute() {
   }
   if (route === 'config') {
     if (S.sub && CONFIG_SECTIONS.some(([id]) => id === S.sub) && !(S.config.section === 'yaml' && S.sub !== 'yaml' && rawDirty())) S.config.section = S.sub;
-  } else Object.assign(S.config, { msg: null, reveal: false });
+  } else Object.assign(S.config, { msg: null, reveal: false, named: namedIdle() });
   render();
   if (route === 'accounts' && !S.sub && S.panel === 'key') $('#acct-panel input')?.focus();
   view.focus({ preventScroll: true });
