@@ -4,7 +4,7 @@
     {
       "id": "claude-code",
       "name": "Claude Code",
-      "version": "2.1.295",
+      "version": "2.1.296",
       "source": { "kind": "npm", "package": "@anthropic-ai/claude-code" },
       "where": "src/upstream.rs: CC_VERSION, CC_USER_AGENT; check the anthropic-beta list, x-stainless-* headers, cloak_body and the billing header",
       "notes": "https://github.com/anthropics/claude-code/blob/main/CHANGELOG.md"

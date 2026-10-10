@@ -14,8 +14,8 @@ pub const CODEX_BACKEND: &str = "https://chatgpt.com/backend-api/codex";
 pub const OPENAI_API: &str = "https://api.openai.com/v1";
 pub const GEMINI_API: &str = "https://generativelanguage.googleapis.com";
 
-pub const CC_VERSION: &str = "2.1.295";
-pub const CC_USER_AGENT: &str = "claude-cli/2.1.295 (external, cli)";
+pub const CC_VERSION: &str = "2.1.296";
+pub const CC_USER_AGENT: &str = "claude-cli/2.1.296 (external, cli)";
 const CC_IDENTITY: &str = "You are Claude Code, Anthropic's official CLI for Claude.";
 const CC_FINGERPRINT_SALT: &str = "59cf53e54c78";
 pub const CODEX_USER_AGENT: &str = "codex-tui/0.162.0 (Mac OS 26.5.2; arm64) iTerm.app/3.6.11 (codex-tui; 0.162.0)";
@@ -878,7 +878,7 @@ mod tests {
     }
 
     #[test]
-    fn claude_generated_requests_match_2_1_295_identity() {
+    fn claude_generated_requests_match_2_1_296_identity() {
         let acct = claude_account();
         *acct.cred.write() = Credential::OAuth(crate::accounts::OAuth {
             access_token: "test".into(),
@@ -908,12 +908,12 @@ mod tests {
         );
         assert_eq!(
             prepared.headers.iter().find(|(name, _)| name == "user-agent").unwrap().1,
-            "claude-cli/2.1.295 (external, cli)"
+            "claude-cli/2.1.296 (external, cli)"
         );
-        // 3bd is the fingerprint captured from the published 2.1.295 client for "Reply OK".
+        // 9f1 is the fingerprint captured from the published 2.1.296 client for "Reply OK".
         assert_eq!(
             prepared.body["system"][0]["text"],
-            "x-anthropic-billing-header: cc_version=2.1.295.3bd; cc_entrypoint=cli;"
+            "x-anthropic-billing-header: cc_version=2.1.296.9f1; cc_entrypoint=cli;"
         );
     }
 
