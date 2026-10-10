@@ -5,7 +5,7 @@ const CONFIG_SECTIONS = [
   ['providers', 'Providers'], ['models', 'Model rules'], ['notifications', 'Notifications'], ['diagnostics', 'Diagnostics'], ['yaml', 'YAML file'],
 ];
 const CONFIG_DESCRIPTIONS = {
-  clients: 'The endpoint and key your tools use, and how to set each one up.',
+  clients: 'The endpoint and keys your tools use, and how to set each one up.',
   server: 'Where Fusebox listens and where it keeps sign-in files.',
   access: 'Who can use the proxy and the dashboard.',
   routing: 'How Fusebox picks an account for each request.',
@@ -149,17 +149,152 @@ function configHeaders(path) {
       <button type="button" class="btn danger" data-config-act="remove-header" data-path="${configPath(path)}" data-key="${esc(key)}" aria-label="Remove ${esc(key)} header">Remove</button></div>`).join('') || '<p class="cfg-empty">No extra headers configured.</p>'}</div>`;
 }
 
-// Nothing to edit here: client keys are set under Access.
+// Shared client keys are set under Access; named clients are added and removed here, saved at once.
 function configClientsHTML() {
   const keys = S.overview.client_keys;
+  const named = (configGet(['named-clients']) || []).length;
   const access = '<button type="button" class="linkbtn" data-config-act="section" data-section="access">Access</button>';
   const help = keys.length
     ? `Clients send ${keys.length > 1 ? 'this or another client key' : 'this key'} as their API key. Add or replace keys under ${access}.`
-    : `Any client that can reach the endpoint can use it. Add a key under ${access}.`;
+    : named ? `Each client sends its own key from Named clients below. Add a shared key under ${access}.`
+      : `Any client that can reach the endpoint can use it. Add a key under ${access}.`;
   return `<div class="cfg-clients">${connectItemsHTML()}<p class="cfg-description">${help}</p></div>
     <div class="cfg-divider"></div>
-    <div class="setup" id="client-setup">${setupHTML()}</div>`;
+    <div class="setup" id="client-setup">${setupHTML()}</div>
+    <div class="cfg-divider"></div>
+    <div class="cfg-list" id="named-clients">${namedClientsHTML()}</div>`;
 }
+
+// Named clients: a key per tool, so the Usage page can tell them apart. Other tools
+// (Whombat, for one) add their own through the same settings API.
+const namedIdle = () => ({ adding: false, label: '', error: '', confirm: null, created: null, shown: {} });
+
+// "Whombat · Cybex BV" → "whombat-cybex-bv": lowercase letters, digits and dashes, at most 40, not taken.
+function namedClientId(label, taken) {
+  const base = String(label).normalize('NFKD').replace(/[̀-ͯ]/g, '').toLowerCase()
+    .replace(/[^a-z0-9]+/g, '-').replace(/^-|-$/g, '').slice(0, 40).replace(/-$/, '') || 'client';
+  let id = base;
+  for (let n = 2; taken.includes(id); n++) id = `${base.slice(0, 39 - String(n).length).replace(/-$/, '')}-${n}`;
+  return id;
+}
+
+const namedName = (client) => (S.private ? '••••••' : client.label || client.id);
+
+function namedClientsHTML() {
+  const c = S.config;
+  const n = c.named;
+  const list = configGet(['named-clients']) || [];
+  const shared = (configGet(['api-keys']) || []).length > 0;
+  const off = c.busy ? ' disabled' : '';
+  const row = (client) => {
+    const name = esc(namedName(client));
+    const id = esc(client.id);
+    const shown = !S.private && n.shown[client.id];
+    const key = S.private ? secret(client.key) : shown ? client.key : configMask(client.key);
+    const confirming = n.confirm === client.id;
+    const last = list.length === 1 && !shared; // removing it turns client keys off
+    return `<div class="named-row"><span class="cell2"><span>${name}</span>${S.private ? '' : `<span class="mono">${id}</span>`}</span>
+      <span class="named-key"><span class="mono">${esc(key)}</span>
+        ${S.private ? '' : `<button type="button" class="btn sm ghost" data-config-act="named-reveal" data-id="${id}" aria-label="${shown ? 'Hide' : 'Show'} the key for ${name}">${shown ? 'Hide' : 'Show'}</button>`}
+        ${copyBtn(client.key, `Copy the key for ${name}`, 'Key copied')}</span>
+      ${confirming ? '' : `<button type="button" class="btn sm danger" data-config-act="named-remove" data-id="${id}" aria-label="Remove ${name}"${off}>Remove</button>`}</div>
+      ${confirming ? `<div class="named-confirm${last ? ' keyless' : ''}" role="alert"><span>Remove ${name}? Tools using its key stop working.${last ? ' Fusebox will accept requests without a key again.' : ''}</span>
+        <div class="named-actions"><button type="button" class="btn sm ghost" data-config-act="named-keep" data-id="${id}"${off}>Keep</button><button type="button" class="btn sm danger" data-config-act="named-confirm" data-id="${id}"${off}>${c.busy ? 'Removing…' : 'Remove'}</button></div></div>` : ''}`;
+  };
+  const created = list.find((client) => client.id === n.created);
+  const preview = n.label.trim() ? namedClientId(n.label.trim(), list.map((client) => client.id)) : '';
+  const form = `<form class="named-add" id="named-add" novalidate>
+      <div class="field"><label for="named-label">Name</label>
+        <input id="named-label" type="${S.private ? 'password' : 'text'}" value="${esc(n.label)}" placeholder="${S.private ? 'Name hidden' : 'Work laptop'}" maxlength="100" autocomplete="off" style="font-family:var(--sans)" aria-describedby="named-label-help named-label-error"${n.error ? ' aria-invalid="true"' : ''}${off}>
+        <small id="named-label-help">Shown on the Usage page.${S.private ? '' : `<span id="named-id-line"${preview ? '' : ' hidden'}> Id: <span class="mono" id="named-id">${esc(preview)}</span></span>`}${list.length || shared ? '' : '<br>After this, Fusebox only accepts requests with a key.'}</small>
+        <small id="named-label-error" class="cfg-error" data-error-for="named-label">${esc(n.error)}</small></div>
+      <div class="named-actions"><button type="submit" class="btn primary"${off}>${c.busy ? 'Adding…' : 'Add client'}</button><button type="button" class="btn ghost" data-config-act="named-cancel"${off}>Cancel</button></div></form>`;
+  return `${configListHead('Named clients', 'A key per tool, so the Usage page shows each one by name. Some tools, such as Whombat, add their own.', 'Add client', `data-config-act="named-add" aria-expanded="${n.adding}"${off}`)}
+    ${created ? `<div class="named-new" role="status"><span>Key for ${esc(namedName(created))}</span><span class="meta">Copy it into the tool. It works right away.</span>
+      <span class="named-key"><span class="mono">${esc(S.private ? secret(created.key) : created.key)}</span>${copyBtn(created.key, `Copy the key for ${esc(namedName(created))}`, 'Key copied')}</span>
+      <div class="named-actions"><button type="button" class="btn sm ghost" data-config-act="named-done">Done</button></div></div>` : ''}
+    ${n.adding ? form : ''}
+    ${list.length ? `<div class="named-list">${list.map(row).join('')}</div>` : '<p class="cfg-empty">No named clients yet.</p>'}`;
+}
+
+// Other sections' unsaved edits would be lost when this saves, so one kind of edit at a time.
+function namedBlocked() {
+  if (!configDirty()) return false;
+  S.config.msg = { kind: 'err', text: 'Save or discard the changes in the other sections first.' };
+  configUpdateFoot();
+  return true;
+}
+
+async function saveNamedClients(list, text, onSaved) {
+  const c = S.config;
+  c.busy = true; c.msg = null; render();
+  try {
+    const result = await configPatch({ 'named-clients': list });
+    onSaved();
+    c.msg = { kind: 'ok', text: configSavedText(result, text) };
+    refreshAccounts();
+  } catch (e) { c.msg = { kind: 'err', text: e.message }; }
+  c.busy = false; render();
+}
+
+async function addNamedClient() {
+  const n = S.config.named;
+  const label = n.label.trim();
+  if (S.config.busy || namedBlocked()) return;
+  if (!label) {
+    n.error = 'Enter a name.';
+    render(); $('#named-label')?.focus(); return;
+  }
+  const list = configGet(['named-clients']) || [];
+  const client = { id: namedClientId(label, list.map((x) => x.id)), label, key: generateClientKey() };
+  await saveNamedClients([...configClone(list), client], `Added ${namedName(client)}.`,
+    () => Object.assign(S.config.named, { adding: false, label: '', error: '', created: client.id }));
+  if (S.config.named.created === client.id) $('.named-new .copy')?.focus();
+}
+
+async function removeNamedClient(id) {
+  const list = configGet(['named-clients']) || [];
+  const client = list.find((x) => x.id === id);
+  if (!client || namedBlocked()) return;
+  await saveNamedClients(list.filter((x) => x !== client), `Removed ${namedName(client)}.`,
+    () => Object.assign(S.config.named, { confirm: null, created: null }));
+  if (!S.config.named.confirm) $('[data-config-act="named-add"]')?.focus();
+}
+
+function namedAction(act, id) {
+  const n = S.config.named;
+  const focus = (selector) => $(selector)?.focus();
+  const byId = (a) => `[data-config-act="${a}"][data-id="${CSS.escape(id)}"]`;
+  if (act === 'named-add') {
+    if (namedBlocked()) return;
+    Object.assign(n, { adding: true, confirm: null, error: '' }); render(); return focus('#named-label');
+  }
+  if (act === 'named-cancel') { Object.assign(n, { adding: false, label: '', error: '' }); render(); return focus('[data-config-act="named-add"]'); }
+  if (act === 'named-done') { n.created = null; render(); return focus('[data-config-act="named-add"]'); }
+  if (act === 'named-reveal') { n.shown[id] = !n.shown[id]; render(); return focus(byId('named-reveal')); }
+  if (act === 'named-remove') {
+    if (namedBlocked()) return;
+    Object.assign(n, { confirm: id, created: null }); render(); return focus(byId('named-keep'));
+  }
+  if (act === 'named-keep') { n.confirm = null; render(); return focus(byId('named-remove')); }
+  if (act === 'named-confirm') return removeNamedClient(id);
+}
+
+document.addEventListener('submit', (e) => {
+  if (e.target.id !== 'named-add') return;
+  e.preventDefault();
+  addNamedClient();
+});
+document.addEventListener('input', (e) => {
+  if (e.target.id !== 'named-label') return;
+  const n = S.config.named;
+  n.label = e.target.value;
+  if (n.error) { n.error = ''; e.target.removeAttribute('aria-invalid'); $('#named-label-error').textContent = ''; }
+  const label = n.label.trim();
+  const out = $('#named-id');
+  if (out) out.textContent = label ? namedClientId(label, (configGet(['named-clients']) || []).map((x) => x.id)) : '';
+  $('#named-id-line')?.toggleAttribute('hidden', !label);
+});
 
 function configServerHTML() {
   const tls = !!configGet(['tls', 'enable']);
@@ -407,7 +542,7 @@ function acceptConfig(result) {
   const c = S.config;
   Object.assign(c, { values: result.values, saved: configClone(result.values), defaults: result.defaults, revision: result.revision,
     path: result.path, ignored: result.ignored || [], restart_fields: result.restart_fields || [], errors: {}, secrets: {}, reloadConfirm: false,
-    raw: { text: null, saved: null, loading: false } });
+    raw: { text: null, saved: null, loading: false }, named: { ...c.named, confirm: null } });
 }
 
 async function loadConfig() {
@@ -516,6 +651,20 @@ function configValidate() {
   return true;
 }
 
+// Sends changes with the revision they were made against; the server refuses (409) if the file moved on.
+async function configPatch(changes) {
+  const result = await api('/config/settings', { method: 'PATCH', body: JSON.stringify({ revision: S.config.revision, changes }) });
+  acceptConfig(result);
+  // The main line and Clients read the keys from the overview; keep them current until it refreshes.
+  Object.assign(S.overview, { client_keys: result.values['api-keys'] || [], named_clients: (result.values['named-clients'] || []).length });
+  return result;
+}
+
+function configSavedText(result, text = 'Saved and applied.') {
+  return [result.restart_required ? 'Saved. Some changes need a server restart.' : text,
+    result.rewritten ? 'This file\'s layout couldn\'t be kept, so its comments were removed; the original is in config.yaml.bak.' : ''].filter(Boolean).join(' ');
+}
+
 async function saveConfig() {
   const c = S.config;
   if (c.section === 'yaml') return saveRawConfig();
@@ -525,10 +674,8 @@ async function saveConfig() {
   const newKey = c.values['management-key'];
   c.busy = true; c.msg = null; render();
   try {
-    const result = await api('/config/settings', { method: 'PATCH', body: JSON.stringify({ revision: c.revision, changes }) });
-    acceptConfig(result);
-    c.msg = { kind: 'ok', text: [result.restart_required ? 'Saved. Some changes need a server restart.' : 'Saved and applied.',
-      result.rewritten ? 'This file\'s layout couldn\'t be kept, so its comments were removed; the original is in config.yaml.bak.' : ''].filter(Boolean).join(' ') };
+    const result = await configPatch(changes);
+    c.msg = { kind: 'ok', text: configSavedText(result) };
     // A newly configured dashboard key must also authenticate this browser's next request.
     if (oldKey !== newKey) {
       S.key = newKey;
@@ -626,6 +773,7 @@ document.addEventListener('click', (e) => {
   const path = button.dataset.path ? JSON.parse(button.dataset.path) : null;
   if (act === 'save') return saveConfig();
   if (act === 'discard') return discardConfig();
+  if (act.startsWith('named-')) return namedAction(act, button.dataset.id);
   if (act === 'reload') {
     if (configDirty() || rawDirty()) { c.reloadConfirm = true; render(); return; }
     return loadConfig();

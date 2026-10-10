@@ -72,7 +72,7 @@ const S = {
   push: { loaded: false, loading: false, status: null, endpoint: null, busy: false, msg: null }, // Config, Notifications
   config: { values: null, saved: null, defaults: {}, revision: '', path: '', ignored: [], restart_fields: [],
     msg: null, busy: false, loading: false, section: 'clients', provider: 'claude', oauthProvider: 'claude',
-    errors: {}, opens: {}, secrets: {}, reloadConfirm: false, reveal: false, raw: { text: null, saved: null, loading: false } },
+    errors: {}, opens: {}, secrets: {}, reloadConfirm: false, reveal: false, raw: { text: null, saved: null, loading: false }, named: namedIdle() },
 };
 
 const PROVIDER = {
@@ -2988,7 +2988,7 @@ function onRoute() {
   }
   if (route === 'config') {
     if (S.sub && CONFIG_SECTIONS.some(([id]) => id === S.sub) && !(S.config.section === 'yaml' && S.sub !== 'yaml' && rawDirty())) S.config.section = S.sub;
-  } else Object.assign(S.config, { msg: null, reveal: false });
+  } else Object.assign(S.config, { msg: null, reveal: false, named: namedIdle() });
   render();
   if (route === 'accounts' && !S.sub && S.panel === 'key') $('#acct-panel input')?.focus();
   view.focus({ preventScroll: true });
