@@ -43,7 +43,7 @@
     {
       "id": "antigravity",
       "name": "Antigravity",
-      "version": "2.21.1",
+      "version": "2.22.0",
       "source": { "kind": "yaml-line", "url": "https://antigravity-hub-auto-updater-974169037036.us-central1.run.app/manifest/latest-arm64-mac.yml", "key": "version" },
       "where": "src/antigravity.rs: FALLBACK_VERSION (Fusebox reads the current version from this manifest at runtime; the constant is only its fallback)"
     }

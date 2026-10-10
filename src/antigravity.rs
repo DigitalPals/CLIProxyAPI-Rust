@@ -28,7 +28,7 @@ pub const SCOPES: &str = "https://www.googleapis.com/auth/cloud-platform https:/
 pub const BASE_DAILY: &str = "https://daily-cloudcode-pa.googleapis.com";
 pub const BASE_PROD: &str = "https://cloudcode-pa.googleapis.com";
 
-pub(crate) const FALLBACK_VERSION: &str = "2.21.1";
+pub(crate) const FALLBACK_VERSION: &str = "2.22.0";
 const MANIFEST_URL: &str =
     "https://antigravity-hub-auto-updater-974169037036.us-central1.run.app/manifest/latest-arm64-mac.yml";
 const NODE_CLIENT: &str = "google-api-nodejs-client/10.3.0";
@@ -337,6 +337,11 @@ pub fn unwrap(v: Value) -> Value {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn fallback_user_agent_matches_the_current_release() {
+        assert_eq!(user_agent(), "antigravity/hub/2.22.0 darwin/arm64");
+    }
 
     #[test]
     fn envelope_wraps_and_cleans() {
