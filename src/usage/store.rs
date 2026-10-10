@@ -31,6 +31,8 @@ type Job = Box<dyn FnOnce(&mut Connection) + Send>;
 enum Command {
     Observe(Box<Observation>),
     Call(Job),
+    /// Leave the worker loop, close the connection, then reply.
+    Stop(oneshot::Sender<std::result::Result<(), String>>),
 }
 #[derive(Default)]
 struct Health {
@@ -260,14 +262,14 @@ impl Store {
             .name("fusebox-usage-db".into())
             .spawn(move || {
                 let mut last_retention = Utc::now().timestamp_millis();
-                loop {
+                let stop = loop {
                     let received = runtime
                         .block_on(async { tokio::time::timeout(std::time::Duration::from_secs(1), rx.recv()).await });
                     let command = match received {
                         Ok(Some(command)) => Some(command),
                         Ok(None) => {
                             let _ = persist_health(&conn, &worker_session, &worker_health);
-                            break;
+                            break None;
                         }
                         Err(_) => None,
                     };
@@ -286,6 +288,7 @@ impl Store {
                     };
                     match command {
                         Command::Call(f) => f(&mut conn),
+                        Command::Stop(reply) => break Some(reply),
                         Command::Observe(o) => {
                             let mut batch = vec![*o];
                             // Do not cross a queued durable barrier or custom transaction.
@@ -318,11 +321,21 @@ impl Store {
                             if let Err(e) = persist_health(&conn, &worker_session, &worker_health) {
                                 worker_health.fail(&e);
                             }
-                            if let Some(Command::Call(f)) = pending {
-                                f(&mut conn);
+                            match pending {
+                                Some(Command::Call(f)) => f(&mut conn),
+                                Some(Command::Stop(reply)) => break Some(reply),
+                                _ => {}
                             }
                         }
                     }
+                };
+                // Refuse later commands, then close before replying. The last connection to
+                // close checkpoints the WAL into the database file, so a shut down store must
+                // not still be writing it when the caller reads, copies or reopens the file.
+                drop(rx);
+                let closed = conn.close().map_err(|(_, e)| format!("close usage database: {e}"));
+                if let Some(reply) = stop {
+                    let _ = reply.send(closed);
                 }
             })
             .context("start usage database worker")?;
@@ -411,8 +424,9 @@ impl Store {
             .map_err(|_| anyhow!("usage writer stopped"))?;
         rx.await.context("usage writer dropped transaction reply")?
     }
-    /// Close observation ingress, drain prior commands durably, then mark this writer
-    /// clean. Concurrent shutdown callers share the same acknowledged result.
+    /// Close observation ingress, drain prior commands durably, mark this writer clean,
+    /// then stop the writer and close its connection. Once this returns the store no longer
+    /// touches the database file. Concurrent shutdown callers share the same acknowledged result.
     pub async fn shutdown(&self) -> Result<()> {
         let result = self
             .shutdown_result
@@ -423,16 +437,24 @@ impl Store {
                 }
                 let id = self.session_id.clone();
                 let health = self.health.clone();
-                self.call_internal(move |conn| {
-                    persist_health(conn, &id, &health)?;
-                    conn.execute(
-                        "UPDATE usage_writer_sessions SET clean=1,ended_at_ms=?2 WHERE id=?1",
-                        params![id.as_str(), Utc::now().timestamp_millis()],
-                    )?;
-                    Ok(())
-                })
-                .await
-                .map_err(|e| e.to_string())
+                let clean = self
+                    .call_internal(move |conn| {
+                        persist_health(conn, &id, &health)?;
+                        conn.execute(
+                            "UPDATE usage_writer_sessions SET clean=1,ended_at_ms=?2 WHERE id=?1",
+                            params![id.as_str(), Utc::now().timestamp_millis()],
+                        )?;
+                        Ok(())
+                    })
+                    .await
+                    .map_err(|e| e.to_string());
+                // Stop even when the clean mark failed: the connection must close either way.
+                let (tx, rx) = oneshot::channel();
+                let closed = match self.tx.send(Command::Stop(tx)).await {
+                    Ok(()) => rx.await.unwrap_or_else(|_| Err("usage writer stopped before closing".into())),
+                    Err(_) => Err("usage writer stopped".into()),
+                };
+                clean.and(closed)
             })
             .await;
         result.clone().map_err(|e| anyhow!(e))

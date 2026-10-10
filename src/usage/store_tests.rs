@@ -75,10 +75,8 @@ async fn collector_limit_precedes_startup_and_concurrent_open_preserves_delete_m
     }
     assert!(std::fs::metadata(&p).unwrap().len() <= limit);
     // A lower cap must reject before any catalogue/session/migration writes.
-    // Hold a shared read lock so a dropped writer's final health persistence
-    // cannot race this byte-for-byte nonmutation check.
-    let guard = Connection::open(&p).unwrap();
-    guard.execute_batch("BEGIN; SELECT COUNT(*) FROM usage_meta;").unwrap();
+    // Every writer above has shut down, which closes its connection, so nothing
+    // else can touch the file during this byte-for-byte nonmutation check.
     let before = Sha256::digest(std::fs::read(&p).unwrap());
     let error = Store::open_collector(&p, limit / 2).err().unwrap().to_string();
     assert!(error.contains("exceeds size limit"), "{error}");
@@ -599,6 +597,27 @@ async fn durable_gaps_and_unclean_or_concurrent_sessions_survive_restart() {
     store.shutdown().await.unwrap();
     let reopened = Store::open_existing(&clean, 8).unwrap();
     assert!(reopened.health()["recovery_warning"].is_null());
+    assert_eq!(reopened.health()["state"], "healthy");
+    reopened.shutdown().await.unwrap();
+}
+#[tokio::test]
+async fn shutdown_closes_the_writer_before_returning() {
+    let p = path("shutdown-closes");
+    let mut wal = p.clone().into_os_string();
+    wal.push("-wal");
+    let store = Store::open(&p, 8, 90, None).unwrap();
+    assert!(store.enqueue(event("proxy", "a")));
+    store.flush().await.unwrap();
+    assert!(std::path::Path::new(&wal).exists());
+    store.shutdown().await.unwrap();
+    // The handle is still alive, yet its connection has closed: the last close
+    // checkpointed the WAL into the database file and removed it.
+    assert!(!std::path::Path::new(&wal).exists());
+    assert!(store.call(|_| Ok(())).await.is_err());
+    assert_eq!(store.health()["state"], "stopped");
+    store.shutdown().await.unwrap();
+    let reopened = Store::open_existing(&p, 8).unwrap();
+    assert_eq!(reopened.details(all()).await.unwrap()["total"], 1);
     assert_eq!(reopened.health()["state"], "healthy");
     reopened.shutdown().await.unwrap();
 }
