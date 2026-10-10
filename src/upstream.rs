@@ -18,10 +18,10 @@ pub const CC_VERSION: &str = "2.1.295";
 pub const CC_USER_AGENT: &str = "claude-cli/2.1.295 (external, cli)";
 const CC_IDENTITY: &str = "You are Claude Code, Anthropic's official CLI for Claude.";
 const CC_FINGERPRINT_SALT: &str = "59cf53e54c78";
-pub const CODEX_USER_AGENT: &str = "codex-tui/0.161.0 (Mac OS 26.5.2; arm64) iTerm.app/3.6.11 (codex-tui; 0.161.0)";
+pub const CODEX_USER_AGENT: &str = "codex-tui/0.162.0 (Mac OS 26.5.2; arm64) iTerm.app/3.6.11 (codex-tui; 0.162.0)";
 pub const CODEX_ORIGINATOR: &str = "codex-tui";
 /// The Codex release `CODEX_USER_AGENT` claims; its model list depends on it.
-pub const CODEX_VERSION: &str = "0.161.0";
+pub const CODEX_VERSION: &str = "0.162.0";
 pub const CODEX_WS_BETA: &str = "responses_websockets=2026-02-06";
 
 pub struct Prepared {
@@ -425,9 +425,6 @@ const CODEX_STRIP: &[&str] = &[
 pub fn sanitize_codex_body(body: &mut Value, model: &str, websocket: bool) {
     body["model"] = model.into();
     body["store"] = false.into();
-    if body["instructions"].is_null() {
-        body["instructions"] = "".into();
-    }
     if let Some(o) = body.as_object_mut() {
         for k in CODEX_STRIP.iter().filter(|k| !(websocket && **k == "generate")) {
             o.remove(*k);
@@ -438,6 +435,21 @@ pub fn sanitize_codex_body(body: &mut Value, model: &str, websocket: bool) {
                 "input".into(),
                 json!([{ "type": "message", "role": "user", "content": [{ "type": "input_text", "text": text }] }]),
             );
+        }
+        // Codex 0.162 sends base instructions as developer input, on HTTP and websockets.
+        if let Some(Value::String(text)) = o.remove("instructions")
+            && !text.is_empty()
+        {
+            let input = o.entry("input").or_insert_with(|| json!([]));
+            if input.is_null() {
+                *input = json!([]);
+            }
+            if let Some(items) = input.as_array_mut() {
+                items.insert(
+                    0,
+                    json!({ "type": "message", "role": "developer", "content": [{ "type": "input_text", "text": text }] }),
+                );
+            }
         }
         if !websocket {
             o.remove("previous_response_id");
@@ -459,13 +471,12 @@ pub fn sanitize_codex_body(body: &mut Value, model: &str, websocket: bool) {
     }
 }
 
-/// Codex 0.161 sends routing fields first; other keys keep their order after these.
+/// Codex 0.162 sends routing fields first; other keys keep their order after these.
 const CODEX_FIELD_ORDER: &[&str] = &[
     "type",
     "model",
     "stream",
     "service_tier",
-    "instructions",
     "previous_response_id",
     "input",
     "tools",
@@ -1046,7 +1057,6 @@ mod tests {
                 "type",
                 "model",
                 "stream",
-                "instructions",
                 "previous_response_id",
                 "input",
                 "store",
@@ -1058,6 +1068,44 @@ mod tests {
         let mut http = json!({"generate": false, "previous_response_id": "r", "input": []});
         sanitize_codex_body(&mut http, "gpt-6.1-sol", false);
         assert!(http.get("generate").is_none() && http.get("previous_response_id").is_none());
+    }
+
+    #[test]
+    fn codex_instructions_are_developer_input_on_both_transports() {
+        for websocket in [false, true] {
+            let mut body = json!({"instructions": "Follow these rules.", "input": "question"});
+            sanitize_codex_body(&mut body, "gpt-6.1-sol", websocket);
+            assert!(body.get("instructions").is_none());
+            assert_eq!(
+                body["input"],
+                json!([
+                    {"type": "message", "role": "developer", "content": [{"type": "input_text", "text": "Follow these rules."}]},
+                    {"type": "message", "role": "user", "content": [{"type": "input_text", "text": "question"}]}
+                ])
+            );
+            let once = body.clone();
+            sanitize_codex_body(&mut body, "gpt-6.1-sol", websocket);
+            assert_eq!(body, once, "sanitizing again must not duplicate instructions");
+        }
+    }
+
+    #[test]
+    fn codex_native_developer_input_does_not_gain_an_instructions_field() {
+        let input = json!([
+            {"type": "message", "role": "developer", "content": [{"type": "input_text", "text": "native instructions"}]},
+            {"type": "message", "role": "user", "content": [{"type": "input_text", "text": "question"}]}
+        ]);
+        for websocket in [false, true] {
+            for instructions in [None, Some(Value::Null), Some(json!(""))] {
+                let mut body = json!({"input": input});
+                if let Some(instructions) = instructions {
+                    body["instructions"] = instructions;
+                }
+                sanitize_codex_body(&mut body, "gpt-6.1-sol", websocket);
+                assert!(body.get("instructions").is_none());
+                assert_eq!(body["input"], input);
+            }
+        }
     }
 
     #[test]
