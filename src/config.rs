@@ -462,13 +462,15 @@ impl Config {
         }
         let mut ids = std::collections::HashSet::new();
         for client in &cfg.named_clients {
-            if client.id.is_empty()
-                || client.key.is_empty()
-                || client.key.starts_with("fbxc_")
-                || !ids.insert(&client.id)
-            {
-                anyhow::bail!("named-clients require unique ids and nonempty inference keys");
-            }
+            let id = &client.id;
+            anyhow::ensure!(!id.trim().is_empty(), "named-clients: every client needs an id");
+            anyhow::ensure!(!client.key.trim().is_empty(), "named-clients: {id} needs a key");
+            // fbxc_ keys belong to usage collectors, which may only send usage.
+            anyhow::ensure!(
+                !client.key.starts_with("fbxc_"),
+                "named-clients: {id} has a collector key (fbxc_); give it another key"
+            );
+            anyhow::ensure!(ids.insert(id), "named-clients: the id {id} is used twice");
             crate::usage::types::valid_label(&client.id).map_err(anyhow::Error::msg)?;
             crate::usage::types::valid_label(&client.label).map_err(anyhow::Error::msg)?;
         }
@@ -541,5 +543,24 @@ mod tests {
         assert!(t.contains("auth-dir: \"~/.fusebox\""));
         assert!(t.contains("`fusebox login <provider>`"));
         assert_eq!(Config::parse(t).unwrap().auth_dir, DEFAULT_AUTH_DIR);
+    }
+
+    #[test]
+    fn named_clients_need_unique_ids_and_real_keys() {
+        let client = |id: &str, key: &str| format!("  - id: \"{id}\"\n    label: Tool\n    key: \"{key}\"\n");
+        let parse = |clients: &[String]| Config::parse(&format!("named-clients:\n{}", clients.concat()));
+        let cfg = parse(&[client("laptop", "fbx_one"), client("whombat-cybex", "wbgw_two")]).unwrap();
+        assert_eq!(cfg.named_clients.len(), 2);
+        for (clients, problem) in [
+            (vec![client("", "fbx_one")], "needs an id"),
+            (vec![client("  ", "fbx_one")], "needs an id"),
+            (vec![client("laptop", "")], "laptop needs a key"),
+            (vec![client("laptop", "   ")], "laptop needs a key"),
+            (vec![client("laptop", "fbxc_collector")], "collector key"),
+            (vec![client("laptop", "fbx_one"), client("laptop", "fbx_two")], "laptop is used twice"),
+        ] {
+            let err = parse(&clients).unwrap_err().to_string();
+            assert!(err.contains(problem), "{err}");
+        }
     }
 }
