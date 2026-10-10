@@ -768,6 +768,7 @@ fn responses_api(t: &Target, mut body: Value) -> Prepared {
     let base = if t.acct.provider == Provider::Meta {
         headers.push(("user-agent".into(), device::meta::API_UA.into()));
         headers.push(("x-client-id".into(), "tbh:tui".into()));
+        headers.push(("x-tbh-agent-role".into(), "main".into()));
         base.unwrap_or_else(|| device::meta::API_BASE.into())
     } else {
         // xAI routes its prompt cache by conversation id.
@@ -823,6 +824,49 @@ fn compat(t: &Target, mut body: Value) -> Prepared {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn muse_requests_match_1_4_4_identity() {
+        let cfg = Config {
+            auth_dir: "/nonexistent".into(),
+            meta_api_key: vec![crate::config::KeyEntry { api_key: "test".into(), ..Default::default() }],
+            ..Default::default()
+        };
+        let pool = crate::accounts::Pool::default();
+        pool.reload(&cfg);
+        let acct = pool.all().remove(0);
+        let headers = HeaderMap::new();
+        let prepared = prepare(
+            &Target {
+                acct: &acct,
+                cfg: &cfg,
+                client_headers: &headers,
+                model: "muse-spark-1.3",
+                wire: Format::Responses,
+                passthrough: false,
+                stream: true,
+                count_tokens: false,
+                cache_key: None,
+            },
+            json!({"input":"Reply OK"}),
+        );
+        assert_eq!(prepared.url, "https://api.meta.ai/v1/responses");
+        for (name, expected) in [
+            (
+                "user-agent",
+                "muse-build/1.4.4 (interactive; macos-aarch64; build 1e1635eda6610b6dec0803bc76c1ceb0dbff7caa)",
+            ),
+            ("x-client-id", "tbh:tui"),
+            ("x-tbh-agent-role", "main"),
+        ] {
+            assert_eq!(
+                prepared.headers.iter().find(|(key, _)| key == name).map(|(_, value)| value.as_str()),
+                Some(expected),
+                "{name}"
+            );
+        }
+        assert_eq!(prepared.body, json!({"input":"Reply OK","model":"muse-spark-1.3","stream":true}));
+    }
 
     #[test]
     fn grok_subscription_requests_match_1_0_50_identity() {

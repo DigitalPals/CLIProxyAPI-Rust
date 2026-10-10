@@ -29,7 +29,7 @@
     {
       "id": "muse-code",
       "name": "Muse Code",
-      "version": "1.4.3",
+      "version": "1.4.4",
       "source": { "kind": "json", "url": "https://api.meta.ai/muse-code/channels/muse-stable", "path": "version", "cut": "-R" },
       "where": "src/device.rs: meta::API_UA, whose build hash is the git commit compiled into the release (find it next to the version string in the macOS arm64 binary from the channel's release manifest)"
     },

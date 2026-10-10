@@ -35,9 +35,9 @@ pub mod meta {
     pub const MINT_URL: &str = "https://api.meta.ai/muse-code/key";
     pub const API_BASE: &str = "https://api.meta.ai/v1";
     pub const AUTH_UA: &str = "muse-code/1.0.2";
-    /// Muse Code 1.4.3 for macOS arm64; the build hash is the commit compiled into that release.
+    /// Muse Code 1.4.4 for macOS arm64; the build hash is the commit compiled into that release.
     pub const API_UA: &str =
-        "muse-build/1.4.3 (interactive; macos-aarch64; build 5c1bccecf3f125ff8fdc53f63558f6527ee70e56)";
+        "muse-build/1.4.4 (interactive; macos-aarch64; build 1e1635eda6610b6dec0803bc76c1ceb0dbff7caa)";
 }
 
 const GRANT: &str = "urn:ietf:params:oauth:grant-type:device_code";
