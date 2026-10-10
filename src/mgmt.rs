@@ -432,6 +432,8 @@ async fn overview(State(app): State<Arc<App>>) -> Json<Value> {
         "uptime_secs": (chrono::Utc::now() - app.started).num_seconds(),
         "base_url": format!("http://{host}:{}", cfg.port),
         "client_keys": cfg.api_keys,
+        // With named clients and no shared key, clients still need a key: their own.
+        "named_clients": cfg.named_clients.len(),
         "routing": cfg.routing,
         "banked_resets": cfg.banked_resets,
         "session_affinity": cfg.session_affinity,
