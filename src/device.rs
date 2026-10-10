@@ -25,7 +25,7 @@ pub mod xai {
     pub const API_BASE: &str = "https://api.x.ai/v1";
     /// Grok Build subscriptions are served by the CLI chat proxy.
     pub const CLI_BASE: &str = "https://cli-chat-proxy.grok.com/v1";
-    pub const CLIENT_VERSION: &str = "1.0.46";
+    pub const CLIENT_VERSION: &str = "1.0.50";
 }
 
 pub mod meta {

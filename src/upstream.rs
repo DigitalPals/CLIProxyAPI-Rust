@@ -824,6 +824,48 @@ fn compat(t: &Target, mut body: Value) -> Prepared {
 mod tests {
     use super::*;
 
+    #[test]
+    fn grok_subscription_requests_match_1_0_50_identity() {
+        let cfg = Config {
+            auth_dir: "/nonexistent".into(),
+            xai_api_key: vec![crate::config::KeyEntry { api_key: "test".into(), ..Default::default() }],
+            ..Default::default()
+        };
+        let pool = crate::accounts::Pool::default();
+        pool.reload(&cfg);
+        let acct = pool.all().remove(0);
+        *acct.cred.write() =
+            Credential::OAuth(crate::accounts::OAuth { access_token: "test".into(), ..Default::default() });
+        let headers = HeaderMap::new();
+        let prepared = prepare(
+            &Target {
+                acct: &acct,
+                cfg: &cfg,
+                client_headers: &headers,
+                model: "grok-4",
+                wire: Format::Responses,
+                passthrough: false,
+                stream: true,
+                count_tokens: false,
+                cache_key: Some("conversation"),
+            },
+            json!({"input":"Reply OK"}),
+        );
+        assert_eq!(prepared.url, "https://cli-chat-proxy.grok.com/v1/responses");
+        for (name, expected) in [
+            ("x-grok-client-version", "1.0.50"),
+            ("user-agent", "grok-pager/1.0.50 grok-shell/1.0.50 (macos; aarch64)"),
+            ("x-grok-client-identifier", "grok-shell"),
+            ("x-grok-client-mode", "interactive"),
+            ("x-xai-token-auth", "xai-grok-cli"),
+            ("x-authenticateresponse", "authenticate-response"),
+            ("x-grok-conv-id", "conversation"),
+        ] {
+            assert_eq!(prepared.headers.iter().find(|(key, _)| key == name).unwrap().1, expected, "{name}");
+        }
+        assert_eq!(prepared.body, json!({"input":"Reply OK","model":"grok-4","stream":true}));
+    }
+
     fn claude_account() -> std::sync::Arc<Account> {
         let cfg = Config {
             auth_dir: "/nonexistent".into(),

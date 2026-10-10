@@ -21,7 +21,7 @@
     {
       "id": "grok-build",
       "name": "Grok Build",
-      "version": "1.0.46",
+      "version": "1.0.50",
       "source": { "kind": "text", "url": "https://x.ai/cli/stable" },
       "where": "src/device.rs: xai::CLIENT_VERSION; src/upstream.rs: the xAI CLI-proxy headers (user agent, x-grok-*)",
       "notes": "https://x.ai/cli"
